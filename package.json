@@ -1,6 +1,6 @@
 {
   "name": "mcp-agents",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server that wraps AI CLI tools (Claude Code, Gemini CLI, Codex CLI) for use by any MCP client",
   "type": "module",
   "bin": {
