@@ -112,6 +112,56 @@ test_connectivity() {
   fi
 }
 
+# ── Helper: test a CLI flag that should succeed (exit 0, stdout matches) ──
+test_cli_flag() {
+  local label="$1"
+  local flag="$2"
+  local expected="$3"
+
+  echo "--- $label ---"
+
+  OUTPUT=$($SERVER $flag 2>/dev/null) || true
+  EXIT_CODE=${PIPESTATUS[0]:-$?}
+
+  if echo "$OUTPUT" | grep -q "$expected"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (expected '$expected' in output)"
+    echo "  Output: $OUTPUT"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ── Helper: test a CLI flag that should fail (exit non-zero, stderr matches) ──
+test_cli_error() {
+  local label="$1"
+  local flag="$2"
+  local expected="$3"
+
+  echo "--- $label ---"
+
+  STDERR_OUTPUT=$($SERVER $flag 2>&1 >/dev/null) || true
+
+  if echo "$STDERR_OUTPUT" | grep -q "$expected"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (expected '$expected' in stderr)"
+    echo "  Stderr: $STDERR_OUTPUT"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ========== CLI flag tests ==========
+
+test_cli_flag "--help prints usage"         "--help"    "Usage:"
+test_cli_flag "-h prints usage"             "-h"        "Usage:"
+test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
+test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
+test_cli_error "--bogus exits with error"   "--bogus"   "unknown option"
+test_cli_error "--provider without value"   "--provider" "requires a value"
+
 # ========== Protocol tests (fast) ==========
 
 # ---------- Ping (all providers) ----------

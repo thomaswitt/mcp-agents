@@ -2,6 +2,9 @@
 /* eslint-disable no-console */
 
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -9,6 +12,11 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const VERSION = JSON.parse(
+  readFileSync(join(__dirname, "package.json"), "utf8"),
+).version;
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
@@ -76,15 +84,55 @@ function toStringArg(value) {
 }
 
 /**
- * Parse --provider <name> from process.argv.
- * @returns {string} Provider name (defaults to "codex")
+ * Print usage information to stdout.
  */
-function parseProvider() {
-  const idx = process.argv.indexOf("--provider");
-  if (idx !== -1 && idx + 1 < process.argv.length) {
-    return process.argv[idx + 1];
+function printHelp() {
+  const providers = Object.keys(CLI_BACKENDS).join(", ");
+  console.log(`mcp-agents v${VERSION}
+
+Usage: mcp-agents [options]
+
+Options:
+  --provider <name>  CLI backend to use (${providers}) [default: codex]
+  --help, -h         Show this help message
+  --version, -v      Show version number`);
+}
+
+/**
+ * Parse CLI flags from process.argv.
+ * Handles --help, --version, --provider, and unknown flags.
+ * @returns {string | null} Provider name, or null if the process should exit.
+ */
+function parseArgs() {
+  const args = process.argv.slice(2);
+  let provider = "codex";
+
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case "--help":
+      case "-h":
+        printHelp();
+        process.exit(0);
+        break;
+      case "--version":
+      case "-v":
+        console.log(`mcp-agents v${VERSION}`);
+        process.exit(0);
+        break;
+      case "--provider":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --provider requires a value\n");
+          process.exit(1);
+        }
+        provider = args[++i];
+        break;
+      default:
+        process.stderr.write(`error: unknown option: ${args[i]}\n`);
+        process.exit(1);
+    }
   }
-  return "codex";
+
+  return provider;
 }
 
 /**
@@ -140,7 +188,7 @@ function runCli(command, args, opts = {}) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const providerName = parseProvider();
+  const providerName = parseArgs();
   const backend = CLI_BACKENDS[providerName];
 
   if (!backend) {
@@ -153,7 +201,7 @@ async function main() {
   }
 
   const server = new Server(
-    { name: "mcp-agents", version: "0.2.0" },
+    { name: "mcp-agents", version: VERSION },
     { capabilities: { tools: {} } },
   );
 
