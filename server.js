@@ -18,7 +18,7 @@ const VERSION = JSON.parse(
   readFileSync(join(__dirname, "package.json"), "utf8"),
 ).version;
 
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -30,7 +30,7 @@ const CLI_BACKENDS = {
     command: "claude",
     toolName: "claude_code",
     description: "Run Claude Code CLI (claude -p) with a prompt.",
-    buildArgs: (prompt) => ["-p", prompt],
+    buildArgs: (prompt) => ["--no-session-persistence", "-p", prompt],
     extraProperties: {},
   },
   gemini: {

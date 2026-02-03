@@ -38,6 +38,21 @@ NEVER write to stdout in server mode — it's the MCP JSON-RPC transport. Use `l
 
 `test.sh` uses bash helpers that pipe JSON-RPC to the server over stdio. CLI flag tests (`test_cli_flag`, `test_cli_error`) run first, then protocol tests. All tests use `timeout`/`gtimeout` to cap execution since the keepAlive timer prevents natural exit.
 
+## Changelog
+
+Maintain `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/) format. Every user-facing change must have an entry before release.
+
+## Releasing a New Version
+
+1. Update version in `package.json`
+2. Add entry to `CHANGELOG.md`
+3. Run `npm install` to sync `package-lock.json`
+4. Run tests: `SKIP_INTEGRATION=1 ./test.sh`
+5. Commit: `git commit -m "0.x.y"`
+6. Tag: `git tag v0.x.y`
+7. Push: `git push && git push --tags`
+8. Publish: `npm publish`
+
 ## Style
 
 - Follow existing patterns in `server.js` — switch statements for CLI parsing, Promise wrappers for child_process
