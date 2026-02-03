@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.5] - 2026-02-03
+
+### Changed
+
+- Codex provider now runs as native MCP pass-through (`codex mcp-server`) instead of `codex exec`
+
+### Added
+
+- `--model` flag to set Codex model (default: `gpt-5.2-codex`)
+- `--model_reasoning_effort` flag to set reasoning effort (default: `high`)
+
 ## [0.3.2] - 2026-02-03
 
 ### Fixed

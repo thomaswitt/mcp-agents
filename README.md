@@ -36,6 +36,7 @@ Each `--provider` flag maps to a single exposed tool:
 |----------|-----------|-------------|
 | `claude` | `claude_code` | `claude -p <prompt>` |
 | `gemini` | `gemini` | `gemini [-s] -p <prompt>` |
+| `codex` | *(pass-through)* | `codex mcp-server` |
 
 ### `claude_code` parameters
 
@@ -52,12 +53,49 @@ Each `--provider` flag maps to a single exposed tool:
 | `sandbox` | `boolean` | no | Run in sandbox mode (`-s` flag) |
 | `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
 
-### `codex` parameters
+### `codex` (pass-through)
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `prompt` | `string` | yes | The prompt to send to Codex CLI |
-| `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
+The codex provider passes through to Codex's native MCP server (`codex mcp-server`)
+with configurable flags:
+
+| CLI Flag | Default | Codex flag |
+|----------|---------|------------|
+| `--model` | `gpt-5.2-codex` | `-m <model>` |
+| `--model_reasoning_effort` | `high` | `-c model_reasoning_effort=<value>` |
+
+Hardcoded defaults: `-s read-only -a never` (safe for MCP server mode).
+
+## Integration with Claude Code
+
+Add entries to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "codex": {
+      "command": "npx",
+      "args": ["-y", "mcp-agents@latest", "--provider", "codex"]
+    },
+    "gemini": {
+      "command": "npx",
+      "args": ["-y", "mcp-agents@latest", "--provider", "gemini"]
+    }
+  }
+}
+```
+
+Override codex defaults:
+
+```json
+{
+  "mcpServers": {
+    "codex": {
+      "command": "npx",
+      "args": ["-y", "mcp-agents@latest", "--provider", "codex", "--model", "o3-pro", "--model_reasoning_effort", "medium"]
+    }
+  }
+}
+```
 
 ## Integration with OpenAI Codex
 

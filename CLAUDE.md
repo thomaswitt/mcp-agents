@@ -48,10 +48,10 @@ Maintain `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/
 2. Add entry to `CHANGELOG.md`
 3. Run `npm install` to sync `package-lock.json`
 4. Run tests: `SKIP_INTEGRATION=1 ./test.sh`
-5. Commit: `git commit -m "0.x.y"`
+5. Commit: `git commit -m "<see commit message instructions below"`
 6. Tag: `git tag v0.x.y`
 7. Push: `git push && git push --tags`
-8. Publish: `npm publish`
+8. Publish: `npm publish` # needs to be done manually due to 2FA
 
 ## Style
 
@@ -76,8 +76,7 @@ INSTRUCTIONS:
    - You MUST indicate breaking changes or required migrations in the
      first line
    - Add a blank line afterwards
-- All the following should provide information about the what and why
-  of the changes:
+- All the following should provide information about the what and why of the changes:
    - Use bullet points
    - Wrap lines at 72 chars
    - Use imperative mood, present tense, active voice
@@ -86,4 +85,5 @@ INSTRUCTIONS:
    - Do NOT mention that test coverage has been added for the changes
    - Do NOT mention file additions/removals in comments
    - Keep it as SHORT and as CONCISE as possible
+   - Do NOT include your own attribution
 ```
