@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,11 +52,7 @@ const CLI_BACKENDS = {
     },
   },
   codex: {
-    command: "codex",
-    toolName: "codex",
-    description: "Run Codex CLI (codex exec) with a prompt.",
-    buildArgs: (prompt) => ["exec", prompt],
-    extraProperties: {},
+    passthrough: true,
   },
 };
 
@@ -93,19 +89,23 @@ function printHelp() {
 Usage: mcp-agents [options]
 
 Options:
-  --provider <name>  CLI backend to use (${providers}) [default: codex]
-  --help, -h         Show this help message
-  --version, -v      Show version number`);
+  --provider <name>              CLI backend to use (${providers}) [default: codex]
+  --model <model>                Model to use (codex) [default: gpt-5.2-codex]
+  --model_reasoning_effort <e>   Reasoning effort (codex) [default: high]
+  --help, -h                     Show this help message
+  --version, -v                  Show version number`);
 }
 
 /**
  * Parse CLI flags from process.argv.
- * Handles --help, --version, --provider, and unknown flags.
- * @returns {string | null} Provider name, or null if the process should exit.
+ * Handles --help, --version, --provider, --model, --model_reasoning_effort, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
   let provider = "codex";
+  let model;
+  let modelReasoningEffort;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -126,13 +126,29 @@ function parseArgs() {
         }
         provider = args[++i];
         break;
+      case "--model":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --model requires a value\n");
+          process.exit(1);
+        }
+        model = args[++i];
+        break;
+      case "--model_reasoning_effort":
+        if (i + 1 >= args.length) {
+          process.stderr.write(
+            "error: --model_reasoning_effort requires a value\n",
+          );
+          process.exit(1);
+        }
+        modelReasoningEffort = args[++i];
+        break;
       default:
         process.stderr.write(`error: unknown option: ${args[i]}\n`);
         process.exit(1);
     }
   }
 
-  return provider;
+  return { provider, model, modelReasoningEffort };
 }
 
 /**
@@ -183,12 +199,43 @@ function runCli(command, args, opts = {}) {
   });
 }
 
+/**
+ * Spawn codex mcp-server as a pass-through, piping stdio directly.
+ * @param {{ model?: string, modelReasoningEffort?: string }} opts
+ */
+function runCodexPassthrough({ model, modelReasoningEffort }) {
+  const args = [
+    "-m",
+    model || "gpt-5.2-codex",
+    "-s",
+    "read-only",
+    "-a",
+    "never",
+    "-c",
+    `model_reasoning_effort=${modelReasoningEffort || "high"}`,
+    "mcp-server",
+  ];
+
+  logErr(`[mcp-agents] passthrough: codex ${args.join(" ")}`);
+
+  const child = spawn("codex", args, { stdio: "inherit" });
+
+  child.on("error", (err) => {
+    logErr(`[mcp-agents] failed to start codex: ${err.message}`);
+    process.exitCode = 1;
+  });
+
+  child.on("exit", (code) => {
+    process.exitCode = code ?? 1;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const providerName = parseArgs();
+  const { provider: providerName, model, modelReasoningEffort } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
 
   if (!backend) {
@@ -197,6 +244,11 @@ async function main() {
       `[mcp-agents] Available: ${Object.keys(CLI_BACKENDS).join(", ")}`,
     );
     process.exitCode = 1;
+    return;
+  }
+
+  if (backend.passthrough) {
+    runCodexPassthrough({ model, modelReasoningEffort });
     return;
   }
 

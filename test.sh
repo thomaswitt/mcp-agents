@@ -160,12 +160,14 @@ test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
 test_cli_error "--bogus exits with error"   "--bogus"   "unknown option"
-test_cli_error "--provider without value"   "--provider" "requires a value"
+test_cli_error "--provider without value"                  "--provider"                 "requires a value"
+test_cli_error "--model without value"                     "--model"                    "requires a value"
+test_cli_error "--model_reasoning_effort without value"    "--model_reasoning_effort"   "requires a value"
 
 # ========== Protocol tests (fast) ==========
 
 # ---------- Ping (all providers) ----------
-for p in claude gemini codex; do
+for p in claude gemini; do
   test_tools_list "tools/list --provider $p → ping" "$p" "ping"
 done
 
@@ -177,11 +179,33 @@ test_handshake  "handshake --provider claude → claude_code"  "claude" "claude_
 test_tools_list "tools/list --provider gemini → gemini" "gemini" "gemini"
 test_handshake  "handshake --provider gemini → gemini"  "gemini" "gemini"
 
-# ---------- Codex provider (default) ----------
-test_tools_list "tools/list --provider codex → codex" "codex" "codex"
-test_handshake  "handshake --provider codex → codex"  "codex" "codex"
-
 # ========== Integration tests (call real CLIs) ==========
+
+# ── Helper: test codex pass-through (tools/list comes from codex itself) ──
+test_codex_passthrough() {
+  local label="$1"
+  echo "--- $label ---"
+
+  RESPONSE=$(
+    {
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+      sleep 0.3
+      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+      sleep 0.3
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+      sleep 3
+    } | $TIMEOUT_CMD 10 $SERVER --provider codex 2>/dev/null || true
+  )
+
+  if echo "$RESPONSE" | jq -e '.result.tools' >/dev/null 2>&1; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  fi
+}
 
 if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
   echo ""
@@ -189,6 +213,7 @@ if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
 else
   test_connectivity "call claude (connectivity)" "claude" "claude_code" 30
   test_connectivity "call gemini (connectivity)" "gemini" "gemini"     30
+  test_codex_passthrough "codex passthrough (tools/list)"
 fi
 
 # ---------- Summary ----------
