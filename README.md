@@ -24,6 +24,7 @@ npx mcp-agents
 # Specific provider
 npx mcp-agents --provider claude
 npx mcp-agents --provider gemini
+npx mcp-agents --provider gemini --sandbox false
 ```
 
 The server speaks [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio). It prints `[mcp-agents] ready (provider: <name>)` to stderr when it's listening.
@@ -50,7 +51,7 @@ Each `--provider` flag maps to a single exposed tool:
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `string` | yes | The prompt to send to Gemini CLI |
-| `sandbox` | `boolean` | no | Run in sandbox mode (`-s` flag) |
+| `sandbox` | `boolean` | no | Run in sandbox mode (`-s` flag, default: false) |
 | `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
 
 ### `codex` (pass-through)
@@ -78,7 +79,7 @@ Add entries to your project's `.mcp.json`:
     },
     "gemini": {
       "command": "npx",
-      "args": ["-y", "mcp-agents@latest", "--provider", "gemini"]
+      "args": ["-y", "mcp-agents@latest", "--provider", "gemini", "--sandbox", "false"]
     }
   }
 }
@@ -108,7 +109,7 @@ args = ["-y", "mcp-agents", "--provider", "claude"]
 
 [mcp_servers.gemini]
 command = "npx"
-args = ["-y", "mcp-agents", "--provider", "gemini"]
+args = ["-y", "mcp-agents", "--provider", "gemini", "--sandbox", "false"]
 ```
 
 Then in a Codex session you can call the `claude_code` or `gemini` tools, which shell out to the respective CLIs.

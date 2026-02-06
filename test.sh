@@ -163,6 +163,7 @@ test_cli_error "--bogus exits with error"   "--bogus"   "unknown option"
 test_cli_error "--provider without value"                  "--provider"                 "requires a value"
 test_cli_error "--model without value"                     "--model"                    "requires a value"
 test_cli_error "--model_reasoning_effort without value"    "--model_reasoning_effort"   "requires a value"
+test_cli_error "--sandbox without value"                    "--sandbox"                  "requires a value"
 
 # ========== Protocol tests (fast) ==========
 

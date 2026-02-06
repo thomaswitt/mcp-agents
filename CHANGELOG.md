@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-02-06
+
+### Added
+
+- `--sandbox` flag to control Gemini sandbox mode at startup (default: false)
+
+### Changed
+
+- Gemini sandbox mode now defaults to off (was on)
+
 ## [0.3.6] - 2026-02-05
 
 ### Changed

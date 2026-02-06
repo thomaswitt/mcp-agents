@@ -39,15 +39,15 @@ const CLI_BACKENDS = {
     description: "Run Gemini CLI (gemini -p) with a prompt.",
     buildArgs: (prompt, opts) => {
       const args = [];
-      if (opts.sandbox !== false) args.push("-s");
+      if (opts.sandbox === true) args.push("-s");
       args.push("-p", prompt);
       return args;
     },
     extraProperties: {
       sandbox: {
         type: "boolean",
-        default: true,
-        description: "Run in sandbox mode (-s flag). Defaults to true.",
+        default: false,
+        description: "Run in sandbox mode (-s flag). Defaults to false.",
       },
     },
   },
@@ -92,20 +92,22 @@ Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
   --model <model>                Model to use (codex) [default: gpt-5.3-codex]
   --model_reasoning_effort <e>   Reasoning effort (codex) [default: high]
+  --sandbox <bool>               Gemini sandbox mode (true/false) [default: false]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
 }
 
 /**
  * Parse CLI flags from process.argv.
- * Handles --help, --version, --provider, --model, --model_reasoning_effort, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string }}
+ * Handles --help, --version, --provider, --model, --model_reasoning_effort, --sandbox, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandbox: boolean }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
   let provider = "codex";
   let model;
   let modelReasoningEffort;
+  let sandbox = false;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -142,13 +144,20 @@ function parseArgs() {
         }
         modelReasoningEffort = args[++i];
         break;
+      case "--sandbox":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --sandbox requires a value\n");
+          process.exit(1);
+        }
+        sandbox = args[++i] === "true";
+        break;
       default:
         process.stderr.write(`error: unknown option: ${args[i]}\n`);
         process.exit(1);
     }
   }
 
-  return { provider, model, modelReasoningEffort };
+  return { provider, model, modelReasoningEffort, sandbox };
 }
 
 /**
@@ -235,7 +244,7 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { provider: providerName, model, modelReasoningEffort } = parseArgs();
+  const { provider: providerName, model, modelReasoningEffort, sandbox } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
 
   if (!backend) {
@@ -248,6 +257,10 @@ async function main() {
   if (backend.passthrough) {
     runCodexPassthrough({ model, modelReasoningEffort });
     return;
+  }
+
+  if (backend.extraProperties.sandbox) {
+    backend.extraProperties.sandbox.default = sandbox;
   }
 
   const server = new Server(
@@ -330,9 +343,7 @@ async function main() {
 
     const extraOpts = {};
     for (const key of Object.keys(backend.extraProperties)) {
-      if (params.arguments?.[key] != null) {
-        extraOpts[key] = params.arguments[key];
-      }
+      extraOpts[key] = params.arguments?.[key] ?? backend.extraProperties[key].default;
     }
 
     const cliArgs = backend.buildArgs(prompt, extraOpts);
