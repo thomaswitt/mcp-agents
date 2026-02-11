@@ -29,14 +29,16 @@ const CLI_BACKENDS = {
   claude: {
     command: "claude",
     toolName: "claude_code",
-    description: "Run Claude Code CLI (claude -p) with a prompt.",
-    buildArgs: (prompt) => ["--no-session-persistence", "-p", prompt],
+    description: "Run Claude Code CLI with a prompt (via stdin).",
+    stdinPrompt: true,
+    buildArgs: () => ["--no-session-persistence", "-p"],
     extraProperties: {},
   },
   gemini: {
     command: "gemini",
     toolName: "gemini",
     description: "Run Gemini CLI (gemini -p) with a prompt.",
+    stdinPrompt: false,
     buildArgs: (prompt, opts) => {
       const args = [];
       if (opts.sandbox === true) args.push("-s");
@@ -164,11 +166,12 @@ function parseArgs() {
  * Run a CLI command and return stdout (or stderr if stdout is empty).
  * @param {string} command
  * @param {string[]} args
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, stdinData?: string }} [opts]
  * @returns {Promise<string>}
  */
 function runCli(command, args, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const stdinData = opts.stdinData;
 
   return new Promise((resolve, reject) => {
     const child = execFile(
@@ -197,10 +200,13 @@ function runCli(command, args, opts = {}) {
       },
     );
 
-    // Close stdin immediately so the child process doesn't wait for piped input.
-    // execFile creates a pipe for stdin by default; leaving it open causes
-    // the child to hang indefinitely waiting for EOF.
-    child.stdin?.end();
+    // Pipe prompt via stdin to avoid arg-quoting issues, then close.
+    child.stdin?.on("error", () => {}); // ignore EPIPE if child exits early
+    if (stdinData != null) {
+      child.stdin?.end(stdinData, "utf8");
+    } else {
+      child.stdin?.end();
+    }
 
     child.on("error", (err) => {
       reject(new Error(`Failed to start ${command}: ${err.message}`));
@@ -346,11 +352,16 @@ async function main() {
       extraOpts[key] = params.arguments?.[key] ?? backend.extraProperties[key].default;
     }
 
-    const cliArgs = backend.buildArgs(prompt, extraOpts);
+    const cliArgs = backend.stdinPrompt
+      ? backend.buildArgs(extraOpts)
+      : backend.buildArgs(prompt, extraOpts);
+    const cliOpts = backend.stdinPrompt
+      ? { timeoutMs, stdinData: prompt }
+      : { timeoutMs };
 
     logErr(`[mcp-agents] tools/call: running ${backend.command} …`);
     try {
-      const output = await runCli(backend.command, cliArgs, { timeoutMs });
+      const output = await runCli(backend.command, cliArgs, cliOpts);
       logErr("[mcp-agents] tools/call: done");
       return {
         content: [{ type: "text", text: output || "" }],

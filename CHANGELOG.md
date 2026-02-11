@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-02-11
+
+### Changed
+
+- Claude backend now pipes prompts via stdin instead of `-p` argument, fixing quoting and length issues with complex prompts
+
 ## [0.4.0] - 2026-02-06
 
 ### Added
