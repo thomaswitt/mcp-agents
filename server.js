@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,6 +95,7 @@ Options:
   --model <model>                Model to use (codex) [default: gpt-5.3-codex]
   --model_reasoning_effort <e>   Reasoning effort (codex) [default: high]
   --sandbox <bool>               Gemini sandbox mode (true/false) [default: false]
+  --timeout <seconds>            Default timeout per call [default: 300]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
 }
@@ -102,7 +103,7 @@ Options:
 /**
  * Parse CLI flags from process.argv.
  * Handles --help, --version, --provider, --model, --model_reasoning_effort, --sandbox, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandbox: boolean }}
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandbox: boolean, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -110,6 +111,7 @@ function parseArgs() {
   let model;
   let modelReasoningEffort;
   let sandbox = false;
+  let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -153,17 +155,32 @@ function parseArgs() {
         }
         sandbox = args[++i] === "true";
         break;
+      case "--timeout": {
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --timeout requires a value\n");
+          process.exit(1);
+        }
+        const secs = Number(args[++i]);
+        if (!(secs > 0)) {
+          process.stderr.write("error: --timeout must be a positive number\n");
+          process.exit(1);
+        }
+        defaultTimeoutMs = Math.round(secs * 1000);
+        break;
+      }
       default:
         process.stderr.write(`error: unknown option: ${args[i]}\n`);
         process.exit(1);
     }
   }
 
-  return { provider, model, modelReasoningEffort, sandbox };
+  return { provider, model, modelReasoningEffort, sandbox, defaultTimeoutMs };
 }
 
 /**
  * Run a CLI command and return stdout (or stderr if stdout is empty).
+ * Uses spawn with detached:true so the entire process group can be killed
+ * on timeout — prevents orphan child processes.
  * @param {string} command
  * @param {string[]} args
  * @param {{ timeoutMs?: number, stdinData?: string }} [opts]
@@ -174,31 +191,17 @@ function runCli(command, args, opts = {}) {
   const stdinData = opts.stdinData;
 
   return new Promise((resolve, reject) => {
-    const child = execFile(
-      command,
-      args,
-      {
-        timeout: timeoutMs,
-        maxBuffer: MAX_BUFFER_BYTES,
-        env: { ...process.env, NO_COLOR: "1" },
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          const details = [
-            `${command} failed: ${error.message}`,
-            stderr ? `stderr:\n${stderr}` : null,
-          ]
-            .filter(Boolean)
-            .join("\n");
+    let stdout = "";
+    let stderr = "";
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    let settled = false;
 
-          reject(new Error(details));
-          return;
-        }
-
-        const out = (stdout || stderr || "").trimEnd();
-        resolve(out);
-      },
-    );
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, NO_COLOR: "1" },
+    });
 
     // Pipe prompt via stdin to avoid arg-quoting issues, then close.
     child.stdin?.on("error", () => {}); // ignore EPIPE if child exits early
@@ -208,8 +211,59 @@ function runCli(command, args, opts = {}) {
       child.stdin?.end();
     }
 
+    const killGroup = () => {
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    };
+
+    const done = (err) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      err ? reject(err) : resolve((stdout || stderr || "").trimEnd());
+    };
+
+    child.stdout.on("data", (chunk) => {
+      stdoutLen += chunk.length;
+      if (stdoutLen > MAX_BUFFER_BYTES) {
+        killGroup();
+        done(new Error(`${command} stdout maxBuffer exceeded`));
+      } else {
+        stdout += chunk;
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderrLen += chunk.length;
+      if (stderrLen > MAX_BUFFER_BYTES) {
+        killGroup();
+        done(new Error(`${command} stderr maxBuffer exceeded`));
+      } else {
+        stderr += chunk;
+      }
+    });
+
+    // Kill entire process group on timeout (prevents orphan processes).
+    const timer = setTimeout(() => {
+      killGroup();
+    }, timeoutMs);
+
     child.on("error", (err) => {
-      reject(new Error(`Failed to start ${command}: ${err.message}`));
+      done(new Error(`Failed to start ${command}: ${err.message}`));
+    });
+
+    child.on("close", (code, signal) => {
+      if (signal || code !== 0) {
+        const reason = signal ? `killed by ${signal}` : `exit code ${code}`;
+        const details = [
+          `${command} failed: ${reason}`,
+          stderr ? `stderr:\n${stderr}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n");
+        done(new Error(details));
+        return;
+      }
+      done(null);
     });
   });
 }
@@ -250,7 +304,7 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { provider: providerName, model, modelReasoningEffort, sandbox } = parseArgs();
+  const { provider: providerName, model, modelReasoningEffort, sandbox, defaultTimeoutMs } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
 
   if (!backend) {
@@ -274,6 +328,8 @@ async function main() {
     { capabilities: { tools: {} } },
   );
 
+  const effectiveTimeout = defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+
   const properties = {
     prompt: {
       type: "string",
@@ -282,7 +338,7 @@ async function main() {
     timeout_ms: {
       type: "integer",
       minimum: 1,
-      description: `Optional timeout override (default ${DEFAULT_TIMEOUT_MS})`,
+      description: `Optional timeout override (default ${effectiveTimeout}ms)`,
     },
     ...backend.extraProperties,
   };
@@ -333,7 +389,7 @@ async function main() {
     const timeoutMsRaw = params.arguments?.timeout_ms;
     const timeoutMs = Number.isInteger(timeoutMsRaw)
       ? timeoutMsRaw
-      : DEFAULT_TIMEOUT_MS;
+      : effectiveTimeout;
 
     if (!prompt.trim()) {
       return {

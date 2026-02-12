@@ -164,6 +164,10 @@ test_cli_error "--provider without value"                  "--provider"         
 test_cli_error "--model without value"                     "--model"                    "requires a value"
 test_cli_error "--model_reasoning_effort without value"    "--model_reasoning_effort"   "requires a value"
 test_cli_error "--sandbox without value"                    "--sandbox"                  "requires a value"
+test_cli_error "--timeout without value"                    "--timeout"                  "requires a value"
+test_cli_error "--timeout with zero"                        "--timeout 0"                "must be a positive number"
+test_cli_error "--timeout with negative"                    "--timeout -5"               "must be a positive number"
+test_cli_error "--timeout with non-number"                  "--timeout abc"              "must be a positive number"
 
 # ========== Protocol tests (fast) ==========
 
