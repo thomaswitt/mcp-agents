@@ -15,16 +15,29 @@ MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/
 
 Only the CLI you select with `--provider` needs to be present.
 
+## Install
+
+```bash
+npm install -g mcp-agents
+```
+
+Global install is **strongly recommended** over `npx -y mcp-agents@latest`. The `npx`
+approach performs a network round-trip on every cold start, which can exceed MCP client
+connection timeouts and cause "stream disconnected" errors.
+
+**Tip:** If your project's `.mcp.json` references `mcp-agents`, add `npm install -g mcp-agents`
+to your setup script (e.g. `bin/setup`) so new developers get it automatically.
+
 ## Quick test
 
 ```bash
 # Default provider (codex)
-npx mcp-agents
+mcp-agents
 
 # Specific provider
-npx mcp-agents --provider claude
-npx mcp-agents --provider gemini
-npx mcp-agents --provider gemini --sandbox false
+mcp-agents --provider claude
+mcp-agents --provider gemini
+mcp-agents --provider gemini --sandbox false
 ```
 
 The server speaks [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio). It prints `[mcp-agents] ready (provider: <name>)` to stderr when it's listening.
@@ -57,29 +70,29 @@ Each `--provider` flag maps to a single exposed tool:
 ### `codex` (pass-through)
 
 The codex provider passes through to Codex's native MCP server (`codex mcp-server`)
-with configurable flags:
+using `-c key=value` config overrides:
 
-| CLI Flag | Default | Codex flag |
-|----------|---------|------------|
-| `--model` | `gpt-5.3-codex` | `-m <model>` |
-| `--model_reasoning_effort` | `high` | `-c model_reasoning_effort=<value>` |
+| CLI Flag | Default | Codex config key |
+|----------|---------|-----------------|
+| `--model` | `gpt-5.3-codex` | `model` |
+| `--model_reasoning_effort` | `high` | `model_reasoning_effort` |
 
-Hardcoded defaults: `-s read-only -a never` (safe for MCP server mode).
+Hardcoded defaults: `sandbox_mode=read-only`, `approval_policy=never` (safe for MCP server mode).
 
 ## Integration with Claude Code
 
-Add entries to your project's `.mcp.json`:
+Add entries to your project's `.mcp.json` (requires `npm i -g mcp-agents`):
 
 ```json
 {
   "mcpServers": {
     "codex": {
-      "command": "npx",
-      "args": ["-y", "mcp-agents@latest", "--provider", "codex"]
+      "command": "mcp-agents",
+      "args": ["--provider", "codex"]
     },
     "gemini": {
-      "command": "npx",
-      "args": ["-y", "mcp-agents@latest", "--provider", "gemini", "--sandbox", "false"]
+      "command": "mcp-agents",
+      "args": ["--provider", "gemini", "--sandbox", "false"]
     }
   }
 }
@@ -91,12 +104,31 @@ Override codex defaults:
 {
   "mcpServers": {
     "codex": {
-      "command": "npx",
-      "args": ["-y", "mcp-agents@latest", "--provider", "codex", "--model", "o3-pro", "--model_reasoning_effort", "medium"]
+      "command": "mcp-agents",
+      "args": ["--provider", "codex", "--model", "o3-pro", "--model_reasoning_effort", "medium"]
     }
   }
 }
 ```
+
+<details>
+<summary>Alternative: using npx (slower, not recommended)</summary>
+
+```json
+{
+  "mcpServers": {
+    "codex": {
+      "command": "npx",
+      "args": ["-y", "mcp-agents@latest", "--provider", "codex"]
+    }
+  }
+}
+```
+
+> **Warning:** `npx -y mcp-agents@latest` performs a network round-trip on every cold
+> start (~70s), which can exceed MCP client connection timeouts.
+
+</details>
 
 ## Integration with OpenAI Codex
 
@@ -104,15 +136,24 @@ Add two entries to `~/.codex/config.toml` — one per provider you want availabl
 
 ```toml
 [mcp_servers.claude-code]
-command = "npx"
-args = ["-y", "mcp-agents", "--provider", "claude"]
+command = "mcp-agents"
+args = ["--provider", "claude"]
 
 [mcp_servers.gemini]
-command = "npx"
-args = ["-y", "mcp-agents", "--provider", "gemini", "--sandbox", "false"]
+command = "mcp-agents"
+args = ["--provider", "gemini", "--sandbox", "false"]
 ```
 
 Then in a Codex session you can call the `claude_code` or `gemini` tools, which shell out to the respective CLIs.
+
+## Development
+
+```bash
+npm install
+npm link          # symlinks mcp-agents to your local server.js
+```
+
+After `npm link`, any edits to `server.js` take effect immediately — no reinstall needed.
 
 ## How it works
 

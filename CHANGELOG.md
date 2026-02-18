@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] - 2026-02-18
+
+### Fixed
+
+- Codex passthrough now uses `-c key=value` config overrides after `mcp-server` subcommand instead of top-level `-m`/`-s`/`-a` flags
+- Forward SIGTERM/SIGINT/SIGHUP to codex child process to prevent orphans
+- Capture codex stderr for visibility into crashes and errors
+
+### Changed
+
+- Recommend global install (`npm i -g mcp-agents`) over `npx -y` to avoid MCP connection timeouts from slow npm lookups
+
 ## [0.5.2] - 2026-02-12
 
 ### Added

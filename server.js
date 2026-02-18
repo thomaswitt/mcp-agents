@@ -92,8 +92,8 @@ Usage: mcp-agents [options]
 
 Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
-  --model <model>                Model to use (codex) [default: gpt-5.3-codex]
-  --model_reasoning_effort <e>   Reasoning effort (codex) [default: high]
+  --model <model>                Codex model [default: gpt-5.3-codex]
+  --model_reasoning_effort <e>   Codex reasoning effort [default: high]
   --sandbox <bool>               Gemini sandbox mode (true/false) [default: false]
   --timeout <seconds>            Default timeout per call [default: 300]
   --help, -h                     Show this help message
@@ -274,28 +274,47 @@ function runCli(command, args, opts = {}) {
  */
 function runCodexPassthrough({ model, modelReasoningEffort }) {
   const args = [
-    "-m",
-    model || "gpt-5.3-codex",
-    "-s",
-    "read-only",
-    "-a",
-    "never",
-    "-c",
-    `model_reasoning_effort=${modelReasoningEffort || "high"}`,
     "mcp-server",
+    "-c", `model=${model || "gpt-5.3-codex"}`,
+    "-c", "sandbox_mode=read-only",
+    "-c", "approval_policy=never",
+    "-c", `model_reasoning_effort=${modelReasoningEffort || "high"}`,
   ];
 
   logErr(`[mcp-agents] passthrough: codex ${args.join(" ")}`);
 
-  const child = spawn("codex", args, { stdio: "inherit" });
+  const child = spawn("codex", args, {
+    stdio: ["inherit", "inherit", "pipe"],
+  });
+
+  child.stderr.on("data", (chunk) => {
+    logErr(`[codex] ${chunk.toString().trimEnd()}`);
+  });
+
+  const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(sig, () => {
+      child.kill(sig);
+      setTimeout(() => {
+        child.kill("SIGKILL");
+        process.exit(128 + SIGNAL_CODES[sig]);
+      }, 5000).unref();
+    });
+  }
 
   child.on("error", (err) => {
     logErr(`[mcp-agents] failed to start codex: ${err.message}`);
     process.exitCode = 1;
   });
 
-  child.on("exit", (code) => {
-    process.exitCode = code ?? 1;
+  child.on("exit", (code, signal) => {
+    if (signal) {
+      logErr(`[mcp-agents] codex killed by ${signal}`);
+      process.exitCode = 128 + (SIGNAL_CODES[signal] ?? 0);
+    } else {
+      if (code !== 0) logErr(`[mcp-agents] codex exited with code ${code}`);
+      process.exitCode = code ?? 1;
+    }
   });
 }
 
