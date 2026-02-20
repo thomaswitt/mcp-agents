@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.4] - 2026-02-20
+
+### Fixed
+
+- Ignore unsupported tool-call arguments for `claude_code` and `gemini` instead of letting callers force backend model-like parameters
+- Accept extra tool-call keys while logging them as ignored, improving compatibility with clients that attach additional metadata
+
+### Changed
+
+- Document 5-minute default timeout (`300000ms`) for `claude_code` and `gemini`
+- Clarify that Codex model selection (`--model`, `--model_reasoning_effort`) is startup configuration, not `tools/call` input
+
 ## [0.5.3] - 2026-02-18
 
 ### Fixed

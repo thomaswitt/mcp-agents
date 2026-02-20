@@ -57,7 +57,9 @@ Each `--provider` flag maps to a single exposed tool:
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `string` | yes | The prompt to send to Claude Code |
-| `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
+| `timeout_ms` | `integer` | no | Timeout in ms (default: 300 000 / 5 minutes) |
+
+Any additional `tools/call` arguments are ignored (for example `model` or `model_reasoning_effort`).
 
 ### `gemini` parameters
 
@@ -65,7 +67,9 @@ Each `--provider` flag maps to a single exposed tool:
 |-----------|------|----------|-------------|
 | `prompt` | `string` | yes | The prompt to send to Gemini CLI |
 | `sandbox` | `boolean` | no | Run in sandbox mode (`-s` flag, default: false) |
-| `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
+| `timeout_ms` | `integer` | no | Timeout in ms (default: 300 000 / 5 minutes) |
+
+Any additional `tools/call` arguments are ignored (for example `model` or `model_reasoning_effort`).
 
 ### `codex` (pass-through)
 
@@ -98,14 +102,14 @@ Add entries to your project's `.mcp.json` (requires `npm i -g mcp-agents`):
 }
 ```
 
-Override codex defaults:
+Override codex defaults at server startup (not via `tools/call` arguments):
 
 ```json
 {
   "mcpServers": {
     "codex": {
       "command": "mcp-agents",
-      "args": ["--provider", "codex", "--model", "o3-pro", "--model_reasoning_effort", "medium"]
+      "args": ["--provider", "codex", "--model", "gpt-5.3-codex", "--model_reasoning_effort", "medium"]
     }
   }
 }

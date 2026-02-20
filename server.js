@@ -29,7 +29,8 @@ const CLI_BACKENDS = {
   claude: {
     command: "claude",
     toolName: "claude_code",
-    description: "Run Claude Code CLI with a prompt (via stdin).",
+    description:
+      "Run Claude Code CLI with a prompt (via stdin). Supports prompt + optional timeout_ms only; other arguments are ignored.",
     stdinPrompt: true,
     buildArgs: () => ["--no-session-persistence", "-p"],
     extraProperties: {},
@@ -37,7 +38,8 @@ const CLI_BACKENDS = {
   gemini: {
     command: "gemini",
     toolName: "gemini",
-    description: "Run Gemini CLI (gemini -p) with a prompt.",
+    description:
+      "Run Gemini CLI (gemini -p) with a prompt. Supports prompt + optional timeout_ms/sandbox only; other arguments are ignored.",
     stdinPrompt: false,
     buildArgs: (prompt, opts) => {
       const args = [];
@@ -352,7 +354,7 @@ async function main() {
   const properties = {
     prompt: {
       type: "string",
-      description: `Prompt for ${backend.command}`,
+      description: `Prompt for ${backend.command}. Unsupported extra arguments are ignored.`,
     },
     timeout_ms: {
       type: "integer",
@@ -379,7 +381,7 @@ async function main() {
         description: backend.description,
         inputSchema: {
           type: "object",
-          additionalProperties: false,
+          additionalProperties: true,
           properties,
           required: ["prompt"],
         },
@@ -404,8 +406,26 @@ async function main() {
       };
     }
 
-    const prompt = toStringArg(params.arguments?.prompt);
-    const timeoutMsRaw = params.arguments?.timeout_ms;
+    const rawArgs =
+      params.arguments && typeof params.arguments === "object"
+        ? params.arguments
+        : {};
+    const allowedArgKeys = new Set([
+      "prompt",
+      "timeout_ms",
+      ...Object.keys(backend.extraProperties),
+    ]);
+    const ignoredArgKeys = Object.keys(rawArgs).filter(
+      (key) => !allowedArgKeys.has(key),
+    );
+    if (ignoredArgKeys.length > 0) {
+      logErr(
+        `[mcp-agents] tools/call: ignoring unsupported args: ${ignoredArgKeys.join(", ")}`,
+      );
+    }
+
+    const prompt = toStringArg(rawArgs.prompt);
+    const timeoutMsRaw = rawArgs.timeout_ms;
     const timeoutMs = Number.isInteger(timeoutMsRaw)
       ? timeoutMsRaw
       : effectiveTimeout;
@@ -424,7 +444,7 @@ async function main() {
 
     const extraOpts = {};
     for (const key of Object.keys(backend.extraProperties)) {
-      extraOpts[key] = params.arguments?.[key] ?? backend.extraProperties[key].default;
+      extraOpts[key] = rawArgs[key] ?? backend.extraProperties[key].default;
     }
 
     const cliArgs = backend.stdinPrompt
