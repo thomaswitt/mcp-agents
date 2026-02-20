@@ -37,7 +37,9 @@ mcp-agents
 # Specific provider
 mcp-agents --provider claude
 mcp-agents --provider gemini
-mcp-agents --provider gemini --sandbox false
+
+# Optional: enable Gemini sandbox mode
+mcp-agents --provider gemini --sandbox true
 ```
 
 The server speaks [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio). It prints `[mcp-agents] ready (provider: <name>)` to stderr when it's listening.
@@ -96,7 +98,20 @@ Add entries to your project's `.mcp.json` (requires `npm i -g mcp-agents`):
     },
     "gemini": {
       "command": "mcp-agents",
-      "args": ["--provider", "gemini", "--sandbox", "false"]
+      "args": ["--provider", "gemini"]
+    }
+  }
+}
+```
+
+Optional Gemini sandbox mode in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "gemini": {
+      "command": "mcp-agents",
+      "args": ["--provider", "gemini", "--sandbox", "true"]
     }
   }
 }
@@ -136,16 +151,28 @@ Override codex defaults at server startup (not via `tools/call` arguments):
 
 ## Integration with OpenAI Codex
 
-Add two entries to `~/.codex/config.toml` — one per provider you want available:
+Add two entries to `~/.codex/config.toml` — one per provider you want available.
+Set `tool_timeout_sec = 300` to avoid Codex MCP's default 60s per-tool timeout:
 
 ```toml
 [mcp_servers.claude-code]
 command = "mcp-agents"
 args = ["--provider", "claude"]
+tool_timeout_sec = 300
 
 [mcp_servers.gemini]
 command = "mcp-agents"
-args = ["--provider", "gemini", "--sandbox", "false"]
+args = ["--provider", "gemini"]
+tool_timeout_sec = 300
+```
+
+Optional Gemini sandbox mode in Codex config:
+
+```toml
+[mcp_servers.gemini]
+command = "mcp-agents"
+args = ["--provider", "gemini", "--sandbox", "true"]
+tool_timeout_sec = 300
 ```
 
 Then in a Codex session you can call the `claude_code` or `gemini` tools, which shell out to the respective CLIs.
