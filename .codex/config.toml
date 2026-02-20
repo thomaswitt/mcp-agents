@@ -1,0 +1,9 @@
+[mcp_servers.local-claude-test]
+command = "node"
+args = ["server.js", "--provider", "claude"]
+tool_timeout_sec = 300
+
+[mcp_servers.local-gemini-test]
+command = "node"
+args = ["server.js", "--provider", "gemini"]
+tool_timeout_sec = 300

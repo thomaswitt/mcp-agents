@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.6] - 2026-02-20
+
+### Added
+
+- Add project `.mcp.json` with local Codex and Gemini MCP server entries
+
+### Fixed
+
+- Retry Claude `tools/call` once when the CLI exits successfully with empty output, then return an explicit MCP error if it is still empty
+- Add structured stderr diagnostics for empty-output retries without logging prompt content
+- Tighten connectivity integration checks to require non-empty tool text output
+- Run Claude CLI in `--output-format json` mode and parse `result`/`is_error` so MCP returns assistant text instead of raw JSON
+
 ## [0.5.5] - 2026-02-20
 
 ### Fixed

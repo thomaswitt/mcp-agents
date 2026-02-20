@@ -20,6 +20,7 @@ const VERSION = JSON.parse(
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 
 // ---------------------------------------------------------------------------
 // CLI Backend Definitions
@@ -32,7 +33,7 @@ const CLI_BACKENDS = {
     description:
       "Run Claude Code CLI with a prompt (via stdin). Supports prompt + optional timeout_ms only; other arguments are ignored.",
     stdinPrompt: true,
-    buildArgs: () => ["--no-session-persistence", "-p"],
+    buildArgs: () => ["--no-session-persistence", "-p", "--output-format", "json"],
     extraProperties: {},
   },
   gemini: {
@@ -81,6 +82,33 @@ function toStringArg(value) {
   if (typeof value === "string") return value;
   if (value == null) return "";
   return String(value);
+}
+
+/**
+ * Normalize provider output and parse Claude's JSON print format when present.
+ * @param {string} provider
+ * @param {string} output
+ * @returns {{ text: string, isError: boolean }}
+ */
+function normalizeToolOutput(provider, output) {
+  if (provider !== "claude") return { text: output, isError: false };
+
+  const trimmed = output.trim();
+  if (!trimmed) return { text: "", isError: false };
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && parsed.type === "result") {
+      return {
+        text: toStringArg(parsed.result),
+        isError: parsed.is_error === true,
+      };
+    }
+  } catch {
+    // Fall back to raw text if output shape changes or isn't JSON.
+  }
+
+  return { text: output, isError: false };
 }
 
 /**
@@ -186,11 +214,12 @@ function parseArgs() {
  * @param {string} command
  * @param {string[]} args
  * @param {{ timeoutMs?: number, stdinData?: string }} [opts]
- * @returns {Promise<string>}
+ * @returns {Promise<{ output: string, stdoutBytes: number, stderrBytes: number, durationMs: number }>}
  */
 function runCli(command, args, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const stdinData = opts.stdinData;
+  const startedAt = Date.now();
 
   return new Promise((resolve, reject) => {
     let stdout = "";
@@ -221,7 +250,12 @@ function runCli(command, args, opts = {}) {
       clearTimeout(timer);
       if (settled) return;
       settled = true;
-      err ? reject(err) : resolve((stdout || stderr || "").trimEnd());
+      err ? reject(err) : resolve({
+        output: (stdout || stderr || "").trimEnd(),
+        stdoutBytes: stdoutLen,
+        stderrBytes: stderrLen,
+        durationMs: Date.now() - startedAt,
+      });
     };
 
     child.stdout.on("data", (chunk) => {
@@ -450,16 +484,90 @@ async function main() {
     const cliArgs = backend.stdinPrompt
       ? backend.buildArgs(extraOpts)
       : backend.buildArgs(prompt, extraOpts);
-    const cliOpts = backend.stdinPrompt
-      ? { timeoutMs, stdinData: prompt }
-      : { timeoutMs };
+    const buildCliOpts = (attemptTimeoutMs) => (
+      backend.stdinPrompt
+        ? { timeoutMs: attemptTimeoutMs, stdinData: prompt }
+        : { timeoutMs: attemptTimeoutMs }
+    );
 
     logErr(`[mcp-agents] tools/call: running ${backend.command} …`);
     try {
-      const output = await runCli(backend.command, cliArgs, cliOpts);
-      logErr("[mcp-agents] tools/call: done");
+      const startedAt = Date.now();
+      const maxAttempts = providerName === "claude"
+        ? CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS
+        : 1;
+      let lastResult;
+      let lastNormalized = { text: "", isError: false };
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const elapsedMs = Date.now() - startedAt;
+        const remainingMs = timeoutMs - elapsedMs;
+
+        if (remainingMs <= 0) break;
+
+        const result = await runCli(
+          backend.command,
+          cliArgs,
+          buildCliOpts(remainingMs),
+        );
+        lastResult = result;
+        const normalized = normalizeToolOutput(providerName, result.output);
+        lastNormalized = normalized;
+
+        if (normalized.isError) {
+          const msg = normalized.text.trim() || `${backend.command} returned is_error=true`;
+          logErr(
+            `[mcp-agents] tools/call: provider returned error payload (provider=${providerName})`,
+          );
+          return {
+            content: [{ type: "text", text: msg }],
+            isError: true,
+          };
+        }
+
+        if (normalized.text.trim()) {
+          logErr("[mcp-agents] tools/call: done");
+          return {
+            content: [{ type: "text", text: normalized.text }],
+          };
+        }
+
+        if (attempt < maxAttempts) {
+          logErr(
+            "[mcp-agents] tools/call: empty output; retrying " +
+              `(provider=${providerName}, attempt=${attempt}/${maxAttempts}, ` +
+              `duration_ms=${result.durationMs}, timeout_ms=${timeoutMs}, ` +
+              `stdout_bytes=${result.stdoutBytes}, stderr_bytes=${result.stderrBytes})`,
+          );
+        }
+      }
+
+      if (lastResult && !lastNormalized.text.trim()) {
+        const elapsedMs = Date.now() - startedAt;
+        const emptyMsg = providerName === "claude"
+          ? "claude returned empty output twice (exit 0); treated as failure"
+          : `${backend.command} returned empty output (exit 0); treated as failure`;
+
+        logErr(
+          "[mcp-agents] tools/call: empty output after retries " +
+            `(provider=${providerName}, attempts=${maxAttempts}, ` +
+            `elapsed_ms=${elapsedMs}, timeout_ms=${timeoutMs}, ` +
+            `stdout_bytes=${lastResult.stdoutBytes}, stderr_bytes=${lastResult.stderrBytes})`,
+        );
+        return {
+          content: [{ type: "text", text: emptyMsg }],
+          isError: true,
+        };
+      }
+
+      const timeoutMsg = `${backend.command} failed: timeout budget exhausted before retry`;
+      logErr(
+        "[mcp-agents] tools/call: timeout budget exhausted " +
+          `(provider=${providerName}, timeout_ms=${timeoutMs})`,
+      );
       return {
-        content: [{ type: "text", text: output || "" }],
+        content: [{ type: "text", text: timeoutMsg }],
+        isError: true,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

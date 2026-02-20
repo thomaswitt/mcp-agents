@@ -99,7 +99,7 @@ test_connectivity() {
   )
 
   # Success = got a non-error tool result with actual content
-  if echo "$RESPONSE" | jq -e '.result.content[0].text' >/dev/null 2>&1 \
+  if echo "$RESPONSE" | jq -e '.result.content[0].text | type == "string" and length > 0' >/dev/null 2>&1 \
      && ! echo "$RESPONSE" | jq -e '.result.isError' >/dev/null 2>&1; then
     local text
     text=$(echo "$RESPONSE" | jq -r '.result.content[0].text' 2>/dev/null | head -1)

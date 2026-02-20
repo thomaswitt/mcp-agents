@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "local-codex-test": {
+      "command": "node",
+      "args": [
+        "server.js",
+        "--provider",
+        "codex"
+      ],
+      "env": {}
+    },
+    "local-gemini-test": {
+      "command": "node",
+      "args": [
+        "server.js",
+        "--provider",
+        "gemini"
+      ],
+      "env": {}
+    }
+  }
+}

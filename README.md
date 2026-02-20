@@ -50,7 +50,7 @@ Each `--provider` flag maps to a single exposed tool:
 
 | Provider | Tool name | CLI command |
 |----------|-----------|-------------|
-| `claude` | `claude_code` | `claude -p <prompt>` |
+| `claude` | `claude_code` | `claude -p --output-format json` |
 | `gemini` | `gemini` | `gemini [-s] -p <prompt>` |
 | `codex` | *(pass-through)* | `codex mcp-server` |
 
@@ -62,6 +62,8 @@ Each `--provider` flag maps to a single exposed tool:
 | `timeout_ms` | `integer` | no | Timeout in ms (default: 300 000 / 5 minutes) |
 
 Any additional `tools/call` arguments are ignored (for example `model` or `model_reasoning_effort`).
+
+Claude calls run with `--output-format json`; the server parses the JSON payload and returns the assistant `result` text (or an MCP error if `is_error=true`).
 
 ### `gemini` parameters
 
@@ -192,7 +194,7 @@ After `npm link`, any edits to `server.js` take effect immediately — no reinst
 2. The server reads `--provider <name>` from its argv (defaults to `codex`)
 3. It registers a single tool matching that provider's CLI
 4. Client calls `tools/call` with the tool name and a `prompt`
-5. The server runs the CLI as a child process and returns stdout (or stderr) as the tool result
+5. The server runs the CLI as a child process and returns tool text (Claude JSON `result`, or stdout/stderr for other providers)
 
 The server includes a keepalive timer to prevent Node.js from exiting prematurely when stdin reaches EOF before the async subprocess registers an active handle.
 
