@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.5] - 2026-02-20
+
+### Fixed
+
+- Document Codex MCP timeout override in the OpenAI Codex section with explicit `tool_timeout_sec = 300` examples
+- Remove redundant Gemini `--sandbox false` examples and keep `--sandbox true` as an optional override
+
 ## [0.5.4] - 2026-02-20
 
 ### Fixed
