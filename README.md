@@ -82,7 +82,7 @@ using `-c key=value` config overrides:
 
 | CLI Flag | Default | Codex config key |
 |----------|---------|-----------------|
-| `--model` | `gpt-5.3-codex` | `model` |
+| `--model` | `gpt-5.4` | `model` |
 | `--model_reasoning_effort` | `high` | `model_reasoning_effort` |
 
 Hardcoded defaults: `sandbox_mode=read-only`, `approval_policy=never` (safe for MCP server mode).
@@ -126,7 +126,7 @@ Override codex defaults at server startup (not via `tools/call` arguments):
   "mcpServers": {
     "codex": {
       "command": "mcp-agents",
-      "args": ["--provider", "codex", "--model", "gpt-5.3-codex", "--model_reasoning_effort", "medium"]
+      "args": ["--provider", "codex", "--model", "gpt-5.4", "--model_reasoning_effort", "medium"]
     }
   }
 }

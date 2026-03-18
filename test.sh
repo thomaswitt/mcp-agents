@@ -156,6 +156,7 @@ test_cli_error() {
 # ========== CLI flag tests ==========
 
 test_cli_flag "--help prints usage"         "--help"    "Usage:"
+test_cli_flag "--help shows GPT-5.4 default" "--help"   "gpt-5.4"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"

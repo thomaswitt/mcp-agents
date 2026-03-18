@@ -122,7 +122,7 @@ Usage: mcp-agents [options]
 
 Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
-  --model <model>                Codex model [default: gpt-5.3-codex]
+  --model <model>                Codex model [default: gpt-5.4]
   --model_reasoning_effort <e>   Codex reasoning effort [default: high]
   --sandbox <bool>               Gemini sandbox mode (true/false) [default: false]
   --timeout <seconds>            Default timeout per call [default: 300]
@@ -311,7 +311,7 @@ function runCli(command, args, opts = {}) {
 function runCodexPassthrough({ model, modelReasoningEffort }) {
   const args = [
     "mcp-server",
-    "-c", `model=${model || "gpt-5.3-codex"}`,
+    "-c", `model=${model || "gpt-5.4"}`,
     "-c", "sandbox_mode=read-only",
     "-c", "approval_policy=never",
     "-c", `model_reasoning_effort=${modelReasoningEffort || "high"}`,
