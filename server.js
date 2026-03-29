@@ -40,21 +40,10 @@ const CLI_BACKENDS = {
     command: "gemini",
     toolName: "gemini",
     description:
-      "Run Gemini CLI (gemini -p) with a prompt. Supports prompt + optional timeout_ms/sandbox only; other arguments are ignored.",
+      "Run Gemini CLI with a prompt. Always runs in sandbox mode with --approval-mode=plan.",
     stdinPrompt: false,
-    buildArgs: (prompt, opts) => {
-      const args = [];
-      if (opts.sandbox === true) args.push("-s");
-      args.push("-p", prompt);
-      return args;
-    },
-    extraProperties: {
-      sandbox: {
-        type: "boolean",
-        default: false,
-        description: "Run in sandbox mode (-s flag). Defaults to false.",
-      },
-    },
+    buildArgs: (prompt) => ["-s", "--approval-mode=plan", "-p", prompt],
+    extraProperties: {},
   },
   codex: {
     passthrough: true,
@@ -124,7 +113,6 @@ Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
   --model <model>                Codex model [default: gpt-5.4]
   --model_reasoning_effort <e>   Codex reasoning effort [default: high]
-  --sandbox <bool>               Gemini sandbox mode (true/false) [default: false]
   --timeout <seconds>            Default timeout per call [default: 300]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
@@ -132,15 +120,14 @@ Options:
 
 /**
  * Parse CLI flags from process.argv.
- * Handles --help, --version, --provider, --model, --model_reasoning_effort, --sandbox, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandbox: boolean, defaultTimeoutMs?: number }}
+ * Handles --help, --version, --provider, --model, --model_reasoning_effort, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
   let provider = "codex";
   let model;
   let modelReasoningEffort;
-  let sandbox = false;
   let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
@@ -178,13 +165,6 @@ function parseArgs() {
         }
         modelReasoningEffort = args[++i];
         break;
-      case "--sandbox":
-        if (i + 1 >= args.length) {
-          process.stderr.write("error: --sandbox requires a value\n");
-          process.exit(1);
-        }
-        sandbox = args[++i] === "true";
-        break;
       case "--timeout": {
         if (i + 1 >= args.length) {
           process.stderr.write("error: --timeout requires a value\n");
@@ -204,7 +184,7 @@ function parseArgs() {
     }
   }
 
-  return { provider, model, modelReasoningEffort, sandbox, defaultTimeoutMs };
+  return { provider, model, modelReasoningEffort, defaultTimeoutMs };
 }
 
 /**
@@ -359,7 +339,7 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { provider: providerName, model, modelReasoningEffort, sandbox, defaultTimeoutMs } = parseArgs();
+  const { provider: providerName, model, modelReasoningEffort, defaultTimeoutMs } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
 
   if (!backend) {
@@ -372,10 +352,6 @@ async function main() {
   if (backend.passthrough) {
     runCodexPassthrough({ model, modelReasoningEffort });
     return;
-  }
-
-  if (backend.extraProperties.sandbox) {
-    backend.extraProperties.sandbox.default = sandbox;
   }
 
   const server = new Server(
