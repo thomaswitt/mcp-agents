@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.6.0] - 2026-03-31
+
+### Fixed
+
+- Shut down Claude and Gemini provider servers when the MCP stdio connection closes instead of leaving idle `mcp-agents` processes behind
+- Kill tracked detached provider child process groups during shutdown so abandoned CLI runs do not linger after the parent server exits
+
 ## [0.5.8] - 2026-03-29
 
 ### Changed
