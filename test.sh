@@ -185,6 +185,7 @@ test_cli_error() {
 
 test_cli_flag "--help prints usage"         "--help"    "Usage:"
 test_cli_flag "--help shows GPT-5.4 default" "--help"   "gpt-5.4"
+test_cli_flag "--help shows xhigh default"  "--help"    "xhigh"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
@@ -247,6 +248,55 @@ test_codex_passthrough() {
     red "FAIL: $label"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
+  fi
+}
+
+# ── Helper: verify codex bridge starts with an isolated runtime ──
+test_codex_isolated_runtime() {
+  local label="$1"
+  local output_file
+  local status
+
+  echo "--- $label ---"
+
+  output_file=$(mktemp)
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"Reply with ONLY OK","sandbox":"read-only"}}}'
+    sleep 8
+  } | $TIMEOUT_CMD 45 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
+
+  if [ "$status" -ne 0 ]; then
+    red "FAIL: $label (exit $status)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif ! echo "$RESPONSE" | grep -q '"reasoning_effort":"xhigh"'; then
+    red "FAIL: $label (missing xhigh session config)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif ! echo "$RESPONSE" | grep -q '"server":"codex_apps"'; then
+    red "FAIL: $label (missing codex_apps startup)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif echo "$RESPONSE" | grep -Eq '"server":"(claude-code|local-claude-test|local-gemini-test|chrome-devtools|context7|aws-knowledge-mcp-server|openaiDeveloperDocs|google-dev-knowledge|github-knowledge-mcp-server)"'; then
+    red "FAIL: $label (inherited MCP server started)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif ! echo "$RESPONSE" | jq -e 'select(.id == 2) | .result.structuredContent.content == "OK"' >/dev/null 2>&1; then
+    red "FAIL: $label"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  else
+    green "PASS: $label"
+    PASS=$((PASS + 1))
   fi
 }
 
@@ -328,6 +378,7 @@ else
   test_connectivity "call claude (connectivity)" "claude" "claude_code" 30
   test_connectivity "call gemini (connectivity)" "gemini" "gemini"     30
   test_codex_passthrough "codex passthrough (tools/list)"
+  test_codex_isolated_runtime "codex passthrough (isolated runtime)"
 fi
 
 # ---------- Summary ----------

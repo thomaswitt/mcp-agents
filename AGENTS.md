@@ -26,8 +26,7 @@ node server.js --version
 ## Local Install
 
 ```sh
-npm install
-npm link
+npm install && npm link
 ```
 
 ## Critical: stdout is MCP-only

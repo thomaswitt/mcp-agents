@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-03-31
+
+### Changed
+
+- Default Codex MCP startup reasoning effort to `xhigh` instead of `high`
+- Document native per-call Codex overrides via `config.model_reasoning_effort`
+- Run the Codex bridge in an isolated temporary `CODEX_HOME` so it does not inherit external MCP servers from the user's normal Codex config
+- Disable Codex multi-agent mode in the bridge runtime to prevent recursive delegation through other LLM-backed tools
+
 ## [0.6.0] - 2026-03-31
 
 ### Fixed

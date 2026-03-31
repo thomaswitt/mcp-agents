@@ -78,14 +78,29 @@ Any additional `tools/call` arguments are ignored (for example `model` or `model
 ### `codex` (pass-through)
 
 The codex provider passes through to Codex's native MCP server (`codex mcp-server`)
-using `-c key=value` config overrides:
+inside an isolated `CODEX_HOME`. The bridge copies `auth.json` into a temporary Codex
+home, writes a minimal `config.toml`, and does not inherit your normal external MCP
+server list. That keeps Codex from recursively starting other agent tools like Claude
+or Gemini during bridge calls.
 
 | CLI Flag | Default | Codex config key |
 |----------|---------|-----------------|
 | `--model` | `gpt-5.4` | `model` |
-| `--model_reasoning_effort` | `high` | `model_reasoning_effort` |
+| `--model_reasoning_effort` | `xhigh` | `model_reasoning_effort` |
 
-Hardcoded defaults: `sandbox_mode=read-only`, `approval_policy=never` (safe for MCP server mode).
+Hardcoded defaults: `sandbox_mode=read-only`, `approval_policy=never`,
+`features.multi_agent=false`.
+
+Startup flags set server-wide defaults for the native Codex MCP server. Per-call overrides still work through the native `codex` tool schema, for example:
+
+```json
+{
+  "prompt": "Review this diff",
+  "config": {
+    "model_reasoning_effort": "medium"
+  }
+}
+```
 
 ## Integration with Claude Code
 
@@ -119,7 +134,7 @@ Optional Gemini sandbox mode in `.mcp.json`:
 }
 ```
 
-Override codex defaults at server startup (not via `tools/call` arguments):
+Override codex defaults at server startup:
 
 ```json
 {
@@ -131,6 +146,11 @@ Override codex defaults at server startup (not via `tools/call` arguments):
   }
 }
 ```
+
+The startup default can still be overridden for a single Codex tool call by passing `config.model_reasoning_effort` to the native `codex` tool.
+
+Because the bridge runs in an isolated Codex home, inherited MCP servers from your normal
+`~/.codex/config.toml` are intentionally unavailable inside bridged Codex sessions.
 
 <details>
 <summary>Alternative: using npx (slower, not recommended)</summary>

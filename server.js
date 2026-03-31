@@ -2,7 +2,15 @@
 /* eslint-disable no-console */
 
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +27,8 @@ const VERSION = JSON.parse(
 ).version;
 
 const DEFAULT_TIMEOUT_MS = 300_000;
+const DEFAULT_CODEX_MODEL = "gpt-5.4";
+const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
@@ -114,8 +124,8 @@ Usage: mcp-agents [options]
 
 Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
-  --model <model>                Codex model [default: gpt-5.4]
-  --model_reasoning_effort <e>   Codex reasoning effort [default: high]
+  --model <model>                Codex model [default: ${DEFAULT_CODEX_MODEL}]
+  --model_reasoning_effort <e>   Codex reasoning effort [default: ${DEFAULT_CODEX_MODEL_REASONING_EFFORT}]
   --timeout <seconds>            Default timeout per call [default: 300]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
@@ -298,21 +308,107 @@ function runCli(command, args, opts = {}) {
 }
 
 /**
+ * Resolve the source Codex home used by the parent process.
+ * @returns {string}
+ */
+function resolveCodexHome() {
+  return process.env.CODEX_HOME || join(process.env.HOME || tmpdir(), ".codex");
+}
+
+/**
+ * Quote a string for TOML output.
+ * @param {string} value
+ * @returns {string}
+ */
+function toTomlString(value) {
+  return JSON.stringify(value);
+}
+
+/**
+ * Build the minimal config for the isolated Codex bridge runtime.
+ * @param {{ model: string, modelReasoningEffort: string }} opts
+ * @returns {string}
+ */
+function buildCodexBridgeConfig({ model, modelReasoningEffort }) {
+  return [
+    `model = ${toTomlString(model)}`,
+    `model_reasoning_effort = ${toTomlString(modelReasoningEffort)}`,
+    'approval_policy = "never"',
+    'sandbox_mode = "read-only"',
+    "",
+    "[features]",
+    "multi_agent = false",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
+ * @param {{ model: string, modelReasoningEffort: string }} opts
+ * @returns {string}
+ */
+function createIsolatedCodexHome({ model, modelReasoningEffort }) {
+  const codexHome = mkdtempSync(join(tmpdir(), "mcp-agents-codex-"));
+  const sourceAuthPath = join(resolveCodexHome(), "auth.json");
+  const targetAuthPath = join(codexHome, "auth.json");
+  const configPath = join(codexHome, "config.toml");
+
+  if (existsSync(sourceAuthPath)) {
+    copyFileSync(sourceAuthPath, targetAuthPath);
+  }
+
+  writeFileSync(
+    configPath,
+    buildCodexBridgeConfig({ model, modelReasoningEffort }),
+    "utf8",
+  );
+
+  return codexHome;
+}
+
+/**
  * Spawn codex mcp-server as a pass-through, piping stdio directly.
  * @param {{ model?: string, modelReasoningEffort?: string }} opts
  */
 function runCodexPassthrough({ model, modelReasoningEffort }) {
-  const args = [
-    "mcp-server",
-    "-c", `model=${model || "gpt-5.4"}`,
-    "-c", "sandbox_mode=read-only",
-    "-c", "approval_policy=never",
-    "-c", `model_reasoning_effort=${modelReasoningEffort || "high"}`,
-  ];
+  const resolvedModel = model || DEFAULT_CODEX_MODEL;
+  const resolvedModelReasoningEffort =
+    modelReasoningEffort || DEFAULT_CODEX_MODEL_REASONING_EFFORT;
+  let isolatedCodexHome;
 
-  logErr(`[mcp-agents] passthrough: codex ${args.join(" ")}`);
+  try {
+    isolatedCodexHome = createIsolatedCodexHome({
+      model: resolvedModel,
+      modelReasoningEffort: resolvedModelReasoningEffort,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logErr(`[mcp-agents] failed to prepare isolated codex home: ${msg}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const args = ["mcp-server"];
+  let cleanedUp = false;
+  const cleanupIsolatedCodexHome = () => {
+    if (cleanedUp || !isolatedCodexHome) return;
+    cleanedUp = true;
+
+    try {
+      rmSync(isolatedCodexHome, { recursive: true, force: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logErr(`[mcp-agents] failed to clean isolated codex home: ${msg}`);
+    }
+  };
+
+  logErr(
+    `[mcp-agents] passthrough: codex ${args.join(" ")} ` +
+      `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, isolated_home=true)`,
+  );
 
   const child = spawn("codex", args, {
+    env: { ...process.env, CODEX_HOME: isolatedCodexHome },
     stdio: ["inherit", "inherit", "pipe"],
   });
 
@@ -325,17 +421,20 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
       child.kill(sig);
       setTimeout(() => {
         child.kill("SIGKILL");
+        cleanupIsolatedCodexHome();
         process.exit(128 + SIGNAL_CODES[sig]);
       }, 5000).unref();
     });
   }
 
   child.on("error", (err) => {
+    cleanupIsolatedCodexHome();
     logErr(`[mcp-agents] failed to start codex: ${err.message}`);
     process.exitCode = 1;
   });
 
   child.on("exit", (code, signal) => {
+    cleanupIsolatedCodexHome();
     if (signal) {
       logErr(`[mcp-agents] codex killed by ${signal}`);
       process.exitCode = 128 + (SIGNAL_CODES[signal] ?? 0);
