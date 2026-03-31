@@ -23,6 +23,13 @@ node server.js --help
 node server.js --version
 ```
 
+## Local Install
+
+```sh
+npm install
+npm link
+```
+
 ## Critical: stdout is MCP-only
 
 NEVER write to stdout in server mode — it's the MCP JSON-RPC transport. Use `logErr()` (writes to stderr) for all logging. `console.log` is only safe in `printHelp()` / `parseArgs()` which call `process.exit()` before the server starts.
@@ -49,8 +56,8 @@ Maintain `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/
 3. Run `npm install` to sync `package-lock.json`
 4. Run tests: `SKIP_INTEGRATION=1 ./test.sh`
 5. Commit: `git commit -m "<see commit message instructions below"`
-6. Tag: `git tag v0.x.y`
-7. Push: `git push && git push --tags` (only allowed manually)
+6. Tag: `git tag -a v0.x.y -m "v0.x.y"`
+7. Push: `git push --follow-tags` (only allowed manually)
 8. Publish: `npm publish` (only allowed manually)
 
 ## Style

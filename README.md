@@ -196,7 +196,11 @@ After `npm link`, any edits to `server.js` take effect immediately — no reinst
 4. Client calls `tools/call` with the tool name and a `prompt`
 5. The server runs the CLI as a child process and returns tool text (Claude JSON `result`, or stdout/stderr for other providers)
 
-The server includes a keepalive timer to prevent Node.js from exiting prematurely when stdin reaches EOF before the async subprocess registers an active handle.
+The server keeps a small keepalive timer so Node.js does not exit prematurely
+when stdin reaches EOF before an async subprocess registers an active handle.
+For Claude and Gemini provider mode, that keepalive is cleared during shutdown:
+the server now exits when the MCP stdio connection closes and kills any tracked
+detached provider child process groups that would otherwise linger.
 
 ## License
 

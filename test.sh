@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Smoke tests for mcp-agents stdio transport.
-# Verifies the server responds to piped JSON-RPC without exiting prematurely.
-#
-# The keepalive timer means the server won't exit on its own after stdin EOF,
-# so we use `timeout` to cap each test run.
+# Verifies provider servers handle JSON-RPC over stdio and exit cleanly
+# after stdin EOF. Timeouts are guardrails, not the expected shutdown path.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -29,17 +27,27 @@ test_tools_list() {
   local label="$1"
   local provider="$2"
   local expected_tool="$3"
+  local output_file
+  local status
 
   echo "--- $label ---"
 
-  RESPONSE=$(
-    {
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-      sleep 1
-    } | $TIMEOUT_CMD 10 $SERVER --provider "$provider" 2>/dev/null || true
-  )
+  output_file=$(mktemp)
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+    sleep 1
+  } | $TIMEOUT_CMD 10 $SERVER --provider "$provider" >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
 
-  if echo "$RESPONSE" | jq -e ".result.tools[] | select(.name == \"$expected_tool\")" >/dev/null 2>&1; then
+  if [ "$status" -ne 0 ]; then
+    red "FAIL: $label (exit $status)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif echo "$RESPONSE" | jq -e ".result.tools[] | select(.name == \"$expected_tool\")" >/dev/null 2>&1; then
     green "PASS: $label"
     PASS=$((PASS + 1))
   else
@@ -54,21 +62,31 @@ test_handshake() {
   local label="$1"
   local provider="$2"
   local expected_tool="$3"
+  local output_file
+  local status
 
   echo "--- $label ---"
 
-  RESPONSE=$(
-    {
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
-      sleep 0.3
-      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-      sleep 0.3
-      printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-      sleep 1
-    } | $TIMEOUT_CMD 10 $SERVER --provider "$provider" 2>/dev/null || true
-  )
+  output_file=$(mktemp)
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 1
+  } | $TIMEOUT_CMD 10 $SERVER --provider "$provider" >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
 
-  if echo "$RESPONSE" | grep -q "\"$expected_tool\""; then
+  if [ "$status" -ne 0 ]; then
+    red "FAIL: $label (exit $status)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif echo "$RESPONSE" | grep -q "\"$expected_tool\""; then
     green "PASS: $label"
     PASS=$((PASS + 1))
   else
@@ -84,22 +102,32 @@ test_connectivity() {
   local provider="$2"
   local tool_name="$3"
   local call_timeout="${4:-120}"
+  local output_file
+  local status
 
   echo "--- $label ---"
 
-  RESPONSE=$(
-    {
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
-      sleep 0.3
-      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-      sleep 0.3
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool_name\",\"arguments\":{\"prompt\":\"This is a connectivity test. Reply with exactly: OK\"}}}"
-      sleep "$call_timeout"
-    } | $TIMEOUT_CMD "$((call_timeout + 10))" $SERVER --provider "$provider" 2>/dev/null || true
-  )
+  output_file=$(mktemp)
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool_name\",\"arguments\":{\"prompt\":\"This is a connectivity test. Reply with exactly: OK\"}}}"
+    sleep "$call_timeout"
+  } | $TIMEOUT_CMD "$((call_timeout + 10))" $SERVER --provider "$provider" >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
 
   # Success = got a non-error tool result with actual content
-  if echo "$RESPONSE" | jq -e '.result.content[0].text | type == "string" and length > 0' >/dev/null 2>&1 \
+  if [ "$status" -ne 0 ]; then
+    red "FAIL: $label (exit $status)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif echo "$RESPONSE" | jq -e '.result.content[0].text | type == "string" and length > 0' >/dev/null 2>&1 \
      && ! echo "$RESPONSE" | jq -e '.result.isError' >/dev/null 2>&1; then
     local text
     text=$(echo "$RESPONSE" | jq -r '.result.content[0].text' 2>/dev/null | head -1)
@@ -189,20 +217,30 @@ test_handshake  "handshake --provider gemini → gemini"  "gemini" "gemini"
 # ── Helper: test codex pass-through (tools/list comes from codex itself) ──
 test_codex_passthrough() {
   local label="$1"
+  local output_file
+  local status
   echo "--- $label ---"
 
-  RESPONSE=$(
-    {
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
-      sleep 0.3
-      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-      sleep 0.3
-      printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-      sleep 3
-    } | $TIMEOUT_CMD 10 $SERVER --provider codex 2>/dev/null || true
-  )
+  output_file=$(mktemp)
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 3
+  } | $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
 
-  if echo "$RESPONSE" | jq -e '.result.tools' >/dev/null 2>&1; then
+  if [ "$status" -ne 0 ]; then
+    red "FAIL: $label (exit $status)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  elif echo "$RESPONSE" | jq -e '.result.tools' >/dev/null 2>&1; then
     green "PASS: $label"
     PASS=$((PASS + 1))
   else
@@ -211,6 +249,77 @@ test_codex_passthrough() {
     FAIL=$((FAIL + 1))
   fi
 }
+
+# ── Helper: verify provider shutdown kills an in-flight detached child ──
+test_provider_shutdown_kills_child() {
+  local label="$1"
+  local tmpdir pid_file output_file status child_pid
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  pid_file="$tmpdir/claude.pid"
+  output_file="$tmpdir/output.txt"
+
+  cat >"$tmpdir/claude" <<'EOF'
+#!/usr/bin/env bash
+printf '%s' "$$" > "$MCP_AGENTS_TEST_PID_FILE"
+sleep 30
+printf '%s\n' '{"type":"result","result":"OK","is_error":false}'
+EOF
+  chmod +x "$tmpdir/claude"
+
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    sleep 0.2
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.2
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"claude_code","arguments":{"prompt":"sleep"}}}'
+    sleep 1
+  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_PID_FILE="$pid_file" \
+    $TIMEOUT_CMD 5 $SERVER --provider claude >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  if [ "$status" -ne 0 ]; then
+    red "FAIL: $label (exit $status)"
+    cat "$output_file"
+    FAIL=$((FAIL + 1))
+    rm -rf "$tmpdir"
+    return
+  fi
+
+  for _ in $(seq 1 20); do
+    if [ -s "$pid_file" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  if [ ! -s "$pid_file" ]; then
+    red "FAIL: $label (missing child pid)"
+    cat "$output_file"
+    FAIL=$((FAIL + 1))
+    rm -rf "$tmpdir"
+    return
+  fi
+
+  child_pid=$(cat "$pid_file")
+  sleep 0.5
+
+  if kill -0 "$child_pid" 2>/dev/null; then
+    red "FAIL: $label (child still running: $child_pid)"
+    FAIL=$((FAIL + 1))
+  else
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  fi
+
+  rm -rf "$tmpdir"
+}
+
+test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 
 if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
   echo ""

@@ -21,6 +21,9 @@ const VERSION = JSON.parse(
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
+const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+const SHUTDOWN_TIMEOUT_MS = 3_000;
+let fatalShutdown;
 
 // ---------------------------------------------------------------------------
 // CLI Backend Definitions
@@ -193,12 +196,19 @@ function parseArgs() {
  * on timeout — prevents orphan child processes.
  * @param {string} command
  * @param {string[]} args
- * @param {{ timeoutMs?: number, stdinData?: string }} [opts]
+ * @param {{
+ *   timeoutMs?: number,
+ *   stdinData?: string,
+ *   onSpawn?: (childInfo: { pid?: number, killGroup: () => void }) => void,
+ *   onSettled?: (pid?: number) => void,
+ * }} [opts]
  * @returns {Promise<{ output: string, stdoutBytes: number, stderrBytes: number, durationMs: number }>}
  */
 function runCli(command, args, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const stdinData = opts.stdinData;
+  const onSpawn = opts.onSpawn;
+  const onSettled = opts.onSettled;
   const startedAt = Date.now();
 
   return new Promise((resolve, reject) => {
@@ -225,11 +235,13 @@ function runCli(command, args, opts = {}) {
     const killGroup = () => {
       try { process.kill(-child.pid, "SIGKILL"); } catch {}
     };
+    onSpawn?.({ pid: child.pid, killGroup });
 
     const done = (err) => {
       clearTimeout(timer);
       if (settled) return;
       settled = true;
+      onSettled?.(child.pid);
       err ? reject(err) : resolve({
         output: (stdout || stderr || "").trimEnd(),
         stdoutBytes: stdoutLen,
@@ -262,6 +274,7 @@ function runCli(command, args, opts = {}) {
     const timer = setTimeout(() => {
       killGroup();
     }, timeoutMs);
+    timer.unref();
 
     child.on("error", (err) => {
       done(new Error(`Failed to start ${command}: ${err.message}`));
@@ -307,7 +320,6 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
     logErr(`[codex] ${chunk.toString().trimEnd()}`);
   });
 
-  const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     process.once(sig, () => {
       child.kill(sig);
@@ -358,6 +370,53 @@ async function main() {
     { name: "mcp-agents", version: VERSION },
     { capabilities: { tools: {} } },
   );
+  let keepAlive;
+  let shutdownStarted = false;
+  let shutdownExitCode = 0;
+  let shutdownPromise;
+  let shutdownTimer;
+  let activeRequests = 0;
+  const activeChildren = new Map();
+
+  const maybeFinalizeShutdown = () => {
+    if (!shutdownStarted || activeRequests > 0 || shutdownPromise) return;
+
+    shutdownPromise = Promise.resolve()
+      .then(async () => {
+        if (keepAlive) clearInterval(keepAlive);
+        await server.close();
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logErr(`[mcp-agents] shutdown close failed: ${msg}`);
+      })
+      .finally(() => {
+        if (shutdownTimer) clearTimeout(shutdownTimer);
+        process.exit(shutdownExitCode);
+      });
+  };
+
+  const beginShutdown = (reason, exitCode = 0) => {
+    if (shutdownStarted) return;
+
+    shutdownStarted = true;
+    shutdownExitCode = exitCode;
+    logErr(
+      `[mcp-agents] shutting down (provider=${providerName}, reason=${reason})`,
+    );
+
+    shutdownTimer = setTimeout(() => {
+      process.exit(shutdownExitCode);
+    }, SHUTDOWN_TIMEOUT_MS);
+    shutdownTimer.unref();
+
+    for (const killGroup of activeChildren.values()) {
+      killGroup();
+    }
+
+    maybeFinalizeShutdown();
+  };
+  fatalShutdown = beginShutdown;
 
   const effectiveTimeout = defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
 
@@ -404,6 +463,13 @@ async function main() {
       return { content: [{ type: "text", text: "pong" }] };
     }
 
+    if (shutdownStarted) {
+      return {
+        content: [{ type: "text", text: "Server is shutting down" }],
+        isError: true,
+      };
+    }
+
     if (params.name !== backend.toolName) {
       return {
         content: [
@@ -416,6 +482,7 @@ async function main() {
       };
     }
 
+    activeRequests += 1;
     const rawArgs =
       params.arguments && typeof params.arguments === "object"
         ? params.arguments
@@ -441,6 +508,8 @@ async function main() {
       : effectiveTimeout;
 
     if (!prompt.trim()) {
+      activeRequests -= 1;
+      maybeFinalizeShutdown();
       return {
         content: [
           {
@@ -461,13 +530,30 @@ async function main() {
       ? backend.buildArgs(extraOpts)
       : backend.buildArgs(prompt, extraOpts);
     const buildCliOpts = (attemptTimeoutMs) => (
-      backend.stdinPrompt
-        ? { timeoutMs: attemptTimeoutMs, stdinData: prompt }
-        : { timeoutMs: attemptTimeoutMs }
+      {
+        timeoutMs: attemptTimeoutMs,
+        ...(backend.stdinPrompt ? { stdinData: prompt } : {}),
+        onSpawn: ({ pid, killGroup }) => {
+          if (!pid) return;
+          activeChildren.set(pid, killGroup);
+        },
+        onSettled: (pid) => {
+          if (!pid) return;
+          activeChildren.delete(pid);
+          maybeFinalizeShutdown();
+        },
+      }
     );
 
     logErr(`[mcp-agents] tools/call: running ${backend.command} …`);
     try {
+      if (shutdownStarted) {
+        return {
+          content: [{ type: "text", text: "Server is shutting down" }],
+          isError: true,
+        };
+      }
+
       const startedAt = Date.now();
       const maxAttempts = providerName === "claude"
         ? CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS
@@ -552,6 +638,9 @@ async function main() {
         content: [{ type: "text", text: msg }],
         isError: true,
       };
+    } finally {
+      activeRequests -= 1;
+      maybeFinalizeShutdown();
     }
   });
 
@@ -562,12 +651,27 @@ async function main() {
   // request handlers (tools/call -> execFile) register active handles.
   // The SDK transport doesn't listen for stdin 'end', so the event
   // loop loses its only handle when the pipe closes.
-  const keepAlive = setInterval(() => {}, 60_000);
+  keepAlive = setInterval(() => {}, 60_000);
   const origOnClose = transport.onclose;
   transport.onclose = () => {
     clearInterval(keepAlive);
     origOnClose?.();
   };
+
+  process.stdin.once("end", () => {
+    beginShutdown("stdin-end");
+  });
+  process.stdin.once("close", () => {
+    beginShutdown("stdin-close");
+  });
+  process.stdout.on("error", (err) => {
+    if (err?.code === "EPIPE") beginShutdown("stdout-epipe");
+  });
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(sig, () => {
+      beginShutdown(sig, 128 + SIGNAL_CODES[sig]);
+    });
+  }
 
   logErr(`[mcp-agents] ready (provider: ${providerName})`);
 }
@@ -576,15 +680,23 @@ process.on("unhandledRejection", (reason) => {
   logErr(
     `UnhandledRejection: ${reason instanceof Error ? reason.stack : reason}`,
   );
-  process.exitCode = 1;
+  if (fatalShutdown) {
+    fatalShutdown("unhandledRejection", 1);
+    return;
+  }
+  process.exit(1);
 });
 
 process.on("uncaughtException", (err) => {
   logErr(`UncaughtException: ${err.stack || err.message}`);
-  process.exitCode = 1;
+  if (fatalShutdown) {
+    fatalShutdown("uncaughtException", 1);
+    return;
+  }
+  process.exit(1);
 });
 
 main().catch((err) => {
   logErr(err.stack || err.message);
-  process.exitCode = 1;
+  process.exit(1);
 });
