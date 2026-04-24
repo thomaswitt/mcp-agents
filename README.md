@@ -85,7 +85,7 @@ or Gemini during bridge calls.
 
 | CLI Flag | Default | Codex config key |
 |----------|---------|-----------------|
-| `--model` | `gpt-5.4` | `model` |
+| `--model` | `gpt-5.5` | `model` |
 | `--model_reasoning_effort` | `xhigh` | `model_reasoning_effort` |
 
 Hardcoded defaults: `sandbox_mode=read-only`, `approval_policy=never`,
@@ -141,7 +141,7 @@ Override codex defaults at server startup:
   "mcpServers": {
     "codex": {
       "command": "mcp-agents",
-      "args": ["--provider", "codex", "--model", "gpt-5.4", "--model_reasoning_effort", "medium"]
+      "args": ["--provider", "codex", "--model", "gpt-5.5", "--model_reasoning_effort", "medium"]
     }
   }
 }
