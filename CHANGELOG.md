@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-04-24
+
+### Changed
+
+- Update the default Codex model from `gpt-5.4` to `gpt-5.5` (reasoning effort stays `xhigh`)
+- Refresh README examples and `--help` test assertion to reference `gpt-5.5`
+
 ## [0.6.5] - 2026-03-31
 
 ### Changed
