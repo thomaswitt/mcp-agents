@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-22
+
+### Changed
+
+- The `gemini` provider now spawns Google's Antigravity CLI (`agy`) instead of the legacy `gemini` binary; it runs with `--sandbox -p <prompt>`. The MCP tool name (`gemini`) and `--provider gemini` flag are unchanged
+- Antigravity has no `--approval-mode=plan` equivalent, so `--sandbox` (terminal restrictions) is now the only confinement applied
+- Bump `@modelcontextprotocol/sdk` from `^1.0.0` to `^1.29.0`
+
+### Fixed
+
+- Run the `agy`/Antigravity backend in an isolated temporary working directory (created per call, removed afterwards) so the agentic CLI cannot create workspace files such as `.antigravitycli/`, edit `.gitignore`, or stage changes in the directory the MCP server was started in
+
+### Security
+
+- Clear all 4 npm audit advisories (1 high, 3 moderate) by pinning patched transitive dependencies via `overrides`: `fast-uri` `^3.1.2`, `hono` `^4.12.22`, `ip-address` `^10.2.0`. These packages belong to the MCP SDK's HTTP transport, which the stdio server never exercises
+
 ## [0.6.6] - 2026-04-24
 
 ### Changed

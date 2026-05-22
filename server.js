@@ -50,12 +50,13 @@ const CLI_BACKENDS = {
     extraProperties: {},
   },
   gemini: {
-    command: "gemini",
+    command: "agy",
     toolName: "gemini",
     description:
-      "Run Gemini CLI with a prompt. Always runs in sandbox mode with --approval-mode=plan.",
+      "Run the Antigravity CLI (`agy`, Google's Gemini-backed agent) with a prompt. Always runs in --sandbox mode (terminal restrictions enabled).",
     stdinPrompt: false,
-    buildArgs: (prompt) => ["-s", "--approval-mode=plan", "-p", prompt],
+    isolateCwd: true,
+    buildArgs: (prompt) => ["--sandbox", "-p", prompt],
     extraProperties: {},
   },
   codex: {
@@ -209,6 +210,7 @@ function parseArgs() {
  * @param {{
  *   timeoutMs?: number,
  *   stdinData?: string,
+ *   cwd?: string,
  *   onSpawn?: (childInfo: { pid?: number, killGroup: () => void }) => void,
  *   onSettled?: (pid?: number) => void,
  * }} [opts]
@@ -217,6 +219,7 @@ function parseArgs() {
 function runCli(command, args, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const stdinData = opts.stdinData;
+  const cwd = opts.cwd;
   const onSpawn = opts.onSpawn;
   const onSettled = opts.onSettled;
   const startedAt = Date.now();
@@ -229,6 +232,7 @@ function runCli(command, args, opts = {}) {
     let settled = false;
 
     const child = spawn(command, args, {
+      cwd,
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, NO_COLOR: "1" },
@@ -305,6 +309,18 @@ function runCli(command, args, opts = {}) {
       done(null);
     });
   });
+}
+
+/**
+ * Create a fresh, empty working directory under the OS temp dir for an
+ * agentic CLI. Agentic CLIs (e.g. agy/Antigravity) treat their cwd as a
+ * workspace and write project files into it; running them here keeps them
+ * from mutating whatever directory the MCP server was started in.
+ * @param {string} provider
+ * @returns {string}
+ */
+function createIsolatedWorkdir(provider) {
+  return mkdtempSync(join(tmpdir(), `mcp-agents-${provider}-`));
 }
 
 /**
@@ -628,10 +644,12 @@ async function main() {
     const cliArgs = backend.stdinPrompt
       ? backend.buildArgs(extraOpts)
       : backend.buildArgs(prompt, extraOpts);
+    let isolatedWorkdir;
     const buildCliOpts = (attemptTimeoutMs) => (
       {
         timeoutMs: attemptTimeoutMs,
         ...(backend.stdinPrompt ? { stdinData: prompt } : {}),
+        ...(isolatedWorkdir ? { cwd: isolatedWorkdir } : {}),
         onSpawn: ({ pid, killGroup }) => {
           if (!pid) return;
           activeChildren.set(pid, killGroup);
@@ -651,6 +669,24 @@ async function main() {
           content: [{ type: "text", text: "Server is shutting down" }],
           isError: true,
         };
+      }
+
+      if (backend.isolateCwd) {
+        try {
+          isolatedWorkdir = createIsolatedWorkdir(providerName);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logErr(`[mcp-agents] failed to create isolated workdir: ${msg}`);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to prepare isolated working directory: ${msg}`,
+              },
+            ],
+            isError: true,
+          };
+        }
       }
 
       const startedAt = Date.now();
@@ -738,6 +774,14 @@ async function main() {
         isError: true,
       };
     } finally {
+      if (isolatedWorkdir) {
+        try {
+          rmSync(isolatedWorkdir, { recursive: true, force: true });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logErr(`[mcp-agents] failed to clean isolated workdir: ${msg}`);
+        }
+      }
       activeRequests -= 1;
       maybeFinalizeShutdown();
     }

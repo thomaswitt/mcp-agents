@@ -1,6 +1,6 @@
 # mcp-agents
 
-MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), and [Codex CLI](https://github.com/openai/codex) — so any MCP client can call them as tools.
+MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Antigravity CLI](https://antigravity.google/) (`agy`), and [Codex CLI](https://github.com/openai/codex) — so any MCP client can call them as tools.
 
 ## Prerequisites
 
@@ -10,7 +10,7 @@ MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/
 | CLI | Install |
 |-----|---------|
 | `claude` | [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code) |
-| `gemini` | `npm install -g @anthropic-ai/gemini-cli` |
+| `agy` | [Google Antigravity](https://antigravity.google/) |
 | `codex` | `npm install -g @openai/codex` |
 
 Only the CLI you select with `--provider` needs to be present.
@@ -37,9 +37,6 @@ mcp-agents
 # Specific provider
 mcp-agents --provider claude
 mcp-agents --provider gemini
-
-# Optional: enable Gemini sandbox mode
-mcp-agents --provider gemini --sandbox true
 ```
 
 The server speaks [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio). It prints `[mcp-agents] ready (provider: <name>)` to stderr when it's listening.
@@ -51,7 +48,7 @@ Each `--provider` flag maps to a single exposed tool:
 | Provider | Tool name | CLI command |
 |----------|-----------|-------------|
 | `claude` | `claude_code` | `claude -p --output-format json` |
-| `gemini` | `gemini` | `gemini [-s] -p <prompt>` |
+| `gemini` | `gemini` | `agy --sandbox -p <prompt>` |
 | `codex` | *(pass-through)* | `codex mcp-server` |
 
 ### `claude_code` parameters
@@ -69,11 +66,12 @@ Claude calls run with `--output-format json`; the server parses the JSON payload
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `prompt` | `string` | yes | The prompt to send to Gemini CLI |
-| `sandbox` | `boolean` | no | Run in sandbox mode (`-s` flag, default: false) |
+| `prompt` | `string` | yes | The prompt to send to the Antigravity CLI (`agy`) |
 | `timeout_ms` | `integer` | no | Timeout in ms (default: 300 000 / 5 minutes) |
 
 Any additional `tools/call` arguments are ignored (for example `model` or `model_reasoning_effort`).
+
+`agy` always runs with `--sandbox` (terminal restrictions enabled); there is no per-call sandbox toggle.
 
 ### `codex` (pass-through)
 
@@ -116,19 +114,6 @@ Add entries to your project's `.mcp.json` (requires `npm i -g mcp-agents`):
     "gemini": {
       "command": "mcp-agents",
       "args": ["--provider", "gemini"]
-    }
-  }
-}
-```
-
-Optional Gemini sandbox mode in `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "gemini": {
-      "command": "mcp-agents",
-      "args": ["--provider", "gemini", "--sandbox", "true"]
     }
   }
 }
@@ -185,15 +170,6 @@ tool_timeout_sec = 300
 [mcp_servers.gemini]
 command = "mcp-agents"
 args = ["--provider", "gemini"]
-tool_timeout_sec = 300
-```
-
-Optional Gemini sandbox mode in Codex config:
-
-```toml
-[mcp_servers.gemini]
-command = "mcp-agents"
-args = ["--provider", "gemini", "--sandbox", "true"]
 tool_timeout_sec = 300
 ```
 
