@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-31
+
+### Changed
+
+- Pin the `claude` backend to `claude-opus-4-8` at effort `xhigh` by passing `--model claude-opus-4-8 --effort xhigh` to the Claude CLI
+
+### Security
+
+- Strip per-call `model` and `config` arguments from the codex pass-through's `tools/call` requests so a client cannot override the pinned model/effort (or the read-only/never sandbox config) for a single call. Model and effort are now fixed at server startup for all providers
+
 ## [0.7.0] - 2026-05-22
 
 ### Changed

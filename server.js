@@ -29,6 +29,11 @@ const VERSION = JSON.parse(
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
+const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
+const DEFAULT_CLAUDE_EFFORT = "xhigh";
+// tools/call argument keys stripped from the codex pass-through so callers
+// cannot override the pinned model/effort (or the read-only/never config).
+const CODEX_STRIPPED_TOOL_ARGS = ["model", "config"];
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
@@ -44,9 +49,18 @@ const CLI_BACKENDS = {
     command: "claude",
     toolName: "claude_code",
     description:
-      "Run Claude Code CLI with a prompt (via stdin). Supports prompt + optional timeout_ms only; other arguments are ignored.",
+      `Run Claude Code CLI with a prompt (via stdin), pinned to ${DEFAULT_CLAUDE_MODEL} at effort ${DEFAULT_CLAUDE_EFFORT}. Supports prompt + optional timeout_ms only; other arguments (model/effort/config) are ignored.`,
     stdinPrompt: true,
-    buildArgs: () => ["--no-session-persistence", "-p", "--output-format", "json"],
+    buildArgs: () => [
+      "--model",
+      DEFAULT_CLAUDE_MODEL,
+      "--effort",
+      DEFAULT_CLAUDE_EFFORT,
+      "--no-session-persistence",
+      "-p",
+      "--output-format",
+      "json",
+    ],
     extraProperties: {},
   },
   gemini: {
@@ -383,7 +397,45 @@ function createIsolatedCodexHome({ model, modelReasoningEffort }) {
 }
 
 /**
- * Spawn codex mcp-server as a pass-through, piping stdio directly.
+ * Filter a single newline-delimited JSON-RPC message on its way to the codex
+ * pass-through. Strips per-call model/config overrides from `tools/call` so the
+ * client cannot escape the pinned model/effort (or the read-only/never config).
+ * Non-`tools/call` and unparseable lines are returned byte-for-byte unchanged so
+ * the MCP framing is preserved.
+ * @param {string} line
+ * @returns {string}
+ */
+function filterCodexToolCall(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return line;
+
+  let msg;
+  try {
+    msg = JSON.parse(trimmed);
+  } catch {
+    return line; // not JSON (e.g. partial/keepalive) — pass through untouched
+  }
+
+  const args =
+    msg && typeof msg === "object" && msg.method === "tools/call"
+      ? msg.params?.arguments
+      : null;
+  if (!args || typeof args !== "object") return line;
+
+  const stripped = CODEX_STRIPPED_TOOL_ARGS.filter((key) => key in args);
+  if (stripped.length === 0) return line;
+
+  for (const key of stripped) delete args[key];
+  logErr(
+    `[mcp-agents] codex passthrough: ignoring per-call overrides: ${stripped.join(", ")}`,
+  );
+  return JSON.stringify(msg);
+}
+
+/**
+ * Spawn codex mcp-server as a pass-through. stdout/stderr flow straight back to
+ * the client, but the client's stdin is intercepted line-by-line so per-call
+ * model/config overrides are stripped before reaching codex.
  * @param {{ model?: string, modelReasoningEffort?: string }} opts
  */
 function runCodexPassthrough({ model, modelReasoningEffort }) {
@@ -425,11 +477,32 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
 
   const child = spawn("codex", args, {
     env: { ...process.env, CODEX_HOME: isolatedCodexHome },
-    stdio: ["inherit", "inherit", "pipe"],
+    // stdin is piped (not inherited) so we can strip per-call overrides;
+    // stdout stays inherited so codex responses reach the client untouched.
+    stdio: ["pipe", "inherit", "pipe"],
   });
 
   child.stderr.on("data", (chunk) => {
     logErr(`[codex] ${chunk.toString().trimEnd()}`);
+  });
+
+  // Pump client stdin -> codex stdin, splitting on newlines (MCP stdio framing)
+  // so each JSON-RPC message can be filtered before forwarding.
+  child.stdin.on("error", () => {}); // ignore EPIPE if codex exits early
+  let stdinBuf = "";
+  process.stdin.on("data", (chunk) => {
+    stdinBuf += chunk.toString("utf8");
+    let nl;
+    while ((nl = stdinBuf.indexOf("\n")) !== -1) {
+      const line = stdinBuf.slice(0, nl);
+      stdinBuf = stdinBuf.slice(nl + 1);
+      child.stdin.write(`${filterCodexToolCall(line)}\n`);
+    }
+  });
+  process.stdin.on("error", () => {});
+  process.stdin.on("end", () => {
+    if (stdinBuf.length > 0) child.stdin.write(filterCodexToolCall(stdinBuf));
+    child.stdin.end();
   });
 
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {

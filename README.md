@@ -47,7 +47,7 @@ Each `--provider` flag maps to a single exposed tool:
 
 | Provider | Tool name | CLI command |
 |----------|-----------|-------------|
-| `claude` | `claude_code` | `claude -p --output-format json` |
+| `claude` | `claude_code` | `claude --model claude-opus-4-8 --effort xhigh -p --output-format json` |
 | `gemini` | `gemini` | `agy --sandbox -p <prompt>` |
 | `codex` | *(pass-through)* | `codex mcp-server` |
 
@@ -58,9 +58,9 @@ Each `--provider` flag maps to a single exposed tool:
 | `prompt` | `string` | yes | The prompt to send to Claude Code |
 | `timeout_ms` | `integer` | no | Timeout in ms (default: 300 000 / 5 minutes) |
 
-Any additional `tools/call` arguments are ignored (for example `model` or `model_reasoning_effort`).
+Any additional `tools/call` arguments are ignored (for example `model`, `effort`, or `config`).
 
-Claude calls run with `--output-format json`; the server parses the JSON payload and returns the assistant `result` text (or an MCP error if `is_error=true`).
+Claude is pinned to `claude-opus-4-8` at effort `xhigh`; callers cannot change the model or effort per call. Calls run with `--output-format json`; the server parses the JSON payload and returns the assistant `result` text (or an MCP error if `is_error=true`).
 
 ### `gemini` parameters
 
@@ -89,16 +89,17 @@ or Gemini during bridge calls.
 Hardcoded defaults: `sandbox_mode=read-only`, `approval_policy=never`,
 `features.multi_agent=false`.
 
-Startup flags set server-wide defaults for the native Codex MCP server. Per-call overrides still work through the native `codex` tool schema, for example:
+Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort for the native Codex MCP server. Per-call `model` and `config` arguments are stripped from `tools/call` before they reach Codex, so a client cannot override the pinned model/effort (or the read-only/never sandbox config) for a single call. For example, this request:
 
 ```json
 {
   "prompt": "Review this diff",
-  "config": {
-    "model_reasoning_effort": "medium"
-  }
+  "model": "gpt-5.5-codex",
+  "config": { "model_reasoning_effort": "medium" }
 }
 ```
+
+is forwarded to Codex as `{ "prompt": "Review this diff" }`. Change the model or effort at server startup instead.
 
 ## Integration with Claude Code
 
@@ -132,7 +133,7 @@ Override codex defaults at server startup:
 }
 ```
 
-The startup default can still be overridden for a single Codex tool call by passing `config.model_reasoning_effort` to the native `codex` tool.
+The model and effort are fixed at server startup. Per-call `model` and `config` arguments sent to the native `codex` tool are stripped before reaching Codex, so they cannot override the startup defaults.
 
 Because the bridge runs in an isolated Codex home, inherited MCP servers from your normal
 `~/.codex/config.toml` are intentionally unavailable inside bridged Codex sessions.
