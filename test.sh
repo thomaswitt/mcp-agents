@@ -122,15 +122,17 @@ test_connectivity() {
   RESPONSE=$(cat "$output_file")
   rm -f "$output_file"
 
-  # Success = got a non-error tool result with actual content
+  # Success = the tools/call (id:2) returned a non-error result whose text
+  # actually starts with "OK" (the requested reply) and is short. A non-empty
+  # string is not enough: an "Authentication required…" message (e.g. from an
+  # unauthenticated CLI) would otherwise pass the check.
   if [ "$status" -ne 0 ]; then
     red "FAIL: $label (exit $status)"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
-  elif echo "$RESPONSE" | jq -e '.result.content[0].text | type == "string" and length > 0' >/dev/null 2>&1 \
-     && ! echo "$RESPONSE" | jq -e '.result.isError' >/dev/null 2>&1; then
+  elif echo "$RESPONSE" | jq -e 'select(.id == 2) | (.result.isError != true) and (.result.content[0].text | type == "string" and (ascii_upcase | test("^\\s*OK")) and (length < 40))' >/dev/null 2>&1; then
     local text
-    text=$(echo "$RESPONSE" | jq -r '.result.content[0].text' 2>/dev/null | head -1)
+    text=$(echo "$RESPONSE" | jq -r 'select(.id == 2) | .result.content[0].text // empty' 2>/dev/null | head -c 120)
     green "PASS: $label → $text"
     PASS=$((PASS + 1))
   else
