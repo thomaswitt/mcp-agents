@@ -29,10 +29,13 @@ const VERSION = JSON.parse(
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
+const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
+const DEFAULT_CODEX_APPROVAL_POLICY = "never";
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 // tools/call argument keys stripped from the codex pass-through so callers
-// cannot override the pinned model/effort (or the read-only/never config).
+// cannot override the pinned model/effort (or the server's sandbox/approval
+// config) for a single call.
 const CODEX_STRIPPED_TOOL_ARGS = ["model", "config"];
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
@@ -141,6 +144,10 @@ Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
   --model <model>                Codex model [default: ${DEFAULT_CODEX_MODEL}]
   --model_reasoning_effort <e>   Codex reasoning effort [default: ${DEFAULT_CODEX_MODEL_REASONING_EFFORT}]
+  --sandbox_mode <mode>          Codex sandbox mode: read-only, workspace-write,
+                                 danger-full-access [default: ${DEFAULT_CODEX_SANDBOX_MODE}]
+  --approval_policy <policy>     Codex approval policy: untrusted, on-failure,
+                                 on-request, never [default: ${DEFAULT_CODEX_APPROVAL_POLICY}]
   --timeout <seconds>            Default timeout per call [default: 300]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
@@ -148,14 +155,17 @@ Options:
 
 /**
  * Parse CLI flags from process.argv.
- * Handles --help, --version, --provider, --model, --model_reasoning_effort, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, defaultTimeoutMs?: number }}
+ * Handles --help, --version, --provider, --model, --model_reasoning_effort,
+ * --sandbox_mode, --approval_policy, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
   let provider = "codex";
   let model;
   let modelReasoningEffort;
+  let sandboxMode;
+  let approvalPolicy;
   let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
@@ -193,6 +203,20 @@ function parseArgs() {
         }
         modelReasoningEffort = args[++i];
         break;
+      case "--sandbox_mode":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --sandbox_mode requires a value\n");
+          process.exit(1);
+        }
+        sandboxMode = args[++i];
+        break;
+      case "--approval_policy":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --approval_policy requires a value\n");
+          process.exit(1);
+        }
+        approvalPolicy = args[++i];
+        break;
       case "--timeout": {
         if (i + 1 >= args.length) {
           process.stderr.write("error: --timeout requires a value\n");
@@ -212,7 +236,14 @@ function parseArgs() {
     }
   }
 
-  return { provider, model, modelReasoningEffort, defaultTimeoutMs };
+  return {
+    provider,
+    model,
+    modelReasoningEffort,
+    sandboxMode,
+    approvalPolicy,
+    defaultTimeoutMs,
+  };
 }
 
 /**
@@ -356,15 +387,20 @@ function toTomlString(value) {
 
 /**
  * Build the minimal config for the isolated Codex bridge runtime.
- * @param {{ model: string, modelReasoningEffort: string }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string }} opts
  * @returns {string}
  */
-function buildCodexBridgeConfig({ model, modelReasoningEffort }) {
+function buildCodexBridgeConfig({
+  model,
+  modelReasoningEffort,
+  sandboxMode,
+  approvalPolicy,
+}) {
   return [
     `model = ${toTomlString(model)}`,
     `model_reasoning_effort = ${toTomlString(modelReasoningEffort)}`,
-    'approval_policy = "never"',
-    'sandbox_mode = "read-only"',
+    `approval_policy = ${toTomlString(approvalPolicy)}`,
+    `sandbox_mode = ${toTomlString(sandboxMode)}`,
     "",
     "[features]",
     "multi_agent = false",
@@ -374,10 +410,15 @@ function buildCodexBridgeConfig({ model, modelReasoningEffort }) {
 
 /**
  * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
- * @param {{ model: string, modelReasoningEffort: string }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string }} opts
  * @returns {string}
  */
-function createIsolatedCodexHome({ model, modelReasoningEffort }) {
+function createIsolatedCodexHome({
+  model,
+  modelReasoningEffort,
+  sandboxMode,
+  approvalPolicy,
+}) {
   const codexHome = mkdtempSync(join(tmpdir(), "mcp-agents-codex-"));
   const sourceAuthPath = join(resolveCodexHome(), "auth.json");
   const targetAuthPath = join(codexHome, "auth.json");
@@ -389,7 +430,12 @@ function createIsolatedCodexHome({ model, modelReasoningEffort }) {
 
   writeFileSync(
     configPath,
-    buildCodexBridgeConfig({ model, modelReasoningEffort }),
+    buildCodexBridgeConfig({
+      model,
+      modelReasoningEffort,
+      sandboxMode,
+      approvalPolicy,
+    }),
     "utf8",
   );
 
@@ -399,7 +445,7 @@ function createIsolatedCodexHome({ model, modelReasoningEffort }) {
 /**
  * Filter a single newline-delimited JSON-RPC message on its way to the codex
  * pass-through. Strips per-call model/config overrides from `tools/call` so the
- * client cannot escape the pinned model/effort (or the read-only/never config).
+ * client cannot escape the pinned model/effort (or the sandbox/approval config).
  * Non-`tools/call` and unparseable lines are returned byte-for-byte unchanged so
  * the MCP framing is preserved.
  * @param {string} line
@@ -436,18 +482,27 @@ function filterCodexToolCall(line) {
  * Spawn codex mcp-server as a pass-through. stdout/stderr flow straight back to
  * the client, but the client's stdin is intercepted line-by-line so per-call
  * model/config overrides are stripped before reaching codex.
- * @param {{ model?: string, modelReasoningEffort?: string }} opts
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string }} opts
  */
-function runCodexPassthrough({ model, modelReasoningEffort }) {
+function runCodexPassthrough({
+  model,
+  modelReasoningEffort,
+  sandboxMode,
+  approvalPolicy,
+}) {
   const resolvedModel = model || DEFAULT_CODEX_MODEL;
   const resolvedModelReasoningEffort =
     modelReasoningEffort || DEFAULT_CODEX_MODEL_REASONING_EFFORT;
+  const resolvedSandboxMode = sandboxMode || DEFAULT_CODEX_SANDBOX_MODE;
+  const resolvedApprovalPolicy = approvalPolicy || DEFAULT_CODEX_APPROVAL_POLICY;
   let isolatedCodexHome;
 
   try {
     isolatedCodexHome = createIsolatedCodexHome({
       model: resolvedModel,
       modelReasoningEffort: resolvedModelReasoningEffort,
+      sandboxMode: resolvedSandboxMode,
+      approvalPolicy: resolvedApprovalPolicy,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -472,7 +527,9 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
 
   logErr(
     `[mcp-agents] passthrough: codex ${args.join(" ")} ` +
-      `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, isolated_home=true)`,
+      `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, ` +
+      `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
+      `isolated_home=true)`,
   );
 
   const child = spawn("codex", args, {
@@ -539,7 +596,14 @@ function runCodexPassthrough({ model, modelReasoningEffort }) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { provider: providerName, model, modelReasoningEffort, defaultTimeoutMs } = parseArgs();
+  const {
+    provider: providerName,
+    model,
+    modelReasoningEffort,
+    sandboxMode,
+    approvalPolicy,
+    defaultTimeoutMs,
+  } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
 
   if (!backend) {
@@ -550,7 +614,12 @@ async function main() {
   }
 
   if (backend.passthrough) {
-    runCodexPassthrough({ model, modelReasoningEffort });
+    runCodexPassthrough({
+      model,
+      modelReasoningEffort,
+      sandboxMode,
+      approvalPolicy,
+    });
     return;
   }
 

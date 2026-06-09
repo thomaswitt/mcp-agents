@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-09
+
+### Changed
+
+- The codex pass-through now defaults to `sandbox_mode = "workspace-write"`
+  (previously hard-coded to `read-only`), so Codex can edit files in its
+  workspace by default; `approval_policy` stays `never`
+- Both values are now configurable at server startup via the new
+  `--sandbox_mode <mode>` and `--approval_policy <policy>` flags instead of
+  being hard-coded. Per-call overrides remain stripped (`model`/`config`), so
+  the startup configuration still applies to every `tools/call`
+
 ## [0.8.0] - 2026-05-31
 
 ### Changed
