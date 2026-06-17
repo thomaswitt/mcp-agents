@@ -39,6 +39,8 @@ NEVER write to stdout in server mode — it's the MCP JSON-RPC transport. Use `l
 - Child process stdin must be closed immediately (`child.stdin?.end()`) or the CLI hangs waiting for EOF
 - The `keepAlive` interval prevents premature exit when stdin EOF arrives before async handlers complete
 - `engines` requires `>=18` — avoid Node-version-specific syntax like import assertions
+- The codex pass-through pins model/effort (stripped in `filterCodexToolCall`) but **lets callers steer `sandbox`/`cwd`/`approval-policy` per `tools/call`**. Pass an **absolute** `cwd` — a relative one resolves against the wrapper's cwd, not the caller's project, so `workspace-write` would write to the wrong root
+- `filterCodexToolCall` MUST return a forwarded line byte-for-byte unless it actually stripped a model/effort key; re-serializing an untouched line would drift MCP framing. For the same reason the codex stdin pump buffers raw bytes and splits on the newline byte (`0x0a`), never decoding a chunk to a string before splitting
 
 ## Testing
 

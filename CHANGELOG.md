@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-17
+
+### Changed
+
+- The codex pass-through now lets callers control `sandbox`, `cwd`, and
+  `approval-policy` per `tools/call` — both the top-level args and the matching
+  `config.sandbox_mode` / `config.approval_policy` / `config.cwd` /
+  `config.sandbox_workspace_write` keys. Previously the entire `config` object
+  was stripped, which silently dropped a caller's per-call sandbox escalation and
+  left Codex stuck in the server's `workspace-write` default — surfacing as
+  "workspace is read-only / danger-full-access refused". Model and reasoning
+  effort stay pinned and cannot be overridden per call
+
+### Security
+
+- Replace the blunt `["model", "config"]` strip list with key-aware stripping
+  that removes only the model/effort pin vectors: the top-level `model` arg and,
+  inside any `config` override map, `model`, `model_reasoning_effort`, `profile`,
+  `profiles`, `model_provider`, `model_providers`, `openai_base_url`,
+  `chatgpt_base_url`, `model_catalog_json`. This closes two pin bypasses (a
+  `profile`/`profiles` carrying its own model/effort, and provider/base-url
+  re-pointing the pinned model name to another backend)
+
+### Fixed
+
+- Buffer the codex pass-through's stdin as raw bytes and split on the newline
+  byte (`0x0a`) instead of decoding each read chunk to a string before splitting.
+  A multibyte UTF-8 sequence straddling two read chunks could otherwise be
+  re-encoded non-byte-for-byte, breaking the byte-for-byte framing guarantee for
+  forwarded JSON-RPC frames
+
 ## [0.9.0] - 2026-06-09
 
 ### Changed

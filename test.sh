@@ -375,7 +375,147 @@ EOF
   rm -rf "$tmpdir"
 }
 
+# ── Helper: stub `codex` on PATH that mirrors received stdin into a capture ──
+# file, so we can assert exactly what the wrapper forwarded — no real codex.
+write_codex_capture_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env bash
+# Stub codex mcp-server: echo each received stdin line into the capture file.
+# `|| [ -n "$line" ]` also captures a final line with no trailing newline
+# (exercises the wrapper's end-of-stdin partial-frame path).
+while IFS= read -r line || [ -n "$line" ]; do
+  printf '%s\n' "$line" >> "$MCP_AGENTS_TEST_CAPTURE"
+done
+EOF
+  chmod +x "$1/codex"
+}
+
+# ── Helper: codex passthrough strips model/effort (and the profile/provider ──
+# bypass vectors) while leaving sandbox/cwd/approval intact for per-call control.
+test_codex_strips_only_model_effort() {
+  local label="$1"
+  local tmpdir capture output_file status call_line ok bad good
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  capture="$tmpdir/codex_stdin.txt"
+  output_file="$tmpdir/output.txt"
+  : >"$capture"
+  write_codex_capture_stub "$tmpdir"
+
+  # Every key that MUST be stripped carries an "evil" marker (in its value, or
+  # in the dotted key name), and every key that MUST survive does not — so a
+  # single "no evil leaked through" assertion covers the whole denylist incl.
+  # dotted-path overrides (profiles.*, model_providers.*).
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"hi","model":"evil-model","sandbox":"read-only","cwd":"/tmp/wsroot","approval-policy":"never","config":{"model":"evil-model","model_reasoning_effort":"evil-effort","profile":"evil-profile","profiles":{"p":{"model":"evil-x"}},"profiles.evil.model":"evil-y","model_provider":"evil-prov","model_providers":{"m":{"base_url":"http://evil"}},"model_providers.x.base_url":"http://evil2","openai_base_url":"http://evil3","chatgpt_base_url":"http://evil4","model_catalog_json":"evil-json","plan_mode_reasoning_effort":"evil-plan","review_model":"evil-review","sandbox_mode":"danger-full-access","approval_policy":"never","cwd":"/tmp/wsroot"}}}}'
+    sleep 0.5
+  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_CAPTURE="$capture" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  call_line=$(grep '"method":"tools/call"' "$capture" 2>/dev/null | tail -1)
+  ok=1
+  # No stripped key (model/effort/profile/provider/base-url/plan/review, incl.
+  # dotted variants) may survive — none of the kept keys contains "evil".
+  printf '%s' "$call_line" | grep -q 'evil' && ok=0
+  for good in '"sandbox":"read-only"' '"sandbox_mode":"danger-full-access"' '"approval-policy":"never"' '"approval_policy":"never"' '"cwd":"/tmp/wsroot"'; do
+    printf '%s' "$call_line" | grep -q "$good" || ok=0
+  done
+
+  if [ "$status" -eq 0 ] && [ -n "$call_line" ] && [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Forwarded: $call_line"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: a tools/call with nothing to strip is forwarded byte-for-byte ──
+# (no JSON re-serialization), preserving MCP stdio framing exactly.
+test_codex_passes_through_unmodified() {
+  local label="$1"
+  local tmpdir capture output_file status input captured
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  capture="$tmpdir/codex_stdin.txt"
+  output_file="$tmpdir/output.txt"
+  : >"$capture"
+  write_codex_capture_stub "$tmpdir"
+
+  # Multibyte UTF-8 in the prompt: proves the raw-byte buffering forwards
+  # non-ASCII content intact (the motivation for the Buffer rewrite).
+  input='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"höhö 日本語 🚀 — ünïcödé","sandbox":"workspace-write","cwd":"/tmp/x"}}}'
+
+  set +e
+  {
+    printf '%s\n' "$input"
+    sleep 0.5
+  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_CAPTURE="$capture" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  captured=$(grep '"method":"tools/call"' "$capture" 2>/dev/null | tail -1)
+  if [ "$status" -eq 0 ] && [ "$captured" = "$input" ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Expected: $input"
+    echo "  Captured: $captured"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: a per-call sandbox=workspace-write + absolute cwd actually grants ──
+# writes end-to-end (real codex). Proves the read-only symptom is fixed.
+test_codex_percall_write() {
+  local label="$1"
+  local probe_dir probe_file output_file status RESPONSE
+  echo "--- $label ---"
+
+  probe_dir=$(mktemp -d)
+  probe_file="$probe_dir/mcp_agents_probe.txt"
+  output_file=$(mktemp)
+
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"codex\",\"arguments\":{\"prompt\":\"Create a file named mcp_agents_probe.txt containing exactly OK in your current working directory, then reply with only OK.\",\"sandbox\":\"workspace-write\",\"cwd\":\"$probe_dir\"}}}"
+    sleep 30
+  } | $TIMEOUT_CMD 50 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
+
+  if [ -f "$probe_file" ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (probe file not created — per-call sandbox/cwd did not grant writes)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$probe_dir"
+}
+
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
+
+# Stub-based codex filtering tests (fast — no real codex needed)
+test_codex_strips_only_model_effort "codex strips model/effort, keeps sandbox/cwd/approval"
+test_codex_passes_through_unmodified "codex forwards no-strip tools/call byte-for-byte"
 
 if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
   echo ""
@@ -385,6 +525,7 @@ else
   test_connectivity "call gemini (connectivity)" "gemini" "gemini"     30
   test_codex_passthrough "codex passthrough (tools/list)"
   test_codex_isolated_runtime "codex passthrough (isolated runtime)"
+  test_codex_percall_write "codex per-call workspace-write grants writes"
 fi
 
 # ---------- Summary ----------

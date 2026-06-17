@@ -34,9 +34,31 @@ const DEFAULT_CODEX_APPROVAL_POLICY = "never";
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 // tools/call argument keys stripped from the codex pass-through so callers
-// cannot override the pinned model/effort (or the server's sandbox/approval
-// config) for a single call.
-const CODEX_STRIPPED_TOOL_ARGS = ["model", "config"];
+// cannot override the pinned model/effort. sandbox/cwd/approval-policy are
+// intentionally left intact so callers can steer them per call.
+//   - top-level: only the dedicated `model` arg (there is no top-level
+//     model_reasoning_effort/profile arg in the codex tool schema)
+//   - inside the `config` override map: model/effort plus every other
+//     model-envelope vector — a `profile`/`profiles` can carry its own
+//     model/effort, provider/base-url keys re-point the same model name to a
+//     different backend, and the plan/review variants carry their own
+//     model/effort; all are stripped so the pin cannot be bypassed. Matched on
+//     each config key's HEAD segment so dotted overrides (codex accepts paths
+//     like `profiles.x.model`) are caught too, not just exact keys.
+const CODEX_STRIPPED_TOP_LEVEL_ARGS = ["model"];
+const CODEX_STRIPPED_CONFIG_KEYS = [
+  "model",
+  "model_reasoning_effort",
+  "profile",
+  "profiles",
+  "model_provider",
+  "model_providers",
+  "openai_base_url",
+  "chatgpt_base_url",
+  "model_catalog_json",
+  "plan_mode_reasoning_effort",
+  "review_model",
+];
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
@@ -444,10 +466,13 @@ function createIsolatedCodexHome({
 
 /**
  * Filter a single newline-delimited JSON-RPC message on its way to the codex
- * pass-through. Strips per-call model/config overrides from `tools/call` so the
- * client cannot escape the pinned model/effort (or the sandbox/approval config).
- * Non-`tools/call` and unparseable lines are returned byte-for-byte unchanged so
- * the MCP framing is preserved.
+ * pass-through. Strips per-call model/effort overrides from `tools/call` so the
+ * client cannot escape the pinned model/effort — both the top-level `model` arg
+ * and the model-envelope keys inside a `config` override map. sandbox/cwd/
+ * approval-policy (top-level and inside `config`) are intentionally left intact
+ * so callers can steer them per call. Non-`tools/call`, unparseable, and
+ * nothing-to-strip lines are returned byte-for-byte unchanged so the MCP framing
+ * is preserved.
  * @param {string} line
  * @returns {string}
  */
@@ -468,12 +493,36 @@ function filterCodexToolCall(line) {
       : null;
   if (!args || typeof args !== "object") return line;
 
-  const stripped = CODEX_STRIPPED_TOOL_ARGS.filter((key) => key in args);
-  if (stripped.length === 0) return line;
+  const removed = [];
 
-  for (const key of stripped) delete args[key];
+  for (const key of CODEX_STRIPPED_TOP_LEVEL_ARGS) {
+    if (key in args) {
+      delete args[key];
+      removed.push(key);
+    }
+  }
+
+  // Per-call `config` overrides beat CODEX_HOME/config.toml, so the pinned
+  // model/effort must be stripped from here too; everything else (sandbox_mode,
+  // approval_policy, cwd, sandbox_workspace_write, …) is left untouched. codex
+  // config overrides also accept dotted paths (e.g. "profiles.x.model"), so
+  // match each key on its HEAD segment, not the exact key.
+  const cfg = args.config;
+  if (cfg && typeof cfg === "object" && !Array.isArray(cfg)) {
+    for (const key of Object.keys(cfg)) {
+      if (CODEX_STRIPPED_CONFIG_KEYS.includes(key.split(".")[0])) {
+        delete cfg[key];
+        removed.push(`config.${key}`);
+      }
+    }
+    // Drop a now-empty override map so codex never receives a bare `config: {}`.
+    if (Object.keys(cfg).length === 0) delete args.config;
+  }
+
+  if (removed.length === 0) return line; // nothing pinned to strip — keep framing
+
   logErr(
-    `[mcp-agents] codex passthrough: ignoring per-call overrides: ${stripped.join(", ")}`,
+    `[mcp-agents] codex passthrough: pinning model/effort, stripped: ${removed.join(", ")}`,
   );
   return JSON.stringify(msg);
 }
@@ -543,22 +592,27 @@ function runCodexPassthrough({
     logErr(`[codex] ${chunk.toString().trimEnd()}`);
   });
 
-  // Pump client stdin -> codex stdin, splitting on newlines (MCP stdio framing)
-  // so each JSON-RPC message can be filtered before forwarding.
+  // Pump client stdin -> codex stdin, splitting on the newline BYTE (0x0a) that
+  // delimits MCP stdio JSON-RPC frames. Buffering raw bytes (not per-chunk
+  // strings) avoids corrupting a multibyte UTF-8 sequence that straddles two
+  // read chunks, which would otherwise break the byte-for-byte passthrough.
   child.stdin.on("error", () => {}); // ignore EPIPE if codex exits early
-  let stdinBuf = "";
+  const NEWLINE = 0x0a;
+  let stdinBuf = Buffer.alloc(0);
   process.stdin.on("data", (chunk) => {
-    stdinBuf += chunk.toString("utf8");
+    stdinBuf = stdinBuf.length ? Buffer.concat([stdinBuf, chunk]) : chunk;
     let nl;
-    while ((nl = stdinBuf.indexOf("\n")) !== -1) {
-      const line = stdinBuf.slice(0, nl);
-      stdinBuf = stdinBuf.slice(nl + 1);
+    while ((nl = stdinBuf.indexOf(NEWLINE)) !== -1) {
+      const line = stdinBuf.subarray(0, nl).toString("utf8");
+      stdinBuf = stdinBuf.subarray(nl + 1);
       child.stdin.write(`${filterCodexToolCall(line)}\n`);
     }
   });
   process.stdin.on("error", () => {});
   process.stdin.on("end", () => {
-    if (stdinBuf.length > 0) child.stdin.write(filterCodexToolCall(stdinBuf));
+    if (stdinBuf.length > 0) {
+      child.stdin.write(filterCodexToolCall(stdinBuf.toString("utf8")));
+    }
     child.stdin.end();
   });
 
