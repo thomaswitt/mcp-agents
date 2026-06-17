@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-06-17
+
+### Changed
+
+- Normalize `package.json` `bin` (`./server.js` → `server.js`) and
+  `repository.url` to npm's canonical forms so `npm publish` no longer emits
+  manifest auto-correction warnings. No runtime change — the published `bin`
+  already resolved to `server.js`
+
 ## [0.10.1] - 2026-06-17
 
 ### Fixed
