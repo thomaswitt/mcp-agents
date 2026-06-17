@@ -137,6 +137,12 @@ test_connectivity() {
     PASS=$((PASS + 1))
   else
     red "FAIL: $label"
+    # A well-formed MCP result whose text isn't a short "OK" usually means the
+    # provider CLI's JSON output shape changed and the wrapper fell back to the
+    # raw blob — flag it so drift is obvious, not mysterious.
+    if echo "$RESPONSE" | jq -e 'select(.id == 2) | .result.content[0].text | type == "string"' >/dev/null 2>&1; then
+      echo "  ⚠ could not extract a clean answer (possible JSON shape drift or model noncompliance)"
+    fi
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
   fi
@@ -297,7 +303,7 @@ test_codex_isolated_runtime() {
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
   elif ! echo "$RESPONSE" | jq -e 'select(.id == 2) | .result.structuredContent.content == "OK"' >/dev/null 2>&1; then
-    red "FAIL: $label"
+    red "FAIL: $label (codex MCP result shape unexpected — output format may have changed)"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
   else
@@ -479,7 +485,7 @@ test_codex_passes_through_unmodified() {
 # writes end-to-end (real codex). Proves the read-only symptom is fixed.
 test_codex_percall_write() {
   local label="$1"
-  local probe_dir probe_file output_file status RESPONSE
+  local probe_dir probe_file output_file status RESPONSE shape_ok
   echo "--- $label ---"
 
   probe_dir=$(mktemp -d)
@@ -500,11 +506,22 @@ test_codex_percall_write() {
   RESPONSE=$(cat "$output_file")
   rm -f "$output_file"
 
-  if [ -f "$probe_file" ]; then
+  # Two independent checks: the file proves per-call sandbox/cwd granted writes,
+  # and the live JSON-shape assertion verifies codex's MCP result envelope still
+  # matches what the bridge depends on (so codex output-format drift is caught).
+  shape_ok=0
+  if echo "$RESPONSE" | jq -e 'select(.id == 2) | (.result.isError != true) and (.result.structuredContent.content | type == "string")' >/dev/null 2>&1; then
+    shape_ok=1
+  fi
+
+  if [ "$status" -eq 0 ] && [ -f "$probe_file" ] && [ "$shape_ok" -eq 1 ]; then
     green "PASS: $label"
     PASS=$((PASS + 1))
   else
-    red "FAIL: $label (probe file not created — per-call sandbox/cwd did not grant writes)"
+    red "FAIL: $label"
+    [ "$status" -eq 0 ] || echo "  server exited non-zero ($status)"
+    [ -f "$probe_file" ] || echo "  probe file not created — per-call sandbox/cwd did not grant writes"
+    [ "$shape_ok" -eq 1 ] || echo "  ⚠ codex MCP result shape unexpected — output format may have changed"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
   fi

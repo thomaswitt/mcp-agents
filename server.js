@@ -128,6 +128,9 @@ function toStringArg(value) {
 
 /**
  * Normalize provider output and parse Claude's JSON print format when present.
+ * `--output-format json` emits either a single `{type:"result"}` object or
+ * (newer CLIs, e.g. 2.1.x) an array of stream events whose final
+ * `type:"result"` entry holds the answer; both are supported.
  * @param {string} provider
  * @param {string} output
  * @returns {{ text: string, isError: boolean }}
@@ -140,10 +143,24 @@ function normalizeToolOutput(provider, output) {
 
   try {
     const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && parsed.type === "result") {
+    // Resolve the result event from either shape. Scanning from the end finds
+    // the terminal result without depending on Array.prototype.findLast
+    // (keeps the Node >=18 floor — see engines).
+    let result = parsed;
+    if (Array.isArray(parsed)) {
+      result = null;
+      for (let i = parsed.length - 1; i >= 0; i--) {
+        const event = parsed[i];
+        if (event && typeof event === "object" && event.type === "result") {
+          result = event;
+          break;
+        }
+      }
+    }
+    if (result && typeof result === "object" && result.type === "result") {
       return {
-        text: toStringArg(parsed.result),
-        isError: parsed.is_error === true,
+        text: toStringArg(result.result),
+        isError: result.is_error === true,
       };
     }
   } catch {

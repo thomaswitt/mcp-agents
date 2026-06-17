@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-17
+
+### Fixed
+
+- Parse the `claude` backend's `--output-format json` when it is an array of
+  stream events (Claude CLI 2.1.x) rather than a single `{type:"result"}`
+  object. The old parser only handled the object form and silently fell back to
+  forwarding the raw JSON blob, so MCP callers received the whole event log
+  instead of the assistant's answer
+
+### Changed
+
+- The live integration tests now assert the real CLI JSON output shape for both
+  the `claude` and `codex` backends (and the codex write-probe checks the MCP
+  result envelope, not just the written file), emitting an explicit "output
+  format may have changed" diagnostic on mismatch so upstream CLI format drift
+  is detected instead of silently misparsed
+
 ## [0.10.0] - 2026-06-17
 
 ### Changed
