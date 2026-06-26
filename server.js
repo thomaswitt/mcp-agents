@@ -31,6 +31,11 @@ const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
 const DEFAULT_CODEX_APPROVAL_POLICY = "never";
+// Idle watchdog for the codex pass-through: if a request is in flight and codex
+// emits nothing on stdout/stderr for this long, the wrapper synthesizes a
+// JSON-RPC error for the open request(s) and tears codex down — converting an
+// unbounded post-completion stall into a surfaced error. 0 disables it.
+const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 // tools/call argument keys stripped from the codex pass-through so callers
@@ -61,7 +66,7 @@ const CODEX_STRIPPED_CONFIG_KEYS = [
 ];
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
-const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
 const SHUTDOWN_TIMEOUT_MS = 3_000;
 let fatalShutdown;
 
@@ -187,6 +192,8 @@ Options:
                                  danger-full-access [default: ${DEFAULT_CODEX_SANDBOX_MODE}]
   --approval_policy <policy>     Codex approval policy: untrusted, on-failure,
                                  on-request, never [default: ${DEFAULT_CODEX_APPROVAL_POLICY}]
+  --codex_idle_timeout <secs>    Codex pass-through idle watchdog; 0 disables
+                                 [default: ${DEFAULT_CODEX_IDLE_TIMEOUT_MS / 1000}]
   --timeout <seconds>            Default timeout per call [default: 300]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
@@ -195,8 +202,8 @@ Options:
 /**
  * Parse CLI flags from process.argv.
  * Handles --help, --version, --provider, --model, --model_reasoning_effort,
- * --sandbox_mode, --approval_policy, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, defaultTimeoutMs?: number }}
+ * --sandbox_mode, --approval_policy, --codex_idle_timeout, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexIdleTimeoutMs?: number, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -205,6 +212,7 @@ function parseArgs() {
   let modelReasoningEffort;
   let sandboxMode;
   let approvalPolicy;
+  let codexIdleTimeoutMs;
   let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
@@ -256,6 +264,21 @@ function parseArgs() {
         }
         approvalPolicy = args[++i];
         break;
+      case "--codex_idle_timeout": {
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --codex_idle_timeout requires a value\n");
+          process.exit(1);
+        }
+        const secs = Number(args[++i]);
+        if (!Number.isFinite(secs) || secs < 0) {
+          process.stderr.write(
+            "error: --codex_idle_timeout must be a non-negative number\n",
+          );
+          process.exit(1);
+        }
+        codexIdleTimeoutMs = Math.round(secs * 1000);
+        break;
+      }
       case "--timeout": {
         if (i + 1 >= args.length) {
           process.stderr.write("error: --timeout requires a value\n");
@@ -281,6 +304,7 @@ function parseArgs() {
     modelReasoningEffort,
     sandboxMode,
     approvalPolicy,
+    codexIdleTimeoutMs,
     defaultTimeoutMs,
   };
 }
@@ -459,26 +483,33 @@ function createIsolatedCodexHome({
   approvalPolicy,
 }) {
   const codexHome = mkdtempSync(join(tmpdir(), "mcp-agents-codex-"));
-  const sourceAuthPath = join(resolveCodexHome(), "auth.json");
-  const targetAuthPath = join(codexHome, "auth.json");
-  const configPath = join(codexHome, "config.toml");
+  // If auth copy or config write throws after the dir exists, remove the
+  // partially-prepared dir before rethrowing so it is never leaked.
+  try {
+    const sourceAuthPath = join(resolveCodexHome(), "auth.json");
+    const targetAuthPath = join(codexHome, "auth.json");
+    const configPath = join(codexHome, "config.toml");
 
-  if (existsSync(sourceAuthPath)) {
-    copyFileSync(sourceAuthPath, targetAuthPath);
+    if (existsSync(sourceAuthPath)) {
+      copyFileSync(sourceAuthPath, targetAuthPath);
+    }
+
+    writeFileSync(
+      configPath,
+      buildCodexBridgeConfig({
+        model,
+        modelReasoningEffort,
+        sandboxMode,
+        approvalPolicy,
+      }),
+      "utf8",
+    );
+
+    return codexHome;
+  } catch (err) {
+    try { rmSync(codexHome, { recursive: true, force: true }); } catch {}
+    throw err;
   }
-
-  writeFileSync(
-    configPath,
-    buildCodexBridgeConfig({
-      model,
-      modelReasoningEffort,
-      sandboxMode,
-      approvalPolicy,
-    }),
-    "utf8",
-  );
-
-  return codexHome;
 }
 
 /**
@@ -545,22 +576,27 @@ function filterCodexToolCall(line) {
 }
 
 /**
- * Spawn codex mcp-server as a pass-through. stdout/stderr flow straight back to
- * the client, but the client's stdin is intercepted line-by-line so per-call
- * model/config overrides are stripped before reaching codex.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string }} opts
+ * Spawn codex mcp-server as a pass-through. codex stdout is forwarded back to
+ * the client byte-for-byte, but the client's stdin is intercepted line-by-line
+ * so per-call model/config overrides are stripped before reaching codex. An
+ * idle watchdog converts an unbounded codex stall (no stdout/stderr while a
+ * request is in flight) into a synthesized JSON-RPC error so the caller never
+ * hangs forever.
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, idleTimeoutMs?: number }} opts
  */
 function runCodexPassthrough({
   model,
   modelReasoningEffort,
   sandboxMode,
   approvalPolicy,
+  idleTimeoutMs,
 }) {
   const resolvedModel = model || DEFAULT_CODEX_MODEL;
   const resolvedModelReasoningEffort =
     modelReasoningEffort || DEFAULT_CODEX_MODEL_REASONING_EFFORT;
   const resolvedSandboxMode = sandboxMode || DEFAULT_CODEX_SANDBOX_MODE;
   const resolvedApprovalPolicy = approvalPolicy || DEFAULT_CODEX_APPROVAL_POLICY;
+  const resolvedIdleTimeoutMs = idleTimeoutMs ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
   let isolatedCodexHome;
 
   try {
@@ -595,18 +631,372 @@ function runCodexPassthrough({
     `[mcp-agents] passthrough: codex ${args.join(" ")} ` +
       `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, ` +
       `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
-      `isolated_home=true)`,
+      `idle_timeout_ms=${resolvedIdleTimeoutMs}, isolated_home=true)`,
   );
 
   const child = spawn("codex", args, {
     env: { ...process.env, CODEX_HOME: isolatedCodexHome },
-    // stdin is piped (not inherited) so we can strip per-call overrides;
-    // stdout stays inherited so codex responses reach the client untouched.
-    stdio: ["pipe", "inherit", "pipe"],
+    // stdin is piped so we can strip per-call overrides; stdout is piped (not
+    // inherited) so the wrapper can both forward responses byte-for-byte AND
+    // observe them for the idle watchdog. detached:true puts codex in its own
+    // process group so a stall is torn down group-wide (mirrors runCli).
+    detached: true,
+    stdio: ["pipe", "pipe", "pipe"],
   });
 
+  const NEWLINE = 0x0a;
+  // Clean the isolated home on any exit path, not just the ones we route through
+  // hardExit() (e.g. a global uncaughtException handler calling process.exit).
+  process.once("exit", () => cleanupIsolatedCodexHome());
+
+  // Install signal teardown IMMEDIATELY after spawn (before the heavier wiring
+  // below) so a signal in the startup window can never orphan the detached
+  // group. `finalize` is a forward reference — safe because the handler body
+  // only runs when a signal fires, which is after this synchronous setup
+  // completes and `finalize` is defined.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(sig, () => {
+      finalize({
+        reason: `signal ${sig}`,
+        emit: false,
+        exitCode: 128 + SIGNAL_CODES[sig],
+      });
+    });
+  }
+
+  // ── In-flight request tracking ──────────────────────────────────────────
+  // Client requests (id + method) awaiting a codex response. Keyed by a
+  // type-preserving key so JSON-RPC `1` (number) and `"1"` (string) never
+  // collide. `canceled` marks ids the client gave up on (notifications/
+  // cancelled): we never synthesize a response for them, but they still count
+  // toward teardown so a canceled-but-wedged codex is not left running.
+  const inFlight = new Map();
+  const idKey = (id) => `${typeof id}:${id}`;
+  const addInFlight = (id) => {
+    if (id == null) return;
+    const key = idKey(id);
+    if (!inFlight.has(key)) inFlight.set(key, { id, canceled: false });
+  };
+  const clearInFlight = (id) => {
+    if (id != null) inFlight.delete(idKey(id));
+  };
+  const cancelInFlight = (id) => {
+    const entry = id == null ? undefined : inFlight.get(idKey(id));
+    if (entry) entry.canceled = true;
+  };
+  const hasEmittableInFlight = () => {
+    for (const entry of inFlight.values()) if (!entry.canceled) return true;
+    return false;
+  };
+
+  // ── Liveness / lifecycle state ──────────────────────────────────────────
+  let finalizing = false;
+  let exited = false;
+  let stdoutPaused = false; // process.stdout backpressured (downstream, not idle)
+  let idleTimer;
+  let lastForwardedByteWasNewline = true; // nothing forwarded yet
+  let stdoutObsBuf = Buffer.alloc(0); // observation copy of codex stdout
+  let skippingFrame = false; // mid-skip of an oversized stdout frame (resync at \n)
+  let droppedFrameResponseId; // partial oversized frame's classified id (cleared at its newline)
+  let observationDropLogged = false; // log the first observation-cap drop only
+
+  const killGroup = (signal) => {
+    try {
+      if (child.pid) process.kill(-child.pid, signal);
+      else child.kill(signal);
+    } catch {
+      try { child.kill(signal); } catch {}
+    }
+  };
+
+  const clearIdle = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  };
+  const armIdle = () => {
+    clearIdle();
+    // No watchdog when disabled, while finalizing, or while downstream is
+    // backpressured (blocked downstream != idle upstream).
+    if (!(resolvedIdleTimeoutMs > 0) || finalizing || stdoutPaused) return;
+    idleTimer = setTimeout(onIdle, resolvedIdleTimeoutMs);
+  };
+  const resetIdle = armIdle;
+
+  // Parse one complete codex->client stdout frame (observation only — the raw
+  // bytes are forwarded separately). Clears an id once its result/error lands.
+  const observeOutgoingLine = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let msg;
+    try { msg = JSON.parse(trimmed); } catch { return; }
+    if (
+      msg && typeof msg === "object" && "id" in msg &&
+      ("result" in msg || "error" in msg)
+    ) {
+      clearInFlight(msg.id);
+    }
+  };
+
+  // Classify a (possibly oversized) frame from a bounded prefix: return the
+  // request id iff it is clearly a RESPONSE — a top-level "result"/"error" with
+  // the "id" appearing before it and no top-level "method" preceding it.
+  // Assumes codex's (serde_json) serialization order: a response is
+  // {jsonrpc,id,result|error} (id/result within the first handful of bytes), and
+  // a notification/request emits its top-level "method" before "params". Under
+  // that contract a nested "result"/"id" inside a non-response's params cannot be
+  // misread as a response. Only ever consulted for frames too large to buffer.
+  const FRAME_HEADER_SCAN = 8192;
+  const peekResponseId = (prefix) => {
+    const s = prefix
+      .subarray(0, Math.min(prefix.length, FRAME_HEADER_SCAN))
+      .toString("utf8");
+    const resultAt = s.search(/"(?:result|error)"\s*:/);
+    if (resultAt === -1) return undefined; // no result/error -> not a response
+    const methodAt = s.search(/"method"\s*:/);
+    if (methodAt !== -1 && methodAt < resultAt) return undefined; // request/notif
+    // Capture the full id TOKEN (number or quoted string) and JSON-decode it so
+    // the value matches what noteInbound stored via JSON.parse — otherwise an
+    // escaped string id (e.g. "a\\b") would not equal the tracked key.
+    const idMatch = s
+      .slice(0, resultAt)
+      .match(/"id"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|"(?:[^"\\]|\\.)*")/);
+    if (!idMatch) return undefined;
+    try { return JSON.parse(idMatch[1]); } catch { return undefined; }
+  };
+
+  const logObservationDropOnce = () => {
+    if (!observationDropLogged) {
+      logErr(
+        "[mcp-agents] codex passthrough: stdout frame exceeded observation cap; " +
+          "classifying it via a bounded header scan (forwarding unaffected)",
+      );
+      observationDropLogged = true;
+    }
+  };
+
+  // Resolve a dropped frame's effect on id-tracking. The frame's raw bytes were
+  // already forwarded to the client. If a bounded header scan proves it is the
+  // RESPONSE for an in-flight id, clear exactly that id — so we neither
+  // double-respond with a synthetic error nor falsely idle-kill a healthy
+  // session once codex goes quiet. If it is NOT a response (notification /
+  // server->client request) or cannot be classified, leave the in-flight ids
+  // tracked so a genuine post-frame stall is still caught. ONLY call this once
+  // the frame is COMPLETE (its terminating newline has been seen): clearing on a
+  // still-partial frame would prematurely untrack an id whose response codex may
+  // never finish writing, re-introducing a hang.
+  const resolveDroppedFrame = (prefix) => {
+    const id = peekResponseId(prefix);
+    if (id !== undefined) clearInFlight(id);
+  };
+
+  // Accumulate codex stdout into the observation buffer and parse each complete
+  // frame to clear in-flight ids. Soft-bounded by MAX_BUFFER_BYTES so a
+  // pathologically large single frame cannot exhaust memory — the bound is
+  // approximate (a frame may transiently allocate up to one stream chunk beyond
+  // the cap before being dropped). The RAW bytes are always forwarded untouched
+  // by the caller regardless. A dropped frame is handled by onObservedFrameDropped().
+  const observeOutgoing = (chunk) => {
+    let data = chunk;
+    if (skippingFrame) {
+      const nl = data.indexOf(NEWLINE);
+      if (nl === -1) return; // still inside the oversized frame
+      // The oversized frame just COMPLETED. Apply the deferred clear now: if its
+      // header looked like a response, the response genuinely finished, so clear
+      // that id. (If codex had stalled mid-frame, this newline never arrives and
+      // the id stays tracked so the watchdog still catches the stall.)
+      skippingFrame = false;
+      if (droppedFrameResponseId !== undefined) {
+        clearInFlight(droppedFrameResponseId);
+        droppedFrameResponseId = undefined;
+      }
+      data = data.subarray(nl + 1); // resume parsing after the frame boundary
+    }
+    stdoutObsBuf = stdoutObsBuf.length ? Buffer.concat([stdoutObsBuf, data]) : data;
+    let nl;
+    while ((nl = stdoutObsBuf.indexOf(NEWLINE)) !== -1) {
+      if (nl > MAX_BUFFER_BYTES) {
+        // A COMPLETE frame larger than the cap: it fully arrived, so classify it
+        // from a bounded header prefix and clear its id now (no huge alloc).
+        logObservationDropOnce();
+        resolveDroppedFrame(stdoutObsBuf.subarray(0, nl));
+        stdoutObsBuf = stdoutObsBuf.subarray(nl + 1);
+        continue;
+      }
+      const line = stdoutObsBuf.subarray(0, nl).toString("utf8");
+      stdoutObsBuf = stdoutObsBuf.subarray(nl + 1);
+      observeOutgoingLine(line);
+    }
+    if (stdoutObsBuf.length > MAX_BUFFER_BYTES) {
+      // A PARTIAL frame already past the cap with no newline yet: classify the
+      // prefix but DEFER clearing to the frame's newline (above) — clearing now
+      // would untrack an id whose response codex might never finish, hanging it.
+      logObservationDropOnce();
+      droppedFrameResponseId = peekResponseId(stdoutObsBuf);
+      stdoutObsBuf = Buffer.alloc(0);
+      skippingFrame = true;
+    }
+  };
+
+  const hardExit = (code) => {
+    if (exited) return;
+    exited = true;
+    clearIdle();
+    cleanupIsolatedCodexHome();
+    process.exit(code);
+  };
+  const flushThenExit = (code) => {
+    if (exited) return;
+    if (process.stdout.writableLength === 0) {
+      hardExit(code);
+      return;
+    }
+    // Ref'd safety timer guarantees exit if 'drain' never fires (client gone).
+    const safety = setTimeout(() => hardExit(code), 2_000);
+    process.stdout.once("drain", () => {
+      clearTimeout(safety);
+      hardExit(code);
+    });
+  };
+
+  // Single, idempotent teardown. `emit` controls whether open (non-canceled)
+  // requests get a synthetic JSON-RPC error before exit. The detached group is
+  // killed on EVERY teardown path so codex and any descendants are never
+  // orphaned.
+  const finalize = ({ reason, emit, exitCode }) => {
+    if (finalizing) return;
+    finalizing = true;
+    clearIdle();
+    logErr(`[mcp-agents] codex passthrough finalize: ${reason}`);
+
+    // Stop forwarding further codex stdout so a late real response cannot race
+    // the synthetic error onto the wire after we've taken over the stream.
+    try { child.stdout?.pause(); } catch {}
+
+    // Kill the whole detached group so codex AND any descendants it spawned are
+    // reaped on EVERY teardown path — never orphaned. On abort paths (idle /
+    // signal / EPIPE / fatal) codex is still alive, so there is no PID-reuse
+    // risk; on a natural close/spawn-error this runs synchronously right after
+    // the child was reaped (a negligible reuse window) to clean up anything
+    // codex left behind in its group. A SIGKILL on an already-empty group is a
+    // harmless ESRCH (swallowed by killGroup).
+    killGroup("SIGKILL");
+
+    if (emit && hasEmittableInFlight()) {
+      // Framing recovery: if codex left a dangling partial line on the wire, try
+      // to parse it (it may itself be the real response) and terminate it with a
+      // newline so the synthetic frame cannot glue onto a half-written line.
+      if (stdoutObsBuf.length > 0) {
+        observeOutgoingLine(stdoutObsBuf.toString("utf8"));
+        stdoutObsBuf = Buffer.alloc(0);
+        try { process.stdout.write("\n"); } catch {}
+        lastForwardedByteWasNewline = true;
+      } else if (!lastForwardedByteWasNewline) {
+        try { process.stdout.write("\n"); } catch {}
+        lastForwardedByteWasNewline = true;
+      }
+
+      for (const entry of inFlight.values()) {
+        if (entry.canceled) continue;
+        const frame = {
+          jsonrpc: "2.0",
+          id: entry.id,
+          error: {
+            code: -32001,
+            message:
+              `mcp-agents: codex pass-through aborted before responding ` +
+              `(${reason}); the request was still open. Any applied edits may ` +
+              `exist — verify the tree.`,
+          },
+        };
+        try { process.stdout.write(`${JSON.stringify(frame)}\n`); } catch {}
+      }
+    }
+
+    flushThenExit(exitCode);
+  };
+
+  // Route the global uncaughtException/unhandledRejection handlers through the
+  // same teardown so codex's DETACHED group is always killed — otherwise those
+  // handlers call process.exit() directly and orphan codex (the 'exit' handler
+  // only deletes CODEX_HOME, it cannot reap a detached group).
+  fatalShutdown = (reason, code) =>
+    finalize({ reason: `fatal: ${reason}`, emit: true, exitCode: code ?? 1 });
+
+  function onIdle() {
+    idleTimer = undefined;
+    if (finalizing) return;
+    if (hasEmittableInFlight()) {
+      finalize({
+        reason: `idle timeout (${Math.round(resolvedIdleTimeoutMs / 1000)}s)`,
+        emit: true,
+        exitCode: 1,
+      });
+      return;
+    }
+    // Only canceled requests left -> tear down quietly. Nothing open at all ->
+    // healthy idle between calls, just re-arm.
+    if (inFlight.size > 0) {
+      finalize({
+        reason: "idle timeout (canceled-only)",
+        emit: false,
+        exitCode: 1,
+      });
+    } else {
+      armIdle();
+    }
+  }
+
   child.stderr.on("data", (chunk) => {
+    resetIdle();
     logErr(`[codex] ${chunk.toString().trimEnd()}`);
+  });
+
+  // Forward codex stdout to the client byte-for-byte (raw Buffer) and keep a
+  // parallel observation buffer (split on the newline BYTE) to clear in-flight
+  // ids as their responses land. Raw chunks are forwarded; reconstructed lines
+  // are never written back.
+  child.stdout.on("data", (chunk) => {
+    if (finalizing) return; // stream ownership has been taken over
+    resetIdle();
+
+    // Forward the raw bytes FIRST so a bug in observation can never affect the
+    // byte-for-byte passthrough (observation is best-effort id-tracking only).
+    if (chunk.length > 0) {
+      lastForwardedByteWasNewline = chunk[chunk.length - 1] === NEWLINE;
+    }
+    const ok = process.stdout.write(chunk);
+    try {
+      observeOutgoing(chunk); // bounded parse-for-ids; never alters forwarded bytes
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logErr(`[mcp-agents] codex passthrough: stdout observation error (ignored): ${msg}`);
+    }
+    if (!ok) {
+      // Downstream full: pause codex and suspend the idle watchdog until the
+      // client drains, so a slow reader is never mistaken for a stalled codex.
+      // Trade-off: a client that never drains keeps the request open with no
+      // watchdog — but a synthetic error could not be delivered to it anyway.
+      stdoutPaused = true;
+      clearIdle();
+      child.stdout.pause();
+    }
+  });
+
+  process.stdout.on("drain", () => {
+    if (!stdoutPaused) return;
+    stdoutPaused = false;
+    if (finalizing) return;
+    child.stdout.resume();
+    resetIdle();
+  });
+
+  process.stdout.on("error", (err) => {
+    // Client went away mid-write: nothing left to answer, tear codex down.
+    if (err && err.code === "EPIPE") {
+      finalize({ reason: "stdout EPIPE", emit: false, exitCode: 0 });
+    }
   });
 
   // Pump client stdin -> codex stdin, splitting on the newline BYTE (0x0a) that
@@ -614,51 +1004,106 @@ function runCodexPassthrough({
   // strings) avoids corrupting a multibyte UTF-8 sequence that straddles two
   // read chunks, which would otherwise break the byte-for-byte passthrough.
   child.stdin.on("error", () => {}); // ignore EPIPE if codex exits early
-  const NEWLINE = 0x0a;
+
+  // Read-only inbound tracking: record client requests (id + method) as
+  // in-flight and honor cancellations. Never mutates what is forwarded —
+  // filterCodexToolCall remains the sole authority on the forwarded bytes.
+  const noteInbound = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let msg;
+    try { msg = JSON.parse(trimmed); } catch { return; }
+    if (!msg || typeof msg !== "object") return;
+    // (Watchdog liveness is reset at the byte level in the stdin 'data' handler,
+    // so even an elicitation response — bare id, no method — keeps a healthy
+    // interactive flow alive.)
+    if (msg.method === "notifications/cancelled") {
+      cancelInFlight(msg.params?.requestId);
+      return;
+    }
+    // A client message awaits a response iff it carries BOTH an id and a method.
+    // A bare id with no method is a *response* to a codex elicitation — skip it
+    // for in-flight tracking.
+    if (msg.id != null && typeof msg.method === "string") {
+      addInFlight(msg.id);
+    }
+  };
+
   let stdinBuf = Buffer.alloc(0);
   process.stdin.on("data", (chunk) => {
+    // ANY inbound bytes mean the client side of the exchange is alive — even a
+    // large/slow elicitation response arriving across chunks without a newline.
+    // Reset the watchdog here at the BYTE level (not per parsed line): a truly
+    // stalled exchange (codex silent AND client sending nothing) still produces
+    // no inbound, so the genuine stall is still caught.
+    resetIdle();
     stdinBuf = stdinBuf.length ? Buffer.concat([stdinBuf, chunk]) : chunk;
     let nl;
     while ((nl = stdinBuf.indexOf(NEWLINE)) !== -1) {
       const line = stdinBuf.subarray(0, nl).toString("utf8");
       stdinBuf = stdinBuf.subarray(nl + 1);
+      noteInbound(line);
       child.stdin.write(`${filterCodexToolCall(line)}\n`);
     }
   });
   process.stdin.on("error", () => {});
   process.stdin.on("end", () => {
     if (stdinBuf.length > 0) {
-      child.stdin.write(filterCodexToolCall(stdinBuf.toString("utf8")));
+      const line = stdinBuf.toString("utf8");
+      noteInbound(line);
+      child.stdin.write(filterCodexToolCall(line));
     }
     child.stdin.end();
   });
 
-  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-    process.once(sig, () => {
-      child.kill(sig);
-      setTimeout(() => {
-        child.kill("SIGKILL");
-        cleanupIsolatedCodexHome();
-        process.exit(128 + SIGNAL_CODES[sig]);
-      }, 5000).unref();
-    });
-  }
-
   child.on("error", (err) => {
-    cleanupIsolatedCodexHome();
     logErr(`[mcp-agents] failed to start codex: ${err.message}`);
-    process.exitCode = 1;
+    // codex failed to start. The fix that matters is that we EXIT (instead of
+    // leaving a childless wrapper alive on the client's open stdin, which used
+    // to hang). `emit` synthesizes an error only if a request was already
+    // tracked; spawn 'error' usually fires before any stdin is read, so the
+    // client typically just sees the server exit — the conventional
+    // "server failed to start".
+    finalize({
+      reason: `codex spawn error: ${err.message}`,
+      emit: true,
+      exitCode: 1,
+    });
   });
 
-  child.on("exit", (code, signal) => {
-    cleanupIsolatedCodexHome();
-    if (signal) {
-      logErr(`[mcp-agents] codex killed by ${signal}`);
-      process.exitCode = 128 + (SIGNAL_CODES[signal] ?? 0);
-    } else {
-      if (code !== 0) logErr(`[mcp-agents] codex exited with code ${code}`);
-      process.exitCode = code ?? 1;
+  // codex death is handled via BOTH 'exit' and 'close':
+  //  - 'exit' fires when the codex PROCESS terminates. A descendant that
+  //    inherited codex's stdio can hold those pipes open, delaying or even
+  //    preventing 'close' (and would be orphaned), so we kill the group here to
+  //    reap it — which also lets 'close' fire. A ref'd fallback guarantees
+  //    teardown even if a descendant escaped the group (setsid) so 'close'
+  //    never arrives.
+  //  - 'close' fires once all stdio is drained, so codex's final response has
+  //    been delivered and its id cleared — only THEN do we decide whether to
+  //    synthesize, which avoids double-responding.
+  let childExitInfo = null;
+  const onChildGone = () => {
+    const code = childExitInfo?.code;
+    const signal = childExitInfo?.signal;
+    if (signal) logErr(`[mcp-agents] codex killed by ${signal}`);
+    else if (code != null && code !== 0) {
+      logErr(`[mcp-agents] codex exited with code ${code}`);
     }
+    finalize({
+      reason: signal ? `codex killed by ${signal}` : `codex exited (code ${code})`,
+      emit: true,
+      exitCode: signal ? 128 + (SIGNAL_CODES[signal] ?? 0) : (code ?? 1),
+    });
+  };
+
+  child.on("exit", (code, signal) => {
+    childExitInfo = { code, signal };
+    killGroup("SIGKILL");
+    setTimeout(onChildGone, 2_000);
+  });
+  child.on("close", (code, signal) => {
+    if (!childExitInfo) childExitInfo = { code, signal };
+    onChildGone();
   });
 }
 
@@ -673,6 +1118,7 @@ async function main() {
     modelReasoningEffort,
     sandboxMode,
     approvalPolicy,
+    codexIdleTimeoutMs,
     defaultTimeoutMs,
   } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
@@ -690,6 +1136,7 @@ async function main() {
       modelReasoningEffort,
       sandboxMode,
       approvalPolicy,
+      idleTimeoutMs: codexIdleTimeoutMs,
     });
     return;
   }

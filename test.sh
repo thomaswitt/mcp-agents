@@ -196,6 +196,7 @@ test_cli_flag "--help shows GPT-5.5 default" "--help"   "gpt-5.5"
 test_cli_flag "--help shows xhigh default"  "--help"    "xhigh"
 test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
+test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
@@ -209,6 +210,9 @@ test_cli_error "--timeout without value"                    "--timeout"         
 test_cli_error "--timeout with zero"                        "--timeout 0"                "must be a positive number"
 test_cli_error "--timeout with negative"                    "--timeout -5"               "must be a positive number"
 test_cli_error "--timeout with non-number"                  "--timeout abc"              "must be a positive number"
+test_cli_error "--codex_idle_timeout without value"         "--codex_idle_timeout"       "requires a value"
+test_cli_error "--codex_idle_timeout non-number"            "--codex_idle_timeout abc"   "non-negative number"
+test_cli_error "--codex_idle_timeout negative"              "--codex_idle_timeout -1"    "non-negative number"
 
 # ========== Protocol tests (fast) ==========
 
@@ -396,6 +400,106 @@ EOF
   chmod +x "$1/codex"
 }
 
+# ── Helper: node stub `codex` mcp-server for the watchdog tests. Answers ──
+# initialize, emits one event for tools/call, then per MCP_STUB_MODE either
+# stalls (stays silent → exercises the idle watchdog) or dies (process.exit →
+# exercises the child-death path). No real codex needed.
+write_codex_watchdog_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env node
+const MODE = process.env.MCP_STUB_MODE || "stall";
+// Record our pid so the test can assert the wrapper actually killed us on
+// teardown (no orphaned stalled codex), mirroring the claude shutdown test.
+if (process.env.MCP_AGENTS_TEST_PID_FILE) {
+  try { require("fs").writeFileSync(process.env.MCP_AGENTS_TEST_PID_FILE, String(process.pid)); } catch {}
+}
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (d) => {
+  buf += d;
+  let nl;
+  while ((nl = buf.indexOf("\n")) !== -1) {
+    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+    let m; try { m = JSON.parse(line); } catch { continue; }
+    if (m.method === "initialize") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "stub", version: "0" } } }) + "\n");
+    } else if (m.method === "tools/call") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "codex/event", params: { msg: "working" } }) + "\n");
+      if (MODE === "die") process.exit(0); // codex dies without responding
+      // stall: emit nothing further → idle watchdog must fire
+    }
+  }
+});
+setInterval(() => {}, 1 << 30);
+EOF
+  chmod +x "$1/codex"
+}
+
+# ── Helper: drive initialize + tools/call(id:2) at a stub codex, asserting the ──
+# wrapper synthesizes a JSON-RPC -32001 error for the open id:2 (no hang).
+#   $1 label, $2 MCP_STUB_MODE (stall|die), $3 extra server args
+run_codex_watchdog_case() {
+  local label="$1" mode="$2" extra="$3" expected_status="$4"
+  local tmpdir output_file pid_file status RESPONSE child_pid
+  local resp_ok=0 child_ok=0
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  pid_file="$tmpdir/codex.pid"
+  write_codex_watchdog_stub "$tmpdir"
+
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"hi"}}}'
+    sleep 4
+  } | PATH="$tmpdir:$PATH" MCP_STUB_MODE="$mode" MCP_AGENTS_TEST_PID_FILE="$pid_file" \
+    $TIMEOUT_CMD 12 $SERVER --provider codex $extra >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  child_pid=$(cat "$pid_file" 2>/dev/null || true)
+  sleep 0.3 # allow the group SIGKILL to take effect before the liveness check
+
+  # The wrapper must surface for the still-open id:2 EXACTLY one error frame
+  # that is the -32001 idle/teardown error, and NO result frame for it (no
+  # double-respond, no malformed result+error frame), and it must NOT have
+  # errored the already-answered id:1.
+  if echo "$RESPONSE" | jq -se '
+      (map(select(.id == 1 and has("error"))) | length == 0) and
+      (map(select(.id == 2 and has("result"))) | length == 0) and
+      (map(select(.id == 2 and has("error"))) | length == 1) and
+      (map(select(.id == 2 and (.error.code? == -32001))) | length == 1)
+    ' >/dev/null 2>&1; then
+    resp_ok=1
+  fi
+  # The wrapper must also tear codex down (no orphaned stalled child).
+  if [ -n "$child_pid" ] && ! kill -0 "$child_pid" 2>/dev/null; then
+    child_ok=1
+  fi
+
+  # Exact exit code, not just "not a timeout": stall tears down via the idle
+  # watchdog (exit 1); die exits with codex's own clean code (0). A different
+  # code means an unexpected crash.
+  if [ "$status" -eq "$expected_status" ] && [ "$resp_ok" -eq 1 ] && [ "$child_ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status want=$expected_status resp_ok=$resp_ok child_ok=$child_ok)"
+    echo "  Response: $RESPONSE"
+    if [ "$child_ok" -ne 1 ]; then
+      echo "  codex stub still alive (orphan): ${child_pid:-<no pid>}"
+      [ -n "$child_pid" ] && kill -9 "$child_pid" 2>/dev/null
+    fi
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 # ── Helper: codex passthrough strips model/effort (and the profile/provider ──
 # bypass vectors) while leaving sandbox/cwd/approval intact for per-call control.
 test_codex_strips_only_model_effort() {
@@ -533,6 +637,12 @@ test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 # Stub-based codex filtering tests (fast — no real codex needed)
 test_codex_strips_only_model_effort "codex strips model/effort, keeps sandbox/cwd/approval"
 test_codex_passes_through_unmodified "codex forwards no-strip tools/call byte-for-byte"
+
+# Stub-based codex watchdog/child-death tests (fast — no real codex needed)
+run_codex_watchdog_case "codex idle watchdog synthesizes error for stalled call" \
+  "stall" "--codex_idle_timeout 1" 1
+run_codex_watchdog_case "codex child death synthesizes error (no childless hang)" \
+  "die" "--codex_idle_timeout 30" 0
 
 if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
   echo ""

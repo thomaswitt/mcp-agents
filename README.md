@@ -101,6 +101,19 @@ Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort f
 
 is forwarded to Codex as `{ "prompt": "Review this diff" }`. Change the model or effort at server startup instead.
 
+**Idle watchdog.** The codex pass-through is transparent, so a Codex session that
+stalls after doing work (e.g. its final model turn hangs, or it waits on an
+elicitation the client never answers) would otherwise hang the caller's
+`tools/call` forever. `--codex_idle_timeout <seconds>` (default `600`, `0`
+disables) bounds this: if Codex emits nothing while a request is in flight for
+that long, the wrapper returns a JSON-RPC error (`-32001`) for the open
+request(s), kills the Codex process group, and exits — turning an unbounded stall
+into a surfaced error. The timer resets on any Codex output or inbound client
+activity and is suspended while the client backpressures stdout, so healthy long
+or interactive runs are not killed. The wrapper also exits (instead of lingering)
+if Codex dies or fails to start, so a dead Codex can never leave the caller
+hanging.
+
 ## Integration with Claude Code
 
 Add entries to your project's `.mcp.json` (requires `npm i -g mcp-agents`):

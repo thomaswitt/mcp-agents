@@ -5,7 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.11.0] - 2026-06-26
+
+### Added
+
+- Idle watchdog for the codex pass-through (`--codex_idle_timeout <secs>`,
+  default 600, `0` disables). If codex emits nothing while a request is in
+  flight for that long, the wrapper synthesizes a JSON-RPC error (`-32001`) for
+  the open request(s), kills codex's process group, and exits — converting an
+  unbounded post-completion stall into a surfaced error instead of an infinite
+  hang. The watchdog resets on any codex stdout/stderr or inbound client
+  activity and is suspended while the client backpressures stdout, so healthy
+  long or interactive runs are not killed
+
+### Fixed
+
+- The codex pass-through now exits (synthesizing an error for any open request)
+  when codex dies or fails to spawn, instead of leaving a childless wrapper
+  alive on the client's open stdin — a second way the caller's `tools/call`
+  could hang forever
+- codex stdout is now piped and forwarded byte-for-byte (was inherited) so the
+  wrapper can observe responses for the watchdog; codex now runs in its own
+  process group and is torn down group-wide so a stalled codex (and any
+  descendants) is never orphaned
 
 ## [0.10.2] - 2026-06-17
 
