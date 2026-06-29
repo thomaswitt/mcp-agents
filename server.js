@@ -683,6 +683,48 @@ function filterCodexToolCall(line, opts = {}) {
   return JSON.stringify(msg);
 }
 
+// Tools whose advertised inputSchema gains a wrapper-only `goal` property so a
+// client's model knows it can pass one (the model only emits args declared in
+// the schema). The arg is stripped inbound by filterCodexToolCall before it
+// reaches codex; advertising it here is purely for discoverability.
+const CODEX_GOAL_TOOLS = new Set(["codex", "codex-reply"]);
+const CODEX_GOAL_PROPERTY_DESCRIPTION =
+  "Optional standing objective for this Codex session. mcp-agents injects it as " +
+  "`developer-instructions` (codex) or a prompt reminder (codex-reply); it is not a " +
+  "native Codex parameter. Overrides the server-wide --goal default for this call; " +
+  "pass an empty string to suppress that default.";
+
+/**
+ * Mutate a parsed `tools/list` RESPONSE in place, adding a `goal` property to the
+ * advertised inputSchema of the `codex` and `codex-reply` tools. Returns true iff
+ * it added `goal` to at least one tool. Only `properties` is touched — `required`
+ * and `additionalProperties` are left intact (a declared property is not an
+ * "additional" one, so `additionalProperties:false` stays valid). Best-effort per
+ * tool: a target tool that already declares `goal` (idempotent) or whose
+ * inputSchema.properties is missing/malformed (drifted schema) is simply skipped;
+ * other valid targets are still augmented. Returns false (→ the caller forwards the
+ * original bytes byte-for-byte) for an error response, a non-array `result.tools`,
+ * or when no `codex`/`codex-reply` target was augmentable.
+ * @param {any} msg
+ * @returns {boolean}
+ */
+function injectGoalIntoToolsListMessage(msg) {
+  const tools = msg?.result?.tools;
+  if (!Array.isArray(tools)) return false;
+  let changed = false;
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object" || !CODEX_GOAL_TOOLS.has(tool.name)) continue;
+    const schema = tool.inputSchema;
+    if (!schema || typeof schema !== "object" || Array.isArray(schema)) continue;
+    const props = schema.properties;
+    if (!props || typeof props !== "object" || Array.isArray(props)) continue;
+    if ("goal" in props) continue; // idempotent — respect an existing declaration
+    props.goal = { type: "string", description: CODEX_GOAL_PROPERTY_DESCRIPTION };
+    changed = true;
+  }
+  return changed;
+}
+
 /**
  * Spawn codex mcp-server as a pass-through. codex stdout is forwarded back to
  * the client byte-for-byte, but the client's stdin is intercepted line-by-line
@@ -811,6 +853,18 @@ function runCodexPassthrough({
   let skippingFrame = false; // mid-skip of an oversized stdout frame (resync at \n)
   let droppedFrameResponseId; // partial oversized frame's classified id (cleared at its newline)
   let observationDropLogged = false; // log the first observation-cap drop only
+
+  // ── tools/list goal-advertising rewrite (contained latch) ────────────────
+  // While a `tools/list` request id is outstanding the forwarder switches from
+  // raw passthrough to buffer-and-rewrite, injecting a `goal` property into the
+  // advertised codex/codex-reply schemas of that one response, then returns to
+  // raw. Observation above stays the SOLE authority for inFlight/the watchdog;
+  // this path only changes HOW bytes reach the wire.
+  const pendingToolsListIds = new Set(); // idKey(id) of outstanding tools/list requests (the latch)
+  let rewriteBuf = Buffer.alloc(0); // buffer-mode accumulator; holds ≤1 trailing partial after a flush
+  let rewriteSkipUntilNewline = false; // forwarding raw to the next newline (oversized frame or mode-boundary align)
+  let rewriteSkipReleaseId; // idKey to release when the skipped frame's newline lands (oversized response only)
+  let oversizedToolsListLogged = false; // log the first rewrite-cap drop only
 
   const killGroup = (signal) => {
     try {
@@ -996,10 +1050,53 @@ function runCodexPassthrough({
     killGroup("SIGKILL");
 
     if (emit && hasEmittableInFlight()) {
-      // Framing recovery: if codex left a dangling partial line on the wire, try
-      // to parse it (it may itself be the real response) and terminate it with a
-      // newline so the synthetic frame cannot glue onto a half-written line.
-      if (stdoutObsBuf.length > 0) {
+      // Framing recovery. Precedence handles bytes WITHHELD by buffer mode (which
+      // the plain stdoutObsBuf recovery would mis-handle). EVERY write here is
+      // try/catch-guarded: finalize runs synchronously from close/exit/idle/signal
+      // handlers, so an unguarded EPIPE would escape into uncaughtException ->
+      // fatalShutdown -> a re-entrant finalize early-return, skipping
+      // flushThenExit/process.exit and hanging the wrapper.
+      if (rewriteSkipUntilNewline) {
+        // Oversized/align mid-skip: head already forwarded raw, remainder
+        // unrecoverable. Discard; the -32001 loop covers the still-open id.
+        rewriteBuf = Buffer.alloc(0);
+        rewriteSkipUntilNewline = false;
+        stdoutObsBuf = Buffer.alloc(0);
+        if (!lastForwardedByteWasNewline) {
+          try { process.stdout.write("\n"); } catch {}
+          lastForwardedByteWasNewline = true;
+        }
+      } else if (rewriteBuf.length > 0) {
+        // A withheld buffered partial (never forwarded). If it parses as a COMPLETE
+        // message (only its trailing newline missing) — possible only when the whole
+        // frame arrived post-latch, so NONE of it is on the wire — deliver it
+        // (rewritten if a pending tools/list response, else raw) + "\n" and clear its
+        // id (no -32001). Otherwise (a mode-boundary tail — pre-empted by the
+        // align-skip — or codex died mid-frame) discard; the -32001 loop covers it.
+        const frameStr = rewriteBuf.toString("utf8");
+        let outStr = null;
+        try {
+          const m = JSON.parse(frameStr);
+          outStr = frameStr;
+          if (
+            m && typeof m === "object" && "id" in m &&
+            ("result" in m || "error" in m) &&
+            pendingToolsListIds.has(idKey(m.id)) && injectGoalIntoToolsListMessage(m)
+          ) {
+            outStr = JSON.stringify(m);
+          }
+        } catch { outStr = null; }
+        rewriteBuf = Buffer.alloc(0);
+        stdoutObsBuf = Buffer.alloc(0);
+        if (outStr !== null) {
+          try { process.stdout.write(`${outStr}\n`); } catch {}
+          observeOutgoingLine(frameStr); // clear its id -> no synthetic error for it
+          lastForwardedByteWasNewline = true;
+        } else if (!lastForwardedByteWasNewline) {
+          try { process.stdout.write("\n"); } catch {}
+          lastForwardedByteWasNewline = true;
+        }
+      } else if (stdoutObsBuf.length > 0) {
         observeOutgoingLine(stdoutObsBuf.toString("utf8"));
         stdoutObsBuf = Buffer.alloc(0);
         try { process.stdout.write("\n"); } catch {}
@@ -1025,6 +1122,12 @@ function runCodexPassthrough({
         try { process.stdout.write(`${JSON.stringify(frame)}\n`); } catch {}
       }
     }
+
+    // Hygiene: drop the rewrite latch/skip state (forwarding has stopped).
+    pendingToolsListIds.clear();
+    rewriteSkipUntilNewline = false;
+    rewriteSkipReleaseId = undefined;
+    rewriteBuf = Buffer.alloc(0);
 
     flushThenExit(exitCode);
   };
@@ -1065,34 +1168,152 @@ function runCodexPassthrough({
     logErr(`[codex] ${chunk.toString().trimEnd()}`);
   });
 
-  // Forward codex stdout to the client byte-for-byte (raw Buffer) and keep a
-  // parallel observation buffer (split on the newline BYTE) to clear in-flight
-  // ids as their responses land. Raw chunks are forwarded; reconstructed lines
-  // are never written back.
+  const logRewriteDropOnce = () => {
+    if (!oversizedToolsListLogged) {
+      logErr(
+        "[mcp-agents] codex passthrough: tools/list-window frame exceeded rewrite cap; " +
+          "forwarding raw (goal not advertised on this response)",
+      );
+      oversizedToolsListLogged = true;
+    }
+  };
+
+  // Raw forward of one buffer plus the existing first-`!ok` backpressure handling
+  // (pause codex + suspend the watchdog until drain). Returns the write result.
+  // Used by BOTH the raw fast path and buffer mode, so the wire-state tracking and
+  // backpressure contract live in exactly one place.
+  const forwardChunk = (buf) => {
+    if (buf.length === 0) return true;
+    lastForwardedByteWasNewline = buf[buf.length - 1] === NEWLINE;
+    const ok = process.stdout.write(buf);
+    if (!ok && !stdoutPaused) {
+      // Downstream full: pause codex and suspend the idle watchdog until the
+      // client drains, so a slow reader is never mistaken for a stalled codex.
+      stdoutPaused = true;
+      clearIdle();
+      child.stdout.pause();
+    }
+    return ok;
+  };
+
+  // Once no tools/list id is outstanding (and not mid-skip), a trailing partial in
+  // rewriteBuf is a NON-tools/list frame (no response expected), so it must not stay
+  // withheld in buffer mode — raw mode forwards partials as they arrive, and
+  // withholding it would byte-lose it if codex dies before its newline. Forward it
+  // raw and drop back to the fast path. Called from BOTH paths that can clear the
+  // latch: the end of flushRewriteBuf (a response completed) and noteInbound's
+  // cancel branch (a tools/list was canceled on stdin, which never runs the flush).
+  const returnToRawIfLatchClear = () => {
+    if (
+      !finalizing && pendingToolsListIds.size === 0 &&
+      !rewriteSkipUntilNewline && rewriteBuf.length > 0
+    ) {
+      forwardChunk(rewriteBuf);
+      rewriteBuf = Buffer.alloc(0);
+    }
+  };
+
+  // Flush every COMPLETE frame from rewriteBuf, rewriting only the matched
+  // tools/list response and forwarding everything else byte-for-byte. NEVER
+  // early-returns on backpressure: forwardChunk pauses codex on the first `!ok`,
+  // but this chunk's frames are all queued (Node buffers regardless), so no
+  // COMPLETE frame is ever stranded — exactly today's "one write(chunk), then
+  // pause the source" semantics. After this returns rewriteBuf holds at most one
+  // trailing INCOMPLETE partial.
+  const flushRewriteBuf = () => {
+    if (rewriteSkipUntilNewline) {
+      const nl = rewriteBuf.indexOf(NEWLINE);
+      if (nl === -1) {
+        // Still inside the skipped/aligned frame: forward it all raw, stay skipping.
+        forwardChunk(rewriteBuf);
+        rewriteBuf = Buffer.alloc(0);
+        return;
+      }
+      forwardChunk(rewriteBuf.subarray(0, nl + 1)); // forward through the newline raw
+      rewriteBuf = rewriteBuf.subarray(nl + 1);
+      if (rewriteSkipReleaseId !== undefined) {
+        pendingToolsListIds.delete(rewriteSkipReleaseId);
+        rewriteSkipReleaseId = undefined;
+      }
+      rewriteSkipUntilNewline = false;
+    }
+    let nl;
+    while ((nl = rewriteBuf.indexOf(NEWLINE)) !== -1) {
+      const frameBytes = rewriteBuf.subarray(0, nl + 1); // original bytes incl. delimiter
+      rewriteBuf = rewriteBuf.subarray(nl + 1); // consume-first: never re-forward, never wedge
+      if (nl > MAX_BUFFER_BYTES) {
+        // Complete frame larger than the cap: forward raw without parsing (mirrors
+        // observeOutgoing's oversized branch), releasing only a matching pending id.
+        logRewriteDropOnce();
+        const pid = peekResponseId(frameBytes);
+        if (pid !== undefined && pendingToolsListIds.has(idKey(pid))) {
+          pendingToolsListIds.delete(idKey(pid));
+        }
+        forwardChunk(frameBytes);
+        continue;
+      }
+      let outBuf = frameBytes; // default: byte-for-byte
+      try {
+        const msg = JSON.parse(
+          frameBytes.subarray(0, frameBytes.length - 1).toString("utf8"),
+        );
+        if (
+          msg && typeof msg === "object" && "id" in msg &&
+          ("result" in msg || "error" in msg) &&
+          pendingToolsListIds.has(idKey(msg.id))
+        ) {
+          pendingToolsListIds.delete(idKey(msg.id));
+          if (injectGoalIntoToolsListMessage(msg)) {
+            outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
+          }
+        }
+      } catch {
+        outBuf = frameBytes; // unparseable (mode-boundary tail / partial) — forward original bytes
+      }
+      forwardChunk(outBuf);
+    }
+    if (rewriteBuf.length > MAX_BUFFER_BYTES) {
+      // Partial frame already past the cap with no newline: abandon rewriting for
+      // THIS frame, forward what we have raw, and skip to its newline. Release only
+      // a matching id, deferred to that newline.
+      logRewriteDropOnce();
+      const pid = peekResponseId(rewriteBuf);
+      rewriteSkipReleaseId =
+        pid !== undefined && pendingToolsListIds.has(idKey(pid)) ? idKey(pid) : undefined;
+      forwardChunk(rewriteBuf);
+      rewriteBuf = Buffer.alloc(0);
+      rewriteSkipUntilNewline = true;
+    }
+    // Latch boundary: a response just completed may have emptied the latch — if so,
+    // flush any trailing NON-tools/list partial raw and return to the fast path.
+    returnToRawIfLatchClear();
+  };
+  const bufferModeForward = (chunk) => {
+    rewriteBuf = rewriteBuf.length ? Buffer.concat([rewriteBuf, chunk]) : chunk;
+    flushRewriteBuf();
+  };
+
+  // Forward codex stdout to the client. Steady state is a byte-for-byte raw
+  // passthrough (forwardChunk); while a tools/list response is pending the
+  // forwarder buffers and rewrites that one frame (bufferModeForward) to advertise
+  // `goal`. Observation runs on the ORIGINAL bytes and stays the sole authority for
+  // clearing in-flight ids — by the time it runs, every complete frame in this
+  // chunk was already forwarded/queued, so it never leads forwarding.
   child.stdout.on("data", (chunk) => {
     if (finalizing) return; // stream ownership has been taken over
-    resetIdle();
+    resetIdle(); // UNCONDITIONAL, before the mode branch — buffer-mode activity must keep the watchdog alive
 
-    // Forward the raw bytes FIRST so a bug in observation can never affect the
-    // byte-for-byte passthrough (observation is best-effort id-tracking only).
-    if (chunk.length > 0) {
-      lastForwardedByteWasNewline = chunk[chunk.length - 1] === NEWLINE;
+    if (pendingToolsListIds.size > 0 || rewriteBuf.length > 0 || rewriteSkipUntilNewline) {
+      bufferModeForward(chunk);
+    } else {
+      forwardChunk(chunk);
     }
-    const ok = process.stdout.write(chunk);
+
     try {
       observeOutgoing(chunk); // bounded parse-for-ids; never alters forwarded bytes
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logErr(`[mcp-agents] codex passthrough: stdout observation error (ignored): ${msg}`);
-    }
-    if (!ok) {
-      // Downstream full: pause codex and suspend the idle watchdog until the
-      // client drains, so a slow reader is never mistaken for a stalled codex.
-      // Trade-off: a client that never drains keeps the request open with no
-      // watchdog — but a synthetic error could not be delivered to it anyway.
-      stdoutPaused = true;
-      clearIdle();
-      child.stdout.pause();
     }
   });
 
@@ -1130,7 +1351,16 @@ function runCodexPassthrough({
     // so even an elicitation response — bare id, no method — keeps a healthy
     // interactive flow alive.)
     if (msg.method === "notifications/cancelled") {
-      cancelInFlight(msg.params?.requestId);
+      const rid = msg.params?.requestId;
+      cancelInFlight(rid);
+      // A canceled/never-answered tools/list must not wedge buffer mode open. If
+      // this cancel cleared the last pending tools/list id while a NON-tools/list
+      // partial is withheld in rewriteBuf, flush it raw — otherwise a codex exit
+      // with only-canceled work would drop those bytes (finalize skips recovery).
+      if (rid != null) {
+        pendingToolsListIds.delete(idKey(rid));
+        returnToRawIfLatchClear();
+      }
       return;
     }
     // A client message awaits a response iff it carries BOTH an id and a method.
@@ -1138,6 +1368,22 @@ function runCodexPassthrough({
     // for in-flight tracking.
     if (msg.id != null && typeof msg.method === "string") {
       addInFlight(msg.id);
+      if (msg.method === "tools/list") {
+        // Arm the goal-advertising rewrite latch for this tools/list response. If
+        // buffer mode would START mid-frame (a pre-latch frame's head was already
+        // raw-forwarded and its newline hasn't arrived), first align by raw-skipping
+        // the orphan tail to its next newline — so the tail is forwarded
+        // byte-for-byte and never mis-parsed as a standalone frame nor byte-lost at
+        // finalize. Equivalent to today's raw behaviour for that straddled frame.
+        if (
+          pendingToolsListIds.size === 0 && rewriteBuf.length === 0 &&
+          !rewriteSkipUntilNewline && !lastForwardedByteWasNewline
+        ) {
+          rewriteSkipUntilNewline = true;
+          rewriteSkipReleaseId = undefined;
+        }
+        pendingToolsListIds.add(idKey(msg.id));
+      }
     }
   };
 

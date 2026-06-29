@@ -127,10 +127,18 @@ a concise `Reminder — standing objective for this thread: …` preamble on the
 prompt. Any caller-supplied `developer-instructions` are preserved, with the
 objective merged ahead of them.
 
-The wrapper-only `goal` argument is always stripped before it reaches Codex (its
-schema has no `goal`). A per-call `goal` overrides the `--goal` default for that
-call; a per-call empty `goal` (`""`) suppresses the default for that one call; a
-non-string `goal` is ignored (the `--goal` default still applies).
+The wrapper-only `goal` argument is always stripped before it reaches Codex (it
+is never a native Codex parameter). A per-call `goal` overrides the `--goal`
+default for that call; a per-call empty `goal` (`""`) suppresses the default for
+that one call; a non-string `goal` is ignored (the `--goal` default still
+applies).
+
+So a client's model knows it can pass `goal`, the pass-through advertises it: it
+rewrites its own `tools/list` response to declare an optional `goal` property on
+the `codex` and `codex-reply` tool schemas (models only generate arguments
+declared in a tool's `inputSchema`). Only `properties` is augmented — `required`
+and `additionalProperties` are left intact — and the rewrite touches only the
+`tools/list` response; every other frame is forwarded byte-for-byte.
 
 **Precedence within a thread.** The objective set on the initial `codex` call is
 a developer-role message and persists for the whole thread, so it takes

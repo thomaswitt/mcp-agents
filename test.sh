@@ -675,6 +675,246 @@ test_codex_percall_write() {
   rm -rf "$probe_dir"
 }
 
+# ── Helper: node stub `codex` mcp-server for the tools/list goal-advertising ──
+# tests. Answers initialize, then on tools/list emits a result with codex +
+# codex-reply tools (real schema shapes) per MCP_STUB_TLMODE — exercising the
+# wrapper's contained-latch rewrite paths. No real codex needed.
+write_codex_toolslist_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env node
+const MODE = process.env.MCP_STUB_TLMODE || "normal";
+const SENTINEL = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"PASSTHROUGH_SENTINEL"}}';
+const STRADDLE = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"STRADDLE_SENTINEL"}}';
+const STRADDLE_HEAD = STRADDLE.slice(0, 40);   // emitted on initialize, NO newline (orphan head)
+const STRADDLE_TAIL = STRADDLE.slice(40);      // emitted on tools/list, completes the frame
+function tools(withGoal) {
+  const codex = { name: "codex", inputSchema: { type: "object", additionalProperties: false, required: ["prompt"], properties: { prompt: { type: "string" }, "developer-instructions": { type: "string" }, "base-instructions": { type: "string" } } } };
+  if (withGoal) codex.inputSchema.properties.goal = { type: "string", description: "STUB_OWN_GOAL_DESC" };
+  const reply = { name: "codex-reply", inputSchema: { type: "object", required: ["prompt"], properties: { conversationId: { type: "string" }, threadId: { type: "string" }, prompt: { type: "string" } } } };
+  return [codex, reply];
+}
+const resultLine = (id, withGoal) => JSON.stringify({ jsonrpc: "2.0", id, result: { tools: tools(withGoal) } });
+function onToolsList(id) {
+  if (MODE === "havegoal") { process.stdout.write(resultLine(id, true) + "\n"); return; }
+  if (MODE === "noctools") { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: { tools: [{ name: "ping", inputSchema: { type: "object", properties: {} } }] } }) + "\n"); return; }
+  if (MODE === "error") { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: "no" } }) + "\n"); return; }
+  if (MODE === "interleaved") { process.stdout.write(SENTINEL + "\n"); process.stdout.write(resultLine(id, false) + "\n"); return; }
+  if (MODE === "split") { const s = resultLine(id, false); const cut = Math.floor(s.length / 2); process.stdout.write(s.slice(0, cut)); setTimeout(() => process.stdout.write(s.slice(cut) + "\n"), 40); return; }
+  if (MODE === "straddle") { process.stdout.write(STRADDLE_TAIL + "\n"); process.stdout.write(resultLine(id, false) + "\n"); return; }
+  if (MODE === "partialdie") { const s = resultLine(id, false); process.stdout.write(s.slice(0, Math.floor(s.length / 2)), () => process.exit(0)); return; }
+  if (MODE === "nonewlinedie") { process.stdout.write(resultLine(id, false), () => process.exit(0)); return; }
+  if (MODE === "bp") { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "codex/event", params: { pad: "x".repeat(200000) } }) + "\n"); process.stdout.write(resultLine(id, false) + "\n"); return; }
+  if (MODE === "trailpartialdie") { process.stdout.write(resultLine(id, false) + '\n{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"TRAILING_HEAD', () => process.exit(0)); return; } // result + a NON-tools/list partial head (no newline) then die
+  if (MODE === "cancelpartial") { process.stdout.write('{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"CANCEL_PARTIAL'); setTimeout(() => process.exit(0), 900); return; } // a withheld NON-tools/list partial; the driver cancels the tools/list, then we die
+  if (MODE === "oversized") { const big = JSON.stringify({ jsonrpc: "2.0", method: "codex/event", params: { marker: "OVERSIZED_MARKER", pad: "x".repeat(11 * 1024 * 1024) } }); process.stdout.write(big + "\n"); process.stdout.write(resultLine(id, false) + "\n", () => setTimeout(() => process.exit(0), 100)); return; }
+  process.stdout.write(resultLine(id, false) + "\n"); // normal
+}
+let buf = "";
+let exitTimer;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (d) => {
+  buf += d;
+  let nl;
+  while ((nl = buf.indexOf("\n")) !== -1) {
+    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+    let m; try { m = JSON.parse(line); } catch { continue; }
+    if (m.method === "initialize") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "stub", version: "0" } } }) + "\n");
+      if (MODE === "straddle") process.stdout.write(STRADDLE_HEAD); // orphan head, no newline -> wire mid-frame
+    } else if (m.method === "tools/list") {
+      onToolsList(m.id);
+      // Exit shortly after the LAST response so the wrapper (which waits on codex)
+      // can shut down cleanly — the response was already observed, so finalize
+      // synthesizes no -32001. partialdie/nonewlinedie self-exit; bp is driver-killed.
+      if (MODE !== "partialdie" && MODE !== "nonewlinedie" && MODE !== "bp" && MODE !== "trailpartialdie" && MODE !== "oversized" && MODE !== "cancelpartial") {
+        clearTimeout(exitTimer);
+        exitTimer = setTimeout(() => process.exit(0), 500);
+      }
+    }
+  }
+});
+setInterval(() => {}, 1 << 30);
+EOF
+  chmod +x "$1/codex"
+}
+
+# ── Helper: drive initialize + tools/list(id:2) at the stub under MCP_STUB_TLMODE ──
+# and assert a jq predicate over the wrapper's stdout (plus an optional byte-for-byte grep).
+#   $1 label, $2 stub mode, $3 jq predicate, $4 optional grep -F string
+test_codex_toolslist_goal() {
+  local label="$1" mode="$2" predicate="$3" grep_str="${4:-}"
+  local tmpdir output_file status RESPONSE ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_toolslist_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 1.5
+  } | PATH="$tmpdir:$PATH" MCP_STUB_TLMODE="$mode" \
+    $TIMEOUT_CMD 12 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  echo "$RESPONSE" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
+  if [ -n "$grep_str" ]; then printf '%s' "$RESPONSE" | grep -Fq "$grep_str" || ok=0; fi
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  Response: $RESPONSE"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: two tools/list calls (id:2, id:3) in one session — both rewritten ──
+# (latch re-entry).
+test_codex_toolslist_reentry() {
+  local label="$1" tmpdir output_file status RESPONSE ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_toolslist_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 0.2
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}'
+    sleep 1
+  } | PATH="$tmpdir:$PATH" MCP_STUB_TLMODE="normal" \
+    $TIMEOUT_CMD 12 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  echo "$RESPONSE" | jq -e 'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")' >/dev/null 2>&1 || ok=0
+  echo "$RESPONSE" | jq -e 'select(.id==3) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")' >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  Response: $RESPONSE"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: backpressure regression (Finding 1). A node driver pauses reading ──
+# the wrapper's stdout so a large stub burst backpressures it, then resumes and
+# asserts BOTH tools/list results survive (no complete frame stranded).
+test_codex_toolslist_backpressure() {
+  local label="$1" tmpdir status out
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  write_codex_toolslist_stub "$tmpdir"
+  cat >"$tmpdir/driver.mjs" <<'EOF'
+import { spawn } from "node:child_process";
+const stubDir = process.argv[2], serverDir = process.argv[3];
+const child = spawn("node", ["server.js", "--provider", "codex"], {
+  cwd: serverDir,
+  env: { ...process.env, PATH: stubDir + ":" + process.env.PATH, MCP_STUB_TLMODE: "bp" },
+  stdio: ["pipe", "pipe", "ignore"],
+});
+let out = "";
+child.stdout.pause();                                   // induce backpressure: stop reading
+child.stdout.on("data", (d) => { out += d.toString(); });
+child.stdin.on("error", () => {});
+const send = (o) => { try { child.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
+send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
+setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/initialized" }), 120);
+setTimeout(() => { send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }); send({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} }); }, 240);
+setTimeout(() => child.stdout.resume(), 800);           // stay paused while the stub bursts -> backpressure
+setTimeout(() => {
+  let ok2 = false, ok3 = false;
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue;
+    let m; try { m = JSON.parse(line); } catch { continue; }
+    const hasGoal = m.result?.tools?.find((t) => t.name === "codex")?.inputSchema?.properties?.goal?.type === "string";
+    if (m.id === 2 && hasGoal) ok2 = true;
+    if (m.id === 3 && hasGoal) ok3 = true;
+  }
+  process.stdout.write(ok2 && ok3 ? "BP_OK\n" : `BP_FAIL ok2=${ok2} ok3=${ok3}\n`);
+  try { child.kill("SIGKILL"); } catch {}
+  process.exit(ok2 && ok3 ? 0 : 1);
+}, 1800);
+EOF
+  set +e
+  out=$($TIMEOUT_CMD 15 node "$tmpdir/driver.mjs" "$tmpdir" "$(pwd)" 2>/dev/null)
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ] && printf '%s' "$out" | grep -Fq "BP_OK"; then
+    green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status, out=$out)"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: like test_codex_toolslist_goal but reads the captured FILE so it ──
+# tolerates an unparseable trailing partial or a multi-MB frame: it extracts the
+# id:2 result line for jq and greps the file for a marker.
+#   $1 label, $2 mode, $3 jq predicate over the id:2 result line, $4 grep -F marker
+test_codex_toolslist_file() {
+  local label="$1" mode="$2" predicate="$3" grep_str="$4"
+  local tmpdir output_file status idline ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_toolslist_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 1.5
+  } | PATH="$tmpdir:$PATH" MCP_STUB_TLMODE="$mode" \
+    $TIMEOUT_CMD 25 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  idline=$(grep -F '"id":2,' "$output_file" 2>/dev/null | tail -1)
+  printf '%s' "$idline" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
+  if [ -n "$grep_str" ]; then grep -Fq "$grep_str" "$output_file" || ok=0; fi
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  idline: ${idline:0:200}"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: cancel a tools/list while a NON-tools/list partial is withheld in ──
+# buffer mode, then let codex die — the partial must be forwarded raw on the
+# cancel (return-to-raw), not byte-lost at finalize.
+test_codex_toolslist_cancel() {
+  local label="$1" tmpdir output_file status ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_toolslist_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 0.4
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}'
+    sleep 1.2
+  } | PATH="$tmpdir:$PATH" MCP_STUB_TLMODE="cancelpartial" \
+    $TIMEOUT_CMD 12 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  grep -Fq "CANCEL_PARTIAL" "$output_file" || ok=0
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  out: $(cat "$output_file")"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 
 # Stub-based codex filtering tests (fast — no real codex needed)
@@ -733,6 +973,62 @@ test_codex_goal_case "codex unknown tool name is not goal-injected" \
   '{"prompt":"hi","goal":"X"}' \
   '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (has("developer-instructions")|not))' \
   "some-other-tool"
+
+# Stub-based codex tools/list goal-advertising tests (fast — no real codex needed).
+# The wrapper rewrites ONLY the tools/list RESPONSE to add a `goal` property to the
+# advertised codex/codex-reply schemas; everything else stays byte-for-byte.
+test_codex_toolslist_goal "tools/list advertises goal on codex AND codex-reply" \
+  "normal" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string") and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties.goal.type=="string"))'
+test_codex_toolslist_goal "tools/list keeps additionalProperties:false on codex, none on codex-reply" \
+  "normal" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.additionalProperties==false) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema|has("additionalProperties")|not))'
+test_codex_toolslist_goal "tools/list does not add goal to required; keeps other props" \
+  "normal" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema|(.required|index("goal")|not) and (.properties["developer-instructions"]!=null) and (.properties.prompt!=null)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties.conversationId!=null))'
+test_codex_toolslist_goal "tools/list forwards interleaved notification byte-for-byte + rewrites result" \
+  "interleaved" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")' \
+  '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"PASSTHROUGH_SENTINEL"}}'
+test_codex_toolslist_goal "tools/list reassembles a split frame and rewrites it" \
+  "split" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")'
+test_codex_toolslist_reentry "tools/list latch re-entry: two calls both rewritten"
+test_codex_toolslist_goal "tools/list idempotent: existing goal preserved (not overwritten)" \
+  "havegoal" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.description=="STUB_OWN_GOAL_DESC")'
+test_codex_toolslist_goal "tools/list with no codex tools forwarded byte-for-byte" \
+  "noctools" \
+  'select(.id==2) | ((.result.tools|length==1) and (.result.tools[0].name=="ping") and (.result.tools[0].inputSchema.properties|has("goal")|not))'
+test_codex_toolslist_goal "tools/list error response forwarded unchanged" \
+  "error" \
+  'select(.id==2) | (.error.code==-32601)'
+test_codex_toolslist_goal "tools/list partial-then-die yields one -32001 (no hang)" \
+  "partialdie" \
+  'select(.id==2) | (has("error") and .error.code==-32001)'
+test_codex_toolslist_goal "tools/list finalize recovers a complete-but-unterminated frame" \
+  "nonewlinedie" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")'
+test_codex_toolslist_backpressure "tools/list both responses survive backpressure (no strand)"
+test_codex_toolslist_goal "tools/list mode-boundary straddle reassembled byte-for-byte + rewritten" \
+  "straddle" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")' \
+  '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"STRADDLE_SENTINEL"}}'
+# Latch-boundary return-to-raw: a trailing NON-tools/list partial after the
+# rewritten result must be forwarded raw (not withheld/byte-lost) when codex dies.
+test_codex_toolslist_file "tools/list trailing partial after result is forwarded raw (not lost)" \
+  "trailpartialdie" \
+  '.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string"' \
+  "TRAILING_HEAD"
+# Oversized (>10 MiB) frame in the latch window is forwarded raw without parsing,
+# and the subsequent tools/list result is still rewritten.
+test_codex_toolslist_file "tools/list oversized frame forwarded raw, result still rewritten" \
+  "oversized" \
+  '.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string"' \
+  "OVERSIZED_MARKER"
+# Cancel path: a tools/list cancel that empties the latch while a non-tools/list
+# partial is withheld must flush it raw (not byte-lose it when codex then dies).
+test_codex_toolslist_cancel "tools/list cancel flushes a withheld partial raw (not lost)"
 
 # Stub-based codex watchdog/child-death tests (fast — no real codex needed)
 run_codex_watchdog_case "codex idle watchdog synthesizes error for stalled call" \

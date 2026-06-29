@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.1] - 2026-06-29
+
+### Added
+
+- The codex pass-through now advertises the per-call `goal` argument in its
+  `tools/list` response: it rewrites only the `codex` and `codex-reply` tool
+  schemas to declare an optional `goal` property, so a client's model knows it
+  can pass one (models only emit arguments declared in `inputSchema.properties`).
+  Without this, the `goal` argument added in 0.12.0 was reachable only when a
+  caller was explicitly told to send it. `goal` is still stripped inbound before
+  reaching Codex; only `properties` is touched (`required` and
+  `additionalProperties` are left intact, so Codex's strict `codex` schema stays
+  valid). The native `/goal` subsystem remains unreachable over MCP, so this is
+  still discoverability for the developer-instructions/prompt-reminder injection,
+  not Codex's goal-lifecycle subsystem
+
+### Fixed
+
+- The rewrite is a "contained latch": the pass-through stays a byte-for-byte raw
+  forwarder and only buffers/rewrites while a `tools/list` request is in flight,
+  then returns to raw. Observation of codex stdout still runs on the original
+  bytes and remains the sole authority for in-flight/idle-watchdog tracking;
+  backpressure, oversized frames, mode-boundary straddles, and the synthetic
+  `-32001` teardown path are all preserved (every complete frame is flushed so
+  none is stranded under backpressure)
+
 ## [0.12.0] - 2026-06-29
 
 ### Added
