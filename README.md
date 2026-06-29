@@ -86,10 +86,11 @@ or Gemini during bridge calls.
 | `--model` | `gpt-5.5` | `model` |
 | `--model_reasoning_effort` | `xhigh` | `model_reasoning_effort` |
 
-Hardcoded defaults: `sandbox_mode=read-only`, `approval_policy=never`,
-`features.multi_agent=false`.
+Other startup defaults: `sandbox_mode=workspace-write`, `approval_policy=never`
+(both configurable via `--sandbox_mode` / `--approval_policy`, and steerable per
+call); `features.multi_agent=false` is fixed.
 
-Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort for the native Codex MCP server. Per-call `model` and `config` arguments are stripped from `tools/call` before they reach Codex, so a client cannot override the pinned model/effort (or the read-only/never sandbox config) for a single call. For example, this request:
+Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort for the native Codex MCP server. Per-call `model` and the model/effort keys inside a `config` override are stripped from `tools/call` before they reach Codex, so a client cannot override the pinned model/effort for a single call (`sandbox`, `cwd`, and `approval-policy` — top-level and the matching `config` keys — are intentionally left steerable per call). For example, this request:
 
 ```json
 {
@@ -100,6 +101,54 @@ Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort f
 ```
 
 is forwarded to Codex as `{ "prompt": "Review this diff" }`. Change the model or effort at server startup instead.
+
+**Goal injection.** You can give Codex a persistent objective. Set one at server
+startup with `--goal "<text>"`, or per call with a `goal` argument in `tools/call`:
+
+```json
+{ "prompt": "Refactor the parser", "goal": "Keep the public API unchanged" }
+```
+
+For the initial `codex` call the objective is injected into Codex's native
+`developer-instructions` field (a developer-role message), so this is forwarded
+to Codex as:
+
+```json
+{
+  "prompt": "Refactor the parser",
+  "developer-instructions": "Persistent objective for this Codex thread (a standing goal — keep pursuing it across turns unless explicitly superseded):\nKeep the public API unchanged"
+}
+```
+
+A developer message persists for the whole thread, so `codex-reply` follow-ups
+inherit the objective automatically. Because `codex-reply` has no
+`developer-instructions` field, a per-call `goal` on a reply is instead added as
+a concise `Reminder — standing objective for this thread: …` preamble on the
+prompt. Any caller-supplied `developer-instructions` are preserved, with the
+objective merged ahead of them.
+
+The wrapper-only `goal` argument is always stripped before it reaches Codex (its
+schema has no `goal`). A per-call `goal` overrides the `--goal` default for that
+call; a per-call empty `goal` (`""`) suppresses the default for that one call; a
+non-string `goal` is ignored (the `--goal` default still applies).
+
+**Precedence within a thread.** The objective set on the initial `codex` call is
+a developer-role message and persists for the whole thread, so it takes
+precedence: a *different* `goal` supplied later on a `codex-reply` is only a
+prompt-level reminder and will not reliably override the standing objective
+(verified live — a reply goal that conflicts with the initial one is ignored in
+favor of the standing one). The reply reminder works when it is *not* opposed by
+a conflicting standing objective. To genuinely change the objective mid-stream,
+start a new `codex` call rather than changing it on a `codex-reply`.
+
+> **Note — this is not Codex's native `/goal`.** Codex's `/goal` slash command
+> (durable, thread-scoped goal state with lifecycle/budget/evidence-based
+> completion) is a TUI-only feature — it is parsed in the Codex terminal UI and
+> is *not* reachable through `codex mcp-server`. Prefixing an MCP prompt with
+> `/goal …` does **not** activate it; the text is just passed through as a user
+> message. This wrapper therefore steers Codex with `developer-instructions`
+> (the MCP-native vehicle for a standing objective), which is prompt/role
+> conditioning, not the native goal-lifecycle subsystem.
 
 **Idle watchdog.** The codex pass-through is transparent, so a Codex session that
 stalls after doing work (e.g. its final model turn hangs, or it waits on an
@@ -146,7 +195,7 @@ Override codex defaults at server startup:
 }
 ```
 
-The model and effort are fixed at server startup. Per-call `model` and `config` arguments sent to the native `codex` tool are stripped before reaching Codex, so they cannot override the startup defaults.
+The model and effort are fixed at server startup. Per-call `model` and the model/effort keys inside a `config` override sent to the native `codex` tool are stripped before reaching Codex, so they cannot override the startup model/effort (per-call `sandbox`/`cwd`/`approval-policy` are left intact). Add `"--goal", "<text>"` to `args` to inject a persistent objective into every Codex call (see [Goal injection](#codex-pass-through) above).
 
 Because the bridge runs in an isolated Codex home, inherited MCP servers from your normal
 `~/.codex/config.toml` are intentionally unavailable inside bridged Codex sessions.

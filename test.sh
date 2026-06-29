@@ -197,6 +197,7 @@ test_cli_flag "--help shows xhigh default"  "--help"    "xhigh"
 test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
 test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
+test_cli_flag "--help shows goal flag"      "--help"    "Persistent objective"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
@@ -206,6 +207,7 @@ test_cli_error "--model without value"                     "--model"            
 test_cli_error "--model_reasoning_effort without value"    "--model_reasoning_effort"   "requires a value"
 test_cli_error "--sandbox_mode without value"              "--sandbox_mode"             "requires a value"
 test_cli_error "--approval_policy without value"           "--approval_policy"          "requires a value"
+test_cli_error "--goal without value"                      "--goal"                     "requires a value"
 test_cli_error "--timeout without value"                    "--timeout"                  "requires a value"
 test_cli_error "--timeout with zero"                        "--timeout 0"                "must be a positive number"
 test_cli_error "--timeout with negative"                    "--timeout -5"               "must be a positive number"
@@ -585,6 +587,47 @@ test_codex_passes_through_unmodified() {
   rm -rf "$tmpdir"
 }
 
+# ── Helper: drive one tools/call (with the given `arguments` JSON) through a ──
+# capture-stub codex under the given server args, then assert a jq predicate
+# over the forwarded call's parsed JSON-RPC message. Proves the wrapper's goal
+# stripping/injection (server-default, per-call override, and suppress paths).
+#   $1 label, $2 extra server args, $3 arguments JSON, $4 jq predicate,
+#   $5 tool name (optional, default "codex" — pass "codex-reply" to prove the
+#      transform is tool-name agnostic)
+test_codex_goal_case() {
+  local label="$1" server_args="$2" arguments_json="$3" predicate="$4"
+  local tool_name="${5:-codex}"
+  local tmpdir capture output_file status call_line
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  capture="$tmpdir/codex_stdin.txt"
+  output_file="$tmpdir/output.txt"
+  : >"$capture"
+  write_codex_capture_stub "$tmpdir"
+
+  set +e
+  {
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool_name\",\"arguments\":$arguments_json}}"
+    sleep 0.5
+  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_CAPTURE="$capture" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex $server_args >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  call_line=$(grep '"method":"tools/call"' "$capture" 2>/dev/null | tail -1)
+  if [ "$status" -eq 0 ] && [ -n "$call_line" ] && \
+     echo "$call_line" | jq -e "$predicate" >/dev/null 2>&1; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Forwarded: $call_line"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 # ── Helper: a per-call sandbox=workspace-write + absolute cwd actually grants ──
 # writes end-to-end (real codex). Proves the read-only symptom is fixed.
 test_codex_percall_write() {
@@ -637,6 +680,59 @@ test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 # Stub-based codex filtering tests (fast — no real codex needed)
 test_codex_strips_only_model_effort "codex strips model/effort, keeps sandbox/cwd/approval"
 test_codex_passes_through_unmodified "codex forwards no-strip tools/call byte-for-byte"
+
+# Stub-based codex goal injection tests (fast — no real codex needed).
+# For the initial `codex` tool the goal goes into developer-instructions (the
+# MCP-correct, thread-persistent vehicle) and the prompt is left untouched; for
+# `codex-reply` (no developer-instructions field) it is a concise prompt reminder.
+test_codex_goal_case "codex injects per-call goal into developer-instructions" \
+  "" \
+  '{"prompt":"hi","goal":"SHIPSAFE"}' \
+  '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (.["developer-instructions"]|test("SHIPSAFE")))'
+test_codex_goal_case "codex injects server --goal into developer-instructions" \
+  "--goal SERVERGOAL" \
+  '{"prompt":"hi"}' \
+  '.params.arguments | ((.prompt == "hi") and (.["developer-instructions"]|test("SERVERGOAL")))'
+test_codex_goal_case "codex per-call goal overrides server --goal" \
+  "--goal SERVERGOAL" \
+  '{"prompt":"hi","goal":"CALLGOAL"}' \
+  '.params.arguments | ((has("goal")|not) and (.["developer-instructions"]|test("CALLGOAL")) and (.["developer-instructions"]|test("SERVERGOAL")|not))'
+test_codex_goal_case "codex blank per-call goal suppresses server --goal" \
+  "--goal SERVERGOAL" \
+  '{"prompt":"hi","goal":""}' \
+  '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (has("developer-instructions")|not))'
+# A malformed (non-string) per-call goal is dropped without disturbing the
+# configured server default (must NOT suppress it like an empty string does).
+test_codex_goal_case "codex non-string per-call goal keeps server --goal" \
+  "--goal SERVERGOAL" \
+  '{"prompt":"hi","goal":false}' \
+  '.params.arguments | ((has("goal")|not) and (.["developer-instructions"]|test("SERVERGOAL")))'
+# The objective is merged AHEAD of any caller-supplied developer-instructions
+# (order asserted via index), which are preserved.
+test_codex_goal_case "codex merges goal ahead of existing developer-instructions" \
+  "" \
+  '{"prompt":"hi","goal":"GOALX","developer-instructions":"EXISTINGDEV"}' \
+  '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (.["developer-instructions"]|startswith("Persistent objective")) and (.["developer-instructions"]|test("EXISTINGDEV")) and ((.["developer-instructions"]|index("GOALX")) < (.["developer-instructions"]|index("EXISTINGDEV"))))'
+# codex-reply has no developer-instructions field, so the goal is a concise
+# prompt reminder PREFIXED to the prompt (order asserted); conversationId kept.
+test_codex_goal_case "codex-reply injects per-call goal as prompt reminder" \
+  "" \
+  '{"conversationId":"abc","prompt":"continue","goal":"STAYFOCUSED"}' \
+  '.params.arguments | ((has("goal")|not) and (.conversationId == "abc") and (has("developer-instructions")|not) and (.prompt|startswith("Reminder")) and (.prompt|test("continue")) and ((.prompt|index("STAYFOCUSED")) < (.prompt|index("continue"))))' \
+  "codex-reply"
+# Multi-word goal text survives intact.
+test_codex_goal_case "codex injects multi-word per-call goal" \
+  "" \
+  '{"prompt":"hi","goal":"keep the public API unchanged"}' \
+  '.params.arguments | (.["developer-instructions"]|test("keep the public API unchanged"))'
+# An unknown/future tool name is NOT goal-injected: the wrapper-only `goal` arg
+# is still stripped (never leaked) but neither the prompt nor developer-
+# instructions is mutated, preserving byte-for-byte behavior for unsupported tools.
+test_codex_goal_case "codex unknown tool name is not goal-injected" \
+  "--goal SERVERGOAL" \
+  '{"prompt":"hi","goal":"X"}' \
+  '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (has("developer-instructions")|not))' \
+  "some-other-tool"
 
 # Stub-based codex watchdog/child-death tests (fast — no real codex needed)
 run_codex_watchdog_case "codex idle watchdog synthesizes error for stalled call" \

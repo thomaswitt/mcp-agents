@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-06-29
+
+### Added
+
+- Goal injection for the codex pass-through: give Codex a persistent objective
+  via a server-wide `--goal "<text>"` default or a per-call `goal` argument on
+  `tools/call`. Codex's native `/goal` is a TUI-only slash command that is not
+  reachable through `codex mcp-server` (prefixing an MCP prompt with `/goal …`
+  does nothing), so the objective is injected the MCP-correct way: into Codex's
+  native `developer-instructions` field (a developer-role message that persists
+  thread-wide, so `codex-reply` turns inherit it) for the initial `codex` call,
+  merged ahead of any caller-supplied developer instructions; and as a concise
+  prompt reminder for a `codex-reply` turn, which has no `developer-instructions`
+  field. The wrapper-only `goal` arg is always stripped before reaching Codex (it
+  has no `goal` in its schema); a per-call string `goal` overrides the `--goal`
+  default (an empty string suppresses it; a non-string value is ignored).
+  Injection counts as a mutation, so a `tools/call` with no goal change is still
+  forwarded byte-for-byte
+
 ## [0.11.0] - 2026-06-26
 
 ### Added

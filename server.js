@@ -192,6 +192,10 @@ Options:
                                  danger-full-access [default: ${DEFAULT_CODEX_SANDBOX_MODE}]
   --approval_policy <policy>     Codex approval policy: untrusted, on-failure,
                                  on-request, never [default: ${DEFAULT_CODEX_APPROVAL_POLICY}]
+  --goal <text>                  Persistent objective injected into every Codex
+                                 call (as developer-instructions, or a prompt
+                                 reminder on codex-reply); per-call \`goal\` arg
+                                 overrides it [default: none]
   --codex_idle_timeout <secs>    Codex pass-through idle watchdog; 0 disables
                                  [default: ${DEFAULT_CODEX_IDLE_TIMEOUT_MS / 1000}]
   --timeout <seconds>            Default timeout per call [default: 300]
@@ -202,8 +206,9 @@ Options:
 /**
  * Parse CLI flags from process.argv.
  * Handles --help, --version, --provider, --model, --model_reasoning_effort,
- * --sandbox_mode, --approval_policy, --codex_idle_timeout, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexIdleTimeoutMs?: number, defaultTimeoutMs?: number }}
+ * --sandbox_mode, --approval_policy, --goal, --codex_idle_timeout, and unknown
+ * flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, goal?: string, codexIdleTimeoutMs?: number, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -212,6 +217,7 @@ function parseArgs() {
   let modelReasoningEffort;
   let sandboxMode;
   let approvalPolicy;
+  let goal;
   let codexIdleTimeoutMs;
   let defaultTimeoutMs;
 
@@ -264,6 +270,13 @@ function parseArgs() {
         }
         approvalPolicy = args[++i];
         break;
+      case "--goal":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --goal requires a value\n");
+          process.exit(1);
+        }
+        goal = args[++i];
+        break;
       case "--codex_idle_timeout": {
         if (i + 1 >= args.length) {
           process.stderr.write("error: --codex_idle_timeout requires a value\n");
@@ -304,6 +317,7 @@ function parseArgs() {
     modelReasoningEffort,
     sandboxMode,
     approvalPolicy,
+    goal,
     codexIdleTimeoutMs,
     defaultTimeoutMs,
   };
@@ -513,18 +527,68 @@ function createIsolatedCodexHome({
 }
 
 /**
- * Filter a single newline-delimited JSON-RPC message on its way to the codex
- * pass-through. Strips per-call model/effort overrides from `tools/call` so the
- * client cannot escape the pinned model/effort — both the top-level `model` arg
- * and the model-envelope keys inside a `config` override map. sandbox/cwd/
- * approval-policy (top-level and inside `config`) are intentionally left intact
- * so callers can steer them per call. Non-`tools/call`, unparseable, and
- * nothing-to-strip lines are returned byte-for-byte unchanged so the MCP framing
- * is preserved.
- * @param {string} line
+ * Build the text for codex's native `developer-instructions` field (a
+ * developer-role message) from a goal. This is the MCP-correct vehicle for a
+ * standing objective: it is higher-altitude than the user prompt and persists
+ * across the thread. It is NOT codex's `/goal` subsystem — that is a TUI-only
+ * slash command (parsed in codex-rs/tui, e.g. chatwidget/slash_dispatch.rs) and
+ * is not reachable through the MCP `codex`/`codex-reply` tool surface. Any
+ * caller-supplied developer instructions are preserved after the objective.
+ * @param {string} goal
+ * @param {string} [existing] caller-supplied developer-instructions, if any
  * @returns {string}
  */
-function filterCodexToolCall(line) {
+function buildGoalDeveloperInstructions(goal, existing) {
+  const directive =
+    "Persistent objective for this Codex thread (a standing goal — keep " +
+    "pursuing it across turns unless explicitly superseded):\n" +
+    goal.trim();
+  const prior = typeof existing === "string" ? existing.trim() : "";
+  return prior ? `${directive}\n\n---\n\n${prior}` : directive;
+}
+
+/**
+ * Prepend a concise goal reminder to a prompt. Used for `codex-reply` turns,
+ * which expose no `developer-instructions` field, so the prompt is the only
+ * vehicle left to restate the standing objective. A blank goal leaves the
+ * prompt untouched.
+ * @param {string} prompt
+ * @param {string} goal
+ * @returns {string}
+ */
+function applyGoalPreamble(prompt, goal) {
+  const trimmedGoal = (goal ?? "").trim();
+  const body = prompt ?? "";
+  if (!trimmedGoal) return body;
+  return `Reminder — standing objective for this thread: ${trimmedGoal}\n\n${body}`;
+}
+
+/**
+ * Filter a single newline-delimited JSON-RPC message on its way to the codex
+ * pass-through. Two transforms, both confined to `tools/call`:
+ *   1. Strip per-call model/effort overrides — the top-level `model` arg and the
+ *      model-envelope keys inside a `config` override map — so the client cannot
+ *      escape the pinned model/effort. sandbox/cwd/approval-policy (top-level and
+ *      inside `config`) are intentionally left intact so callers can steer them
+ *      per call.
+ *   2. Goal injection — codex's native `/goal` is a TUI-only slash command, not
+ *      reachable via MCP, so a wrapper-only `goal` arg is always stripped and the
+ *      objective is injected the MCP-correct way: into `developer-instructions`
+ *      (a developer-role message) for the initial `codex` call, or as a concise
+ *      prompt reminder for a `codex-reply` turn (which has no
+ *      `developer-instructions` field). A per-call `goal` overrides the
+ *      server-wide `--goal` default (`opts.serverGoal`); only a string per-call
+ *      goal overrides (a blank one suppresses the default for that call), while a
+ *      non-string `goal` is dropped without disturbing the default.
+ * Non-`tools/call`, unparseable, and nothing-to-change lines are returned
+ * byte-for-byte unchanged so the MCP framing is preserved; any actual mutation
+ * re-serializes the message (the intended, framing-safe path for a changed
+ * message).
+ * @param {string} line
+ * @param {{ serverGoal?: string }} [opts]
+ * @returns {string}
+ */
+function filterCodexToolCall(line, opts = {}) {
   const trimmed = line.trim();
   if (!trimmed) return line;
 
@@ -567,11 +631,55 @@ function filterCodexToolCall(line) {
     if (Object.keys(cfg).length === 0) delete args.config;
   }
 
-  if (removed.length === 0) return line; // nothing pinned to strip — keep framing
+  // ── Goal injection ────────────────────────────────────────────────────────
+  // A per-call `goal` (any value) is always stripped — codex's schema has no
+  // `goal`, so it must never be forwarded. Only a STRING per-call goal counts as
+  // an override: a string (including "") replaces the server default for this
+  // call, so "" suppresses it. A non-string `goal` is malformed and is dropped
+  // without disturbing the configured server default. A blank effective goal
+  // injects nothing.
+  let goalLog;
+  let goalSource = "server";
+  let effectiveGoal = opts.serverGoal;
+  if ("goal" in args) {
+    const perCallGoal = args.goal;
+    delete args.goal;
+    goalLog = "stripped per-call goal arg";
+    if (typeof perCallGoal === "string") {
+      effectiveGoal = perCallGoal;
+      goalSource = "per-call";
+    }
+  }
+  if (effectiveGoal && effectiveGoal.trim()) {
+    if (msg.params?.name === "codex") {
+      // Initial `codex` call: the native developer-instructions field is the
+      // correct, thread-persistent vehicle for a standing objective.
+      args["developer-instructions"] = buildGoalDeveloperInstructions(
+        effectiveGoal,
+        args["developer-instructions"],
+      );
+      goalLog = `injected ${goalSource} goal into developer-instructions`;
+    } else if (msg.params?.name === "codex-reply" && typeof args.prompt === "string") {
+      // codex-reply has no developer-instructions field, so restate the
+      // objective as a concise prompt reminder. Any other (unknown/future) tool
+      // is left untouched — only the wrapper-only `goal` arg stripped above is
+      // removed, never the prompt — so the byte-for-byte invariant holds for
+      // tools this wrapper does not explicitly support.
+      args.prompt = applyGoalPreamble(args.prompt, effectiveGoal);
+      goalLog = `injected ${goalSource} goal into codex-reply prompt`;
+    }
+  }
 
-  logErr(
-    `[mcp-agents] codex passthrough: pinning model/effort, stripped: ${removed.join(", ")}`,
-  );
+  if (removed.length === 0 && !goalLog) return line; // nothing changed — keep framing
+
+  if (removed.length > 0) {
+    logErr(
+      `[mcp-agents] codex passthrough: pinning model/effort, stripped: ${removed.join(", ")}`,
+    );
+  }
+  if (goalLog) {
+    logErr(`[mcp-agents] codex passthrough: ${goalLog}`);
+  }
   return JSON.stringify(msg);
 }
 
@@ -582,7 +690,7 @@ function filterCodexToolCall(line) {
  * idle watchdog converts an unbounded codex stall (no stdout/stderr while a
  * request is in flight) into a synthesized JSON-RPC error so the caller never
  * hangs forever.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, idleTimeoutMs?: number }} opts
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, idleTimeoutMs?: number, goal?: string }} opts
  */
 function runCodexPassthrough({
   model,
@@ -590,6 +698,7 @@ function runCodexPassthrough({
   sandboxMode,
   approvalPolicy,
   idleTimeoutMs,
+  goal,
 }) {
   const resolvedModel = model || DEFAULT_CODEX_MODEL;
   const resolvedModelReasoningEffort =
@@ -597,6 +706,8 @@ function runCodexPassthrough({
   const resolvedSandboxMode = sandboxMode || DEFAULT_CODEX_SANDBOX_MODE;
   const resolvedApprovalPolicy = approvalPolicy || DEFAULT_CODEX_APPROVAL_POLICY;
   const resolvedIdleTimeoutMs = idleTimeoutMs ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
+  // Server-wide default goal (string or undefined); per-call `goal` overrides it.
+  const resolvedGoal = goal;
   let isolatedCodexHome;
 
   try {
@@ -631,6 +742,7 @@ function runCodexPassthrough({
     `[mcp-agents] passthrough: codex ${args.join(" ")} ` +
       `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, ` +
       `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
+      `goal=${resolvedGoal && resolvedGoal.trim() ? "set" : "none"}, ` +
       `idle_timeout_ms=${resolvedIdleTimeoutMs}, isolated_home=true)`,
   );
 
@@ -1043,7 +1155,7 @@ function runCodexPassthrough({
       const line = stdinBuf.subarray(0, nl).toString("utf8");
       stdinBuf = stdinBuf.subarray(nl + 1);
       noteInbound(line);
-      child.stdin.write(`${filterCodexToolCall(line)}\n`);
+      child.stdin.write(`${filterCodexToolCall(line, { serverGoal: resolvedGoal })}\n`);
     }
   });
   process.stdin.on("error", () => {});
@@ -1051,7 +1163,7 @@ function runCodexPassthrough({
     if (stdinBuf.length > 0) {
       const line = stdinBuf.toString("utf8");
       noteInbound(line);
-      child.stdin.write(filterCodexToolCall(line));
+      child.stdin.write(filterCodexToolCall(line, { serverGoal: resolvedGoal }));
     }
     child.stdin.end();
   });
@@ -1118,6 +1230,7 @@ async function main() {
     modelReasoningEffort,
     sandboxMode,
     approvalPolicy,
+    goal,
     codexIdleTimeoutMs,
     defaultTimeoutMs,
   } = parseArgs();
@@ -1136,6 +1249,7 @@ async function main() {
       modelReasoningEffort,
       sandboxMode,
       approvalPolicy,
+      goal,
       idleTimeoutMs: codexIdleTimeoutMs,
     });
     return;
