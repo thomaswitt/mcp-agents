@@ -300,8 +300,8 @@ test_codex_isolated_runtime() {
     red "FAIL: $label (missing xhigh session config)"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
-  elif ! echo "$RESPONSE" | grep -q '"server":"codex_apps"'; then
-    red "FAIL: $label (missing codex_apps startup)"
+  elif echo "$RESPONSE" | grep -q '"server":"codex_apps"'; then
+    red "FAIL: $label (codex_apps started despite features.apps=false)"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
   elif echo "$RESPONSE" | grep -Eq '"server":"(claude-code|local-claude-test|local-gemini-test|chrome-devtools|context7|aws-knowledge-mcp-server|openaiDeveloperDocs|google-dev-knowledge|github-knowledge-mcp-server)"'; then

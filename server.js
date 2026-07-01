@@ -480,6 +480,8 @@ function buildCodexBridgeConfig({
     `sandbox_mode = ${toTomlString(sandboxMode)}`,
     "",
     "[features]",
+    "apps = false",
+    "plugins = false",
     "multi_agent = false",
     "",
   ].join("\n");

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.2] - 2026-07-01
+
+### Changed
+
+- The codex pass-through isolated runtime now disables Codex app/plugin
+  surfaces by default, keeping bridged sessions aligned with lean local Codex
+  defaults and avoiding unrelated plugin skill context in focused coding
+  workflows
+
 ## [0.12.1] - 2026-06-29
 
 ### Added
