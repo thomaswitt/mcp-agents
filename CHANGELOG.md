@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.3] - 2026-07-03
+
+### Added
+
+- Add `npm run bench:mcp-startup` to measure global-install and `npx` MCP
+  startup paths through real `/tmp` project `.mcp.json` files
+
+### Changed
+
+- Clarify that `npx` affects MCP startup/reconnect behavior, not tool-call
+  latency once the server is already running
+
 ## [0.12.2] - 2026-07-01
 
 ### Changed

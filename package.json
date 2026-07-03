@@ -1,13 +1,17 @@
 {
   "name": "mcp-agents",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "description": "MCP server that wraps AI CLI tools (Claude Code, Gemini CLI, Codex CLI) for use by any MCP client",
   "type": "module",
+  "scripts": {
+    "bench:mcp-startup": "node scripts/bench-mcp-startup.mjs"
+  },
   "bin": {
     "mcp-agents": "server.js"
   },
   "files": [
     "server.js",
+    "scripts/bench-mcp-startup.mjs",
     "package.json"
   ],
   "keywords": [

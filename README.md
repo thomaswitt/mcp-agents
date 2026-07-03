@@ -21,9 +21,9 @@ Only the CLI you select with `--provider` needs to be present.
 npm install -g mcp-agents
 ```
 
-Global install is **strongly recommended** over `npx -y mcp-agents@latest`. The `npx`
-approach performs a network round-trip on every cold start, which can exceed MCP client
-connection timeouts and cause "stream disconnected" errors.
+Global install is the fastest and most reliable startup path. `npx -y mcp-agents`
+is functionally equivalent once the MCP server is running, but startup depends on
+npm package resolution/cache state before the MCP client can connect.
 
 **Tip:** If your project's `.mcp.json` references `mcp-agents`, add `npm install -g mcp-agents`
 to your setup script (e.g. `bin/setup`) so new developers get it automatically.
@@ -175,7 +175,8 @@ hanging.
 
 ## Integration with Claude Code
 
-Add entries to your project's `.mcp.json` (requires `npm i -g mcp-agents`):
+Add entries to your project's `.mcp.json` using a globally installed `mcp-agents`
+binary:
 
 ```json
 {
@@ -211,21 +212,22 @@ Because the bridge runs in an isolated Codex home, inherited MCP servers from yo
 `~/.codex/config.toml` are intentionally unavailable inside bridged Codex sessions.
 
 <details>
-<summary>Alternative: using npx (slower, not recommended)</summary>
+<summary>Alternative: using npx (zero install, slower startup)</summary>
 
 ```json
 {
   "mcpServers": {
     "codex": {
       "command": "npx",
-      "args": ["-y", "mcp-agents@latest", "--provider", "codex"]
+      "args": ["-y", "mcp-agents", "--provider", "codex"]
     }
   }
 }
 ```
 
-> **Warning:** `npx -y mcp-agents@latest` performs a network round-trip on every cold
-> start (~70s), which can exceed MCP client connection timeouts.
+`npx` only affects process launch. Once the MCP server is connected, normal
+tool-call latency is the same server code either way. Use `npx` when zero install
+matters more than startup/cache reliability.
 
 </details>
 
@@ -256,6 +258,15 @@ npm link          # symlinks mcp-agents to your local server.js
 ```
 
 After `npm link`, any edits to `server.js` take effect immediately — no reinstall needed.
+
+Benchmark the startup paths through real `/tmp` project `.mcp.json` files:
+
+```bash
+npm run bench:mcp-startup
+```
+
+This measures MCP launch through `initialize` and `tools/list`; it does not call
+the provider model/tool.
 
 ## How it works
 
