@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.4] - 2026-07-06
+
+### Changed
+
+- Harden the codex pass-through isolated runtime by keeping web search in cached
+  mode while disabling update checks, login shells, history persistence, hooks,
+  and skill MCP dependency installation in the generated Codex config
+
 ## [0.12.3] - 2026-07-03
 
 ### Added

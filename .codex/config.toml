@@ -3,6 +3,12 @@ command = "node"
 args = ["server.js", "--provider", "claude"]
 tool_timeout_sec = 300
 
+[mcp_servers.local-claude-test.tools.ping]
+approval_mode = "approve"
+
+[mcp_servers.local-claude-test.tools.claude_code]
+approval_mode = "approve"
+
 [mcp_servers.local-gemini-test]
 command = "node"
 args = ["server.js", "--provider", "gemini"]

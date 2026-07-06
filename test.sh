@@ -402,6 +402,69 @@ EOF
   chmod +x "$1/codex"
 }
 
+# ── Helper: stub `codex` that snapshots the generated isolated config ──
+# before the wrapper cleans up the temporary CODEX_HOME.
+write_codex_config_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env bash
+cp "$CODEX_HOME/config.toml" "$MCP_AGENTS_TEST_CONFIG_CAPTURE"
+while IFS= read -r _line; do :; done
+EOF
+  chmod +x "$1/codex"
+}
+
+# ── Helper: verify the generated isolated Codex config is intentionally lean ──
+test_codex_bridge_config_defaults() {
+  local label="$1"
+  local tmpdir config_capture output_file status expected ok
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  config_capture="$tmpdir/config.toml"
+  output_file="$tmpdir/output.txt"
+  write_codex_config_stub "$tmpdir"
+
+  set +e
+  {
+    sleep 0.2
+  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_CONFIG_CAPTURE="$config_capture" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  for expected in \
+    'web_search = "cached"' \
+    'check_for_update_on_startup = false' \
+    'allow_login_shell = false' \
+    '[history]' \
+    'persistence = "none"' \
+    '[features]' \
+    'apps = false' \
+    'hooks = false' \
+    'plugins = false' \
+    'multi_agent = false' \
+    'skill_mcp_dependency_install = false'
+  do
+    grep -Fxq "$expected" "$config_capture" 2>/dev/null || ok=0
+  done
+
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Config:"
+    sed 's/^/    /' "$config_capture" 2>/dev/null || true
+    echo "  Output: $(cat "$output_file")"
+    FAIL=$((FAIL + 1))
+  fi
+
+  rm -rf "$tmpdir"
+}
+
 # ── Helper: node stub `codex` mcp-server for the watchdog tests. Answers ──
 # initialize, emits one event for tools/call, then per MCP_STUB_MODE either
 # stalls (stays silent → exercises the idle watchdog) or dies (process.exit →
@@ -918,6 +981,7 @@ test_codex_toolslist_cancel() {
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 
 # Stub-based codex filtering tests (fast — no real codex needed)
+test_codex_bridge_config_defaults "codex bridge writes lean isolated config"
 test_codex_strips_only_model_effort "codex strips model/effort, keeps sandbox/cwd/approval"
 test_codex_passes_through_unmodified "codex forwards no-strip tools/call byte-for-byte"
 

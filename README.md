@@ -88,9 +88,14 @@ or Gemini during bridge calls.
 
 Other startup defaults: `sandbox_mode=workspace-write`, `approval_policy=never`
 (both configurable via `--sandbox_mode` / `--approval_policy`, and steerable per
-call); `features.multi_agent=false`, `features.apps=false`, and
-`features.plugins=false` are fixed (the latter two keep ChatGPT app/plugin
-skills — Figma, Gmail, Presentations, etc. — out of the bridged session context).
+call), `web_search=cached`, `check_for_update_on_startup=false`,
+`allow_login_shell=false`, and `history.persistence=none`. Startup feature
+defaults (overridable per call via a `config` override, like sandbox/approval)
+are `features.multi_agent=false`, `features.apps=false`,
+`features.plugins=false`, `features.hooks=false`, and
+`features.skill_mcp_dependency_install=false`; apps/plugins stay disabled to
+keep ChatGPT app/plugin skills — Figma, Gmail, Presentations, etc. — out of the
+bridged session context.
 
 Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort for the native Codex MCP server. Per-call `model` and the model/effort keys inside a `config` override are stripped from `tools/call` before they reach Codex, so a client cannot override the pinned model/effort for a single call (`sandbox`, `cwd`, and `approval-policy` — top-level and the matching `config` keys — are intentionally left steerable per call). For example, this request:
 
