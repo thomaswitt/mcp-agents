@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Persist a rotated Codex `auth.json` from the isolated pass-through home back to
+  the real `CODEX_HOME` on teardown. Codex rotates its OAuth refresh token in
+  place, but the isolated home only copied auth in and was deleted on exit, so
+  the canonical `auth.json` kept a stale refresh token and subsequent spawns (or
+  any parallel Codex client) failed with "refresh token already used / revoked"
+  until a manual `codex login`. The write-back is atomic (same-dir temp +
+  rename) and no-ops when auth is unchanged or absent (API-key mode)
+
 ## [0.12.4] - 2026-07-06
 
 ### Changed
