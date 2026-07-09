@@ -192,7 +192,7 @@ test_cli_error() {
 # ========== CLI flag tests ==========
 
 test_cli_flag "--help prints usage"         "--help"    "Usage:"
-test_cli_flag "--help shows GPT-5.5 default" "--help"   "gpt-5.5"
+test_cli_flag "--help shows GPT-5.6 SOL default" "--help" "gpt-5.6-sol"
 test_cli_flag "--help shows xhigh default"  "--help"    "xhigh"
 test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
@@ -450,6 +450,8 @@ test_codex_bridge_config_defaults() {
   ok=1
   [ "$status" -eq 0 ] || ok=0
   for expected in \
+    'model = "gpt-5.6-sol"' \
+    'model_reasoning_effort = "xhigh"' \
     'web_search = "cached"' \
     'check_for_update_on_startup = false' \
     'allow_login_shell = false' \

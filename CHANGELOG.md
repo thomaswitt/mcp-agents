@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.6] - 2026-07-09
+
+### Changed
+
+- Update the default Codex model from `gpt-5.5` to `gpt-5.6-sol` while keeping
+  the reasoning effort at `xhigh`
+
 ## [0.12.5] - 2026-07-09
 
 ### Fixed
