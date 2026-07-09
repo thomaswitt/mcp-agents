@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+  closeSync,
   copyFileSync,
   existsSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -537,6 +542,56 @@ function createIsolatedCodexHome({
 }
 
 /**
+ * Persist a refreshed auth.json from the isolated Codex home back to the real
+ * CODEX_HOME. Codex rotates its OAuth refresh token in place during a request;
+ * because createIsolatedCodexHome() only copies auth.json IN and the temp home
+ * is removed on teardown, the rotated token is otherwise lost and the canonical
+ * auth.json keeps a stale (soon-revoked) refresh token — so the next bridge
+ * spawn, and any parallel Codex client, hits "refresh token already used /
+ * revoked" until a manual `codex login`.
+ *
+ * Best-effort and synchronous (runs from the process "exit" path). Writes
+ * atomically via an exclusive same-directory temp + rename so the canonical
+ * auth.json is never left truncated and never inherits stale temp permissions.
+ * No-ops when auth was never copied in (API-key mode) or when the token is
+ * unchanged.
+ */
+function persistIsolatedCodexAuth(isolatedCodexHome) {
+  try {
+    const realHome = resolveCodexHome();
+    const canonical = join(realHome, "auth.json");
+    const rotated = join(isolatedCodexHome, "auth.json");
+    if (!existsSync(rotated) || !existsSync(canonical)) return;
+
+    const rotatedBuf = readFileSync(rotated);
+    if (rotatedBuf.equals(readFileSync(canonical))) return; // unchanged → skip
+
+    const tmp = join(
+      realHome,
+      `.auth.json.mcp-agents-${process.pid}-${randomUUID()}.tmp`,
+    );
+    let fd;
+    try {
+      fd = openSync(tmp, "wx", 0o600);
+      writeFileSync(fd, rotatedBuf);
+      closeSync(fd);
+      fd = undefined;
+      renameSync(tmp, canonical); // atomic replace on the same filesystem
+    } catch (err) {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch {}
+      }
+      try { unlinkSync(tmp); } catch {}
+      throw err;
+    }
+    logErr("[mcp-agents] persisted refreshed Codex auth.json back to CODEX_HOME");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logErr(`[mcp-agents] failed to persist Codex auth.json: ${msg}`);
+  }
+}
+
+/**
  * Build the text for codex's native `developer-instructions` field (a
  * developer-role message) from a goal. This is the MCP-correct vehicle for a
  * standing objective: it is higher-altitude than the user prompt and persists
@@ -782,6 +837,9 @@ function runCodexPassthrough({
     if (cleanedUp || !isolatedCodexHome) return;
     cleanedUp = true;
 
+    // Write any rotated OAuth token back to the real CODEX_HOME before the temp
+    // home (and its refreshed auth.json) is removed.
+    persistIsolatedCodexAuth(isolatedCodexHome);
     try {
       rmSync(isolatedCodexHome, { recursive: true, force: true });
     } catch (err) {
