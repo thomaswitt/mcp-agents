@@ -413,6 +413,20 @@ EOF
   chmod +x "$1/codex"
 }
 
+# ── Helper: stub `codex` that simulates auth rotation and creates the stale ──
+# PID-named temp file used by the old write-back implementation.
+write_codex_auth_rotation_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env bash
+stale="$MCP_AGENTS_TEST_REAL_CODEX_HOME/.auth.json.mcp-agents-${PPID}.tmp"
+printf '%s' '{"token":"stale"}' > "$stale"
+chmod 0644 "$stale"
+printf '%s' '{"token":"rotated"}' > "$CODEX_HOME/auth.json"
+while IFS= read -r _line; do :; done
+EOF
+  chmod +x "$1/codex"
+}
+
 # ── Helper: verify the generated isolated Codex config is intentionally lean ──
 test_codex_bridge_config_defaults() {
   local label="$1"
@@ -458,6 +472,49 @@ test_codex_bridge_config_defaults() {
     red "FAIL: $label (status=$status)"
     echo "  Config:"
     sed 's/^/    /' "$config_capture" 2>/dev/null || true
+    echo "  Output: $(cat "$output_file")"
+    FAIL=$((FAIL + 1))
+  fi
+
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: verify rotated auth write-back does not reuse stale broad-mode temp files ──
+test_codex_auth_persistence_secure_temp() {
+  local label="$1"
+  local tmpdir real_home output_file status content mode ok
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  real_home="$tmpdir/real-codex"
+  output_file="$tmpdir/output.txt"
+  mkdir "$real_home"
+  printf '%s' '{"token":"original"}' > "$real_home/auth.json"
+  chmod 0644 "$real_home/auth.json"
+  write_codex_auth_rotation_stub "$tmpdir"
+
+  set +e
+  {
+    sleep 0.2
+  } | PATH="$tmpdir:$PATH" CODEX_HOME="$real_home" MCP_AGENTS_TEST_REAL_CODEX_HOME="$real_home" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  content=$(cat "$real_home/auth.json" 2>/dev/null || true)
+  mode=$(stat -f '%Lp' "$real_home/auth.json" 2>/dev/null || stat -c '%a' "$real_home/auth.json" 2>/dev/null || true)
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  [ "$content" = '{"token":"rotated"}' ] || ok=0
+  [ "$mode" = "600" ] || ok=0
+
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status mode=${mode:-<missing>})"
+    echo "  auth.json: $content"
     echo "  Output: $(cat "$output_file")"
     FAIL=$((FAIL + 1))
   fi
@@ -982,6 +1039,7 @@ test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 
 # Stub-based codex filtering tests (fast — no real codex needed)
 test_codex_bridge_config_defaults "codex bridge writes lean isolated config"
+test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclusive temp"
 test_codex_strips_only_model_effort "codex strips model/effort, keeps sandbox/cwd/approval"
 test_codex_passes_through_unmodified "codex forwards no-strip tools/call byte-for-byte"
 

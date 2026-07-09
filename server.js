@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+  closeSync,
   copyFileSync,
   existsSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -548,9 +551,10 @@ function createIsolatedCodexHome({
  * revoked" until a manual `codex login`.
  *
  * Best-effort and synchronous (runs from the process "exit" path). Writes
- * atomically via a same-directory temp + rename so the canonical auth.json is
- * never left truncated. No-ops when auth was never copied in (API-key mode) or
- * when the token is unchanged.
+ * atomically via an exclusive same-directory temp + rename so the canonical
+ * auth.json is never left truncated and never inherits stale temp permissions.
+ * No-ops when auth was never copied in (API-key mode) or when the token is
+ * unchanged.
  */
 function persistIsolatedCodexAuth(isolatedCodexHome) {
   try {
@@ -562,11 +566,21 @@ function persistIsolatedCodexAuth(isolatedCodexHome) {
     const rotatedBuf = readFileSync(rotated);
     if (rotatedBuf.equals(readFileSync(canonical))) return; // unchanged → skip
 
-    const tmp = join(realHome, `.auth.json.mcp-agents-${process.pid}.tmp`);
+    const tmp = join(
+      realHome,
+      `.auth.json.mcp-agents-${process.pid}-${randomUUID()}.tmp`,
+    );
+    let fd;
     try {
-      writeFileSync(tmp, rotatedBuf, { mode: 0o600 });
+      fd = openSync(tmp, "wx", 0o600);
+      writeFileSync(fd, rotatedBuf);
+      closeSync(fd);
+      fd = undefined;
       renameSync(tmp, canonical); // atomic replace on the same filesystem
     } catch (err) {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch {}
+      }
       try { unlinkSync(tmp); } catch {}
       throw err;
     }
