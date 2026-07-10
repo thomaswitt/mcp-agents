@@ -32,6 +32,7 @@ const VERSION = JSON.parse(
 ).version;
 
 const DEFAULT_TIMEOUT_MS = 300_000;
+const DEFAULT_CLAUDE_TIMEOUT_MS = 900_000;
 const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
@@ -44,10 +45,12 @@ const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 // tools/call argument keys stripped from the codex pass-through so callers
-// cannot override the pinned model/effort. sandbox/cwd/approval-policy are
-// intentionally left intact so callers can steer them per call.
-//   - top-level: only the dedicated `model` arg (there is no top-level
-//     model_reasoning_effort/profile arg in the codex tool schema)
+// cannot override the pinned model or choose an arbitrary effort. sandbox/cwd/
+// approval-policy are intentionally left intact so callers can steer them per
+// call.
+//   - top-level: the dedicated `model` arg is always stripped. The wrapper-only
+//     `model_reasoning_effort` arg is handled separately: an initial `codex`
+//     call may select exactly xhigh or max; every other value/use is stripped.
 //   - inside the `config` override map: model/effort plus every other
 //     model-envelope vector — a `profile`/`profiles` can carry its own
 //     model/effort, provider/base-url keys re-point the same model name to a
@@ -69,6 +72,11 @@ const CODEX_STRIPPED_CONFIG_KEYS = [
   "plan_mode_reasoning_effort",
   "review_model",
 ];
+const CODEX_PER_SESSION_REASONING_EFFORT_ARG = "model_reasoning_effort";
+const CODEX_PER_SESSION_REASONING_EFFORTS = ["xhigh", "max"];
+const CODEX_PER_SESSION_REASONING_EFFORT_SET = new Set(
+  CODEX_PER_SESSION_REASONING_EFFORTS,
+);
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
@@ -97,6 +105,7 @@ const CLI_BACKENDS = {
       "json",
     ],
     extraProperties: {},
+    defaultTimeoutMs: DEFAULT_CLAUDE_TIMEOUT_MS,
   },
   gemini: {
     command: "agy",
@@ -203,7 +212,8 @@ Options:
                                  overrides it [default: none]
   --codex_idle_timeout <secs>    Codex pass-through idle watchdog; 0 disables
                                  [default: ${DEFAULT_CODEX_IDLE_TIMEOUT_MS / 1000}]
-  --timeout <seconds>            Default timeout per call [default: 300]
+  --timeout <seconds>            Default timeout per call
+                                 [default: claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
 }
@@ -630,13 +640,18 @@ function applyGoalPreamble(prompt, goal) {
 
 /**
  * Filter a single newline-delimited JSON-RPC message on its way to the codex
- * pass-through. Two transforms, both confined to `tools/call`:
- *   1. Strip per-call model/effort overrides — the top-level `model` arg and the
+ * pass-through. Three transforms, all confined to `tools/call`:
+ *   1. Strip arbitrary model/effort overrides — the top-level `model` arg and
  *      model-envelope keys inside a `config` override map — so the client cannot
- *      escape the pinned model/effort. sandbox/cwd/approval-policy (top-level and
- *      inside `config`) are intentionally left intact so callers can steer them
- *      per call.
- *   2. Goal injection — codex's native `/goal` is a TUI-only slash command, not
+ *      escape the pinned model or select an unapproved effort. sandbox/cwd/
+ *      approval-policy (top-level and inside `config`) remain caller-steerable.
+ *   2. Per-session effort selection — the wrapper-only top-level
+ *      `model_reasoning_effort` arg is always stripped. On an initial `codex`
+ *      call, exact `xhigh`/`max` values are reintroduced as the native
+ *      `config.model_reasoning_effort`; replies and invalid values never reach
+ *      codex. Invalid values are visibly logged and safely inherit the server
+ *      default rather than silently enabling another effort.
+ *   3. Goal injection — codex's native `/goal` is a TUI-only slash command, not
  *      reachable via MCP, so a wrapper-only `goal` arg is always stripped and the
  *      objective is injected the MCP-correct way: into `developer-instructions`
  *      (a developer-role message) for the initial `codex` call, or as a concise
@@ -671,11 +686,39 @@ function filterCodexToolCall(line, opts = {}) {
   if (!args || typeof args !== "object") return line;
 
   const removed = [];
+  const toolName = msg.params?.name;
+  let requestedSessionEffort;
+  let effortLog;
 
   for (const key of CODEX_STRIPPED_TOP_LEVEL_ARGS) {
     if (key in args) {
       delete args[key];
       removed.push(key);
+    }
+  }
+
+  // This is a wrapper-only argument: never forward it directly because native
+  // codex schemas may broaden independently. Only an initial session may select
+  // one of the wrapper's exact allowlisted values. Replies inherit the effort
+  // recorded by their thread and cannot change it.
+  if (CODEX_PER_SESSION_REASONING_EFFORT_ARG in args) {
+    const perSessionEffort = args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
+    delete args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
+    if (toolName !== "codex") {
+      effortLog =
+        "ignored per-session reasoning effort outside an initial codex call; " +
+        "replies inherit their existing session effort";
+    } else if (
+      typeof perSessionEffort === "string" &&
+      CODEX_PER_SESSION_REASONING_EFFORT_SET.has(perSessionEffort)
+    ) {
+      requestedSessionEffort = perSessionEffort;
+    } else {
+      // Deliberately continue with the server default instead of forwarding an
+      // unapproved value or synthesizing a response inside the raw byte pump.
+      effortLog =
+        "ignored invalid per-session reasoning effort; allowed values are " +
+        `${CODEX_PER_SESSION_REASONING_EFFORTS.join(", ")}; using server default`;
     }
   }
 
@@ -694,6 +737,34 @@ function filterCodexToolCall(line, opts = {}) {
     }
     // Drop a now-empty override map so codex never receives a bare `config: {}`.
     if (Object.keys(cfg).length === 0) delete args.config;
+  }
+
+  // Reintroduce a validated selection only AFTER stripping every raw config
+  // effort/profile/provider vector, so an attacker cannot overwrite or combine
+  // it with `ultra` (or another model envelope) in the same call.
+  if (requestedSessionEffort) {
+    let targetConfig = args.config;
+    // JSON null means no caller config override; treat it like omission so it
+    // cannot silently suppress an otherwise valid wrapper selection.
+    if (!("config" in args) || targetConfig === null) {
+      targetConfig = {};
+      args.config = targetConfig;
+    }
+    if (
+      targetConfig &&
+      typeof targetConfig === "object" &&
+      !Array.isArray(targetConfig)
+    ) {
+      targetConfig.model_reasoning_effort = requestedSessionEffort;
+      effortLog = `applied per-session reasoning effort ${requestedSessionEffort}`;
+    } else {
+      // Preserve native validation of a malformed `config` rather than replacing
+      // caller data. The wrapper value is already stripped, so the safe fallback
+      // remains the configured server default if codex accepts the call at all.
+      effortLog =
+        "ignored per-session reasoning effort because config is malformed; " +
+        "using server default";
+    }
   }
 
   // ── Goal injection ────────────────────────────────────────────────────────
@@ -716,7 +787,7 @@ function filterCodexToolCall(line, opts = {}) {
     }
   }
   if (effectiveGoal && effectiveGoal.trim()) {
-    if (msg.params?.name === "codex") {
+    if (toolName === "codex") {
       // Initial `codex` call: the native developer-instructions field is the
       // correct, thread-persistent vehicle for a standing objective.
       args["developer-instructions"] = buildGoalDeveloperInstructions(
@@ -724,7 +795,7 @@ function filterCodexToolCall(line, opts = {}) {
         args["developer-instructions"],
       );
       goalLog = `injected ${goalSource} goal into developer-instructions`;
-    } else if (msg.params?.name === "codex-reply" && typeof args.prompt === "string") {
+    } else if (toolName === "codex-reply" && typeof args.prompt === "string") {
       // codex-reply has no developer-instructions field, so restate the
       // objective as a concise prompt reminder. Any other (unknown/future) tool
       // is left untouched — only the wrapper-only `goal` arg stripped above is
@@ -735,12 +806,15 @@ function filterCodexToolCall(line, opts = {}) {
     }
   }
 
-  if (removed.length === 0 && !goalLog) return line; // nothing changed — keep framing
+  if (removed.length === 0 && !effortLog && !goalLog) return line; // nothing changed — keep framing
 
   if (removed.length > 0) {
     logErr(
       `[mcp-agents] codex passthrough: pinning model/effort, stripped: ${removed.join(", ")}`,
     );
+  }
+  if (effortLog) {
+    logErr(`[mcp-agents] codex passthrough: ${effortLog}`);
   }
   if (goalLog) {
     logErr(`[mcp-agents] codex passthrough: ${goalLog}`);
@@ -758,22 +832,29 @@ const CODEX_GOAL_PROPERTY_DESCRIPTION =
   "`developer-instructions` (codex) or a prompt reminder (codex-reply); it is not a " +
   "native Codex parameter. Overrides the server-wide --goal default for this call; " +
   "pass an empty string to suppress that default.";
+const CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION =
+  "Reasoning effort for this new Codex session. Choose `xhigh` for hard, bounded " +
+  "tasks where latency matters, or `max` for extra-hard, quality-first tasks " +
+  "where deeper exploration and verification justify a longer runtime. Applies " +
+  "only to the initial `codex` call; " +
+  "`codex-reply` inherits the session effort and cannot change it. Omit to use " +
+  "the server-configured default.";
 
 /**
- * Mutate a parsed `tools/list` RESPONSE in place, adding a `goal` property to the
- * advertised inputSchema of the `codex` and `codex-reply` tools. Returns true iff
- * it added `goal` to at least one tool. Only `properties` is touched — `required`
- * and `additionalProperties` are left intact (a declared property is not an
- * "additional" one, so `additionalProperties:false` stays valid). Best-effort per
- * tool: a target tool that already declares `goal` (idempotent) or whose
- * inputSchema.properties is missing/malformed (drifted schema) is simply skipped;
- * other valid targets are still augmented. Returns false (→ the caller forwards the
- * original bytes byte-for-byte) for an error response, a non-array `result.tools`,
- * or when no `codex`/`codex-reply` target was augmentable.
+ * Mutate a parsed `tools/list` RESPONSE in place, advertising wrapper-only
+ * properties on the Codex tools. `goal` is added idempotently to `codex` and
+ * `codex-reply`. `model_reasoning_effort` is forced to the exact xhigh/max enum
+ * on `codex` and removed from `codex-reply`, preventing an upstream schema drift
+ * from advertising `ultra` or implying that replies can change the session.
+ * Only `properties` is touched — `required` and `additionalProperties` remain
+ * intact. Best-effort per tool: a missing/malformed inputSchema.properties is
+ * skipped while other valid targets are still augmented. Returns false (→ raw
+ * byte-for-byte forwarding) for an error response, non-array `result.tools`, or
+ * when no target needed a mutation.
  * @param {any} msg
  * @returns {boolean}
  */
-function injectGoalIntoToolsListMessage(msg) {
+function injectCodexPropertiesIntoToolsListMessage(msg) {
   const tools = msg?.result?.tools;
   if (!Array.isArray(tools)) return false;
   let changed = false;
@@ -783,9 +864,28 @@ function injectGoalIntoToolsListMessage(msg) {
     if (!schema || typeof schema !== "object" || Array.isArray(schema)) continue;
     const props = schema.properties;
     if (!props || typeof props !== "object" || Array.isArray(props)) continue;
-    if ("goal" in props) continue; // idempotent — respect an existing declaration
-    props.goal = { type: "string", description: CODEX_GOAL_PROPERTY_DESCRIPTION };
-    changed = true;
+    if (!("goal" in props)) {
+      props.goal = { type: "string", description: CODEX_GOAL_PROPERTY_DESCRIPTION };
+      changed = true;
+    }
+
+    if (tool.name === "codex") {
+      const effortProperty = {
+        type: "string",
+        enum: [...CODEX_PER_SESSION_REASONING_EFFORTS],
+        description: CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION,
+      };
+      if (
+        JSON.stringify(props[CODEX_PER_SESSION_REASONING_EFFORT_ARG]) !==
+        JSON.stringify(effortProperty)
+      ) {
+        props[CODEX_PER_SESSION_REASONING_EFFORT_ARG] = effortProperty;
+        changed = true;
+      }
+    } else if (CODEX_PER_SESSION_REASONING_EFFORT_ARG in props) {
+      delete props[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
+      changed = true;
+    }
   }
   return changed;
 }
@@ -922,12 +1022,12 @@ function runCodexPassthrough({
   let droppedFrameResponseId; // partial oversized frame's classified id (cleared at its newline)
   let observationDropLogged = false; // log the first observation-cap drop only
 
-  // ── tools/list goal-advertising rewrite (contained latch) ────────────────
+  // ── tools/list wrapper-property rewrite (contained latch) ────────────────
   // While a `tools/list` request id is outstanding the forwarder switches from
-  // raw passthrough to buffer-and-rewrite, injecting a `goal` property into the
-  // advertised codex/codex-reply schemas of that one response, then returns to
-  // raw. Observation above stays the SOLE authority for inFlight/the watchdog;
-  // this path only changes HOW bytes reach the wire.
+  // raw passthrough to buffer-and-rewrite, injecting the wrapper properties into
+  // the advertised Codex schemas of that one response, then returns to raw.
+  // Observation above stays the SOLE authority for inFlight/the watchdog; this
+  // path only changes HOW bytes reach the wire.
   const pendingToolsListIds = new Set(); // idKey(id) of outstanding tools/list requests (the latch)
   let rewriteBuf = Buffer.alloc(0); // buffer-mode accumulator; holds ≤1 trailing partial after a flush
   let rewriteSkipUntilNewline = false; // forwarding raw to the next newline (oversized frame or mode-boundary align)
@@ -1149,7 +1249,8 @@ function runCodexPassthrough({
           if (
             m && typeof m === "object" && "id" in m &&
             ("result" in m || "error" in m) &&
-            pendingToolsListIds.has(idKey(m.id)) && injectGoalIntoToolsListMessage(m)
+            pendingToolsListIds.has(idKey(m.id)) &&
+            injectCodexPropertiesIntoToolsListMessage(m)
           ) {
             outStr = JSON.stringify(m);
           }
@@ -1240,7 +1341,7 @@ function runCodexPassthrough({
     if (!oversizedToolsListLogged) {
       logErr(
         "[mcp-agents] codex passthrough: tools/list-window frame exceeded rewrite cap; " +
-          "forwarding raw (goal not advertised on this response)",
+          "forwarding raw (wrapper properties not advertised on this response)",
       );
       oversizedToolsListLogged = true;
     }
@@ -1331,7 +1432,7 @@ function runCodexPassthrough({
           pendingToolsListIds.has(idKey(msg.id))
         ) {
           pendingToolsListIds.delete(idKey(msg.id));
-          if (injectGoalIntoToolsListMessage(msg)) {
+          if (injectCodexPropertiesIntoToolsListMessage(msg)) {
             outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
           }
         }
@@ -1364,9 +1465,9 @@ function runCodexPassthrough({
   // Forward codex stdout to the client. Steady state is a byte-for-byte raw
   // passthrough (forwardChunk); while a tools/list response is pending the
   // forwarder buffers and rewrites that one frame (bufferModeForward) to advertise
-  // `goal`. Observation runs on the ORIGINAL bytes and stays the sole authority for
-  // clearing in-flight ids — by the time it runs, every complete frame in this
-  // chunk was already forwarded/queued, so it never leads forwarding.
+  // wrapper properties. Observation runs on the ORIGINAL bytes and stays the sole
+  // authority for clearing in-flight ids — by the time it runs, every complete
+  // frame in this chunk was already forwarded/queued, so it never leads forwarding.
   child.stdout.on("data", (chunk) => {
     if (finalizing) return; // stream ownership has been taken over
     resetIdle(); // UNCONDITIONAL, before the mode branch — buffer-mode activity must keep the watchdog alive
@@ -1437,7 +1538,7 @@ function runCodexPassthrough({
     if (msg.id != null && typeof msg.method === "string") {
       addInFlight(msg.id);
       if (msg.method === "tools/list") {
-        // Arm the goal-advertising rewrite latch for this tools/list response. If
+        // Arm the wrapper-property rewrite latch for this tools/list response. If
         // buffer mode would START mid-frame (a pre-latch frame's head was already
         // raw-forwarded and its newline hasn't arrived), first align by raw-skipping
         // the orphan tail to its next newline — so the tail is forwarded
@@ -1621,7 +1722,8 @@ async function main() {
   };
   fatalShutdown = beginShutdown;
 
-  const effectiveTimeout = defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const effectiveTimeout =
+    defaultTimeoutMs ?? backend.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const properties = {
     prompt: {

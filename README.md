@@ -56,11 +56,14 @@ Each `--provider` flag maps to a single exposed tool:
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `string` | yes | The prompt to send to Claude Code |
-| `timeout_ms` | `integer` | no | Timeout in ms (default: 300 000 / 5 minutes) |
+| `timeout_ms` | `integer` | no | Timeout in ms (default: 900 000 / 15 minutes) |
 
 Any additional `tools/call` arguments are ignored (for example `model`, `effort`, or `config`).
 
 Claude is pinned to `claude-opus-4-8` at effort `xhigh`; callers cannot change the model or effort per call. Calls run with `--output-format json`; the server parses the JSON payload and returns the assistant `result` text (or an MCP error if `is_error=true`).
+The longer default accommodates deep Opus reviews; callers can still set a
+smaller `timeout_ms`, and server operators can override the default with
+`--timeout <seconds>`.
 
 ### `gemini` parameters
 
@@ -97,7 +100,30 @@ are `features.multi_agent=false`, `features.apps=false`,
 keep ChatGPT app/plugin skills — Figma, Gmail, Presentations, etc. — out of the
 bridged session context.
 
-Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort for the native Codex MCP server. Per-call `model` and the model/effort keys inside a `config` override are stripped from `tools/call` before they reach Codex, so a client cannot override the pinned model/effort for a single call (`sandbox`, `cwd`, and `approval-policy` — top-level and the matching `config` keys — are intentionally left steerable per call). For example, this request:
+Startup flags (`--model`, `--model_reasoning_effort`) set the model and default
+effort for the native Codex MCP server. The initial `codex` tool additionally
+advertises an optional top-level `model_reasoning_effort` argument with exactly
+two values:
+
+| Value | Use for |
+|-------|---------|
+| `xhigh` | Hard but bounded implementation work |
+| `max` | Extra-hard, quality-first work with high architectural, concurrency, data-integrity, or security risk |
+
+Any other value is stripped and the server-configured default is used.
+
+The selector applies only when creating a new Codex session. Omit it to inherit
+the server's `--model_reasoning_effort` setting (`xhigh` by default). Every
+`codex-reply` in that session inherits the selected effort; replies cannot
+change it and do not advertise the argument. `ultra` is deliberately unavailable
+through this selector because it changes execution topology by enabling automatic
+delegation, rather than merely increasing the reasoning effort of the session.
+
+Raw model and effort overrides remain blocked. Per-call `model` and the
+model/effort keys inside a `config` override are stripped from `tools/call`
+before they reach Codex, so callers cannot bypass the two-value selector
+(`sandbox`, `cwd`, and `approval-policy` — top-level and the matching `config`
+keys — are intentionally left steerable per call). For example, this request:
 
 ```json
 {
@@ -107,7 +133,15 @@ Startup flags (`--model`, `--model_reasoning_effort`) set the model and effort f
 }
 ```
 
-is forwarded to Codex as `{ "prompt": "Review this diff" }`. Change the model or effort at server startup instead.
+is forwarded to Codex as `{ "prompt": "Review this diff" }`. To select maximum
+reasoning for a new session, use the dedicated top-level argument instead:
+
+```json
+{
+  "prompt": "Implement the accepted specification",
+  "model_reasoning_effort": "max"
+}
+```
 
 **Goal injection.** You can give Codex a persistent objective. Set one at server
 startup with `--goal "<text>"`, or per call with a `goal` argument in `tools/call`:
@@ -211,7 +245,15 @@ Override codex defaults at server startup:
 }
 ```
 
-The model and effort are fixed at server startup. Per-call `model` and the model/effort keys inside a `config` override sent to the native `codex` tool are stripped before reaching Codex, so they cannot override the startup model/effort (per-call `sandbox`/`cwd`/`approval-policy` are left intact). Add `"--goal", "<text>"` to `args` to inject a persistent objective into every Codex call (see [Goal injection](#codex-pass-through) above).
+The model is fixed at server startup, while startup effort is the default for new
+sessions. An initial `codex` call may select `xhigh` or `max` with the dedicated
+top-level `model_reasoning_effort` argument; omission inherits the startup
+default, and `codex-reply` calls inherit the session's choice without being able
+to change it. Per-call `model` and model/effort keys inside a raw `config`
+override are still stripped before reaching Codex, so they cannot bypass these
+constraints (`sandbox`/`cwd`/`approval-policy` remain steerable per call). Add
+`"--goal", "<text>"` to `args` to inject a persistent objective into every Codex
+call (see [Goal injection](#codex-pass-through) above).
 
 Because the bridge runs in an isolated Codex home, inherited MCP servers from your normal
 `~/.codex/config.toml` are intentionally unavailable inside bridged Codex sessions.
@@ -239,18 +281,20 @@ matters more than startup/cache reliability.
 ## Integration with OpenAI Codex
 
 Add two entries to `~/.codex/config.toml` — one per provider you want available.
-Set `tool_timeout_sec = 300` to avoid Codex MCP's default 60s per-tool timeout:
+Give the outer MCP call 60 seconds beyond each mcp-agents budget so the provider
+can return its result: 960 seconds for Claude's 900-second budget and 360 seconds
+for Gemini's 300-second budget:
 
 ```toml
 [mcp_servers.claude-code]
 command = "mcp-agents"
 args = ["--provider", "claude"]
-tool_timeout_sec = 300
+tool_timeout_sec = 960
 
 [mcp_servers.gemini]
 command = "mcp-agents"
 args = ["--provider", "gemini"]
-tool_timeout_sec = 300
+tool_timeout_sec = 360
 ```
 
 Then in a Codex session you can call the `claude_code` or `gemini` tools, which shell out to the respective CLIs.

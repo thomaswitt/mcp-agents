@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] - 2026-07-10
+
+### Added
+
+- Let callers select `xhigh` or `max` reasoning effort with a top-level
+  `model_reasoning_effort` argument when creating a Codex session. Omitting it
+  inherits the server-configured default (`xhigh` by default); replies inherit
+  the session choice and cannot change it. Raw `config` effort overrides remain
+  stripped, and `ultra` is intentionally unavailable through the selector
+
+### Changed
+
+- Raise the Claude provider's default call timeout from 5 to 15 minutes so
+  Opus `xhigh` repository reviews can finish; per-call `timeout_ms` and the
+  server-wide `--timeout` override remain available. The Codex integration
+  example now gives each outer MCP call 60 seconds of return headroom
+- **Migration:** Existing Claude MCP operators must change
+  `tool_timeout_sec = 300` to `tool_timeout_sec = 960` in
+  `~/.codex/config.toml` and restart Codex; otherwise the outer client still
+  cancels Claude calls after 5 minutes
+
 ## [0.12.6] - 2026-07-09
 
 ### Changed

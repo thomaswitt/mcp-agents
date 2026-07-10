@@ -27,8 +27,15 @@ test_tools_list() {
   local label="$1"
   local provider="$2"
   local expected_tool="$3"
+  local expected_timeout="${4:-}"
+  local timeout_override="${5:-}"
+  local server_command=(node server.js --provider "$provider")
   local output_file
   local status
+
+  if [ -n "$timeout_override" ]; then
+    server_command+=(--timeout "$timeout_override")
+  fi
 
   echo "--- $label ---"
 
@@ -37,7 +44,7 @@ test_tools_list() {
   {
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
     sleep 1
-  } | $TIMEOUT_CMD 10 $SERVER --provider "$provider" >"$output_file" 2>/dev/null
+  } | $TIMEOUT_CMD 10 "${server_command[@]}" >"$output_file" 2>/dev/null
   status=$?
   set -e
   RESPONSE=$(cat "$output_file")
@@ -47,7 +54,13 @@ test_tools_list() {
     red "FAIL: $label (exit $status)"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
-  elif echo "$RESPONSE" | jq -e ".result.tools[] | select(.name == \"$expected_tool\")" >/dev/null 2>&1; then
+  elif echo "$RESPONSE" | jq -e \
+    --arg tool "$expected_tool" \
+    --arg timeout "$expected_timeout" \
+    '.result.tools[] | select(.name == $tool) |
+      if $timeout == "" then true
+      else (.inputSchema.properties.timeout_ms.description | contains($timeout))
+      end' >/dev/null 2>&1; then
     green "PASS: $label"
     PASS=$((PASS + 1))
   else
@@ -198,6 +211,7 @@ test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
 test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
 test_cli_flag "--help shows goal flag"      "--help"    "Persistent objective"
+test_cli_flag "--help shows provider timeout defaults" "--help" "claude 900, gemini 300"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
@@ -224,11 +238,15 @@ for p in claude gemini; do
 done
 
 # ---------- Claude provider ----------
-test_tools_list "tools/list --provider claude → claude_code" "claude" "claude_code"
+test_tools_list "tools/list --provider claude → claude_code (900s default)" \
+  "claude" "claude_code" "900000"
+test_tools_list "tools/list --provider claude honors --timeout override" \
+  "claude" "claude_code" "7000" "7"
 test_handshake  "handshake --provider claude → claude_code"  "claude" "claude_code"
 
 # ---------- Gemini provider ----------
-test_tools_list "tools/list --provider gemini → gemini" "gemini" "gemini"
+test_tools_list "tools/list --provider gemini → gemini (300s default)" \
+  "gemini" "gemini" "300000"
 test_handshake  "handshake --provider gemini → gemini"  "gemini" "gemini"
 
 # ========== Integration tests (call real CLIs) ==========
@@ -284,7 +302,7 @@ test_codex_isolated_runtime() {
     sleep 0.3
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     sleep 0.3
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"Reply with ONLY OK","sandbox":"read-only"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"Reply with ONLY OK","sandbox":"read-only","model_reasoning_effort":"max"}}}'
     sleep 8
   } | $TIMEOUT_CMD 45 $SERVER --provider codex >"$output_file" 2>/dev/null
   status=$?
@@ -296,8 +314,8 @@ test_codex_isolated_runtime() {
     red "FAIL: $label (exit $status)"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
-  elif ! echo "$RESPONSE" | grep -q '"reasoning_effort":"xhigh"'; then
-    red "FAIL: $label (missing xhigh session config)"
+  elif ! echo "$RESPONSE" | grep -q '"reasoning_effort":"max"'; then
+    red "FAIL: $label (missing per-session max effort)"
     echo "  Response: $RESPONSE"
     FAIL=$((FAIL + 1))
   elif echo "$RESPONSE" | grep -q '"server":"codex_apps"'; then
@@ -711,12 +729,11 @@ test_codex_passes_through_unmodified() {
 
 # ── Helper: drive one tools/call (with the given `arguments` JSON) through a ──
 # capture-stub codex under the given server args, then assert a jq predicate
-# over the forwarded call's parsed JSON-RPC message. Proves the wrapper's goal
-# stripping/injection (server-default, per-call override, and suppress paths).
+# over the forwarded call's parsed JSON-RPC message. Proves wrapper-only arg
+# sanitization/translation without needing a real Codex session.
 #   $1 label, $2 extra server args, $3 arguments JSON, $4 jq predicate,
-#   $5 tool name (optional, default "codex" — pass "codex-reply" to prove the
-#      transform is tool-name agnostic)
-test_codex_goal_case() {
+#   $5 tool name (optional, default "codex")
+test_codex_call_transform() {
   local label="$1" server_args="$2" arguments_json="$3" predicate="$4"
   local tool_name="${5:-codex}"
   local tmpdir capture output_file status call_line
@@ -797,7 +814,7 @@ test_codex_percall_write() {
   rm -rf "$probe_dir"
 }
 
-# ── Helper: node stub `codex` mcp-server for the tools/list goal-advertising ──
+# ── Helper: node stub `codex` mcp-server for tools/list schema-rewrite ──
 # tests. Answers initialize, then on tools/list emits a result with codex +
 # codex-reply tools (real schema shapes) per MCP_STUB_TLMODE — exercising the
 # wrapper's contained-latch rewrite paths. No real codex needed.
@@ -809,15 +826,21 @@ const SENTINEL = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"PA
 const STRADDLE = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"STRADDLE_SENTINEL"}}';
 const STRADDLE_HEAD = STRADDLE.slice(0, 40);   // emitted on initialize, NO newline (orphan head)
 const STRADDLE_TAIL = STRADDLE.slice(40);      // emitted on tools/list, completes the frame
-function tools(withGoal) {
+function tools(withGoal, withEffort) {
   const codex = { name: "codex", inputSchema: { type: "object", additionalProperties: false, required: ["prompt"], properties: { prompt: { type: "string" }, "developer-instructions": { type: "string" }, "base-instructions": { type: "string" } } } };
   if (withGoal) codex.inputSchema.properties.goal = { type: "string", description: "STUB_OWN_GOAL_DESC" };
   const reply = { name: "codex-reply", inputSchema: { type: "object", required: ["prompt"], properties: { conversationId: { type: "string" }, threadId: { type: "string" }, prompt: { type: "string" } } } };
+  if (withEffort) {
+    const drifted = { type: "string", enum: ["low", "xhigh", "max", "ultra"], description: "STUB_DRIFTED_EFFORT_DESC" };
+    codex.inputSchema.properties.model_reasoning_effort = { ...drifted };
+    reply.inputSchema.properties.model_reasoning_effort = { ...drifted };
+  }
   return [codex, reply];
 }
-const resultLine = (id, withGoal) => JSON.stringify({ jsonrpc: "2.0", id, result: { tools: tools(withGoal) } });
+const resultLine = (id, withGoal, withEffort = false) => JSON.stringify({ jsonrpc: "2.0", id, result: { tools: tools(withGoal, withEffort) } });
 function onToolsList(id) {
   if (MODE === "havegoal") { process.stdout.write(resultLine(id, true) + "\n"); return; }
+  if (MODE === "haveeffort") { process.stdout.write(resultLine(id, false, true) + "\n"); return; }
   if (MODE === "noctools") { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: { tools: [{ name: "ping", inputSchema: { type: "object", properties: {} } }] } }) + "\n"); return; }
   if (MODE === "error") { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: "no" } }) + "\n"); return; }
   if (MODE === "interleaved") { process.stdout.write(SENTINEL + "\n"); process.stdout.write(resultLine(id, false) + "\n"); return; }
@@ -863,7 +886,7 @@ EOF
 # ── Helper: drive initialize + tools/list(id:2) at the stub under MCP_STUB_TLMODE ──
 # and assert a jq predicate over the wrapper's stdout (plus an optional byte-for-byte grep).
 #   $1 label, $2 stub mode, $3 jq predicate, $4 optional grep -F string
-test_codex_toolslist_goal() {
+test_codex_toolslist_rewrite() {
   local label="$1" mode="$2" predicate="$3" grep_str="${4:-}"
   local tmpdir output_file status RESPONSE ok
   echo "--- $label ---"
@@ -973,7 +996,7 @@ EOF
   rm -rf "$tmpdir"
 }
 
-# ── Helper: like test_codex_toolslist_goal but reads the captured FILE so it ──
+# ── Helper: like test_codex_toolslist_rewrite but reads the captured FILE ──
 # tolerates an unparseable trailing partial or a multi-MB frame: it extracts the
 # id:2 result line for jq and greps the file for a marker.
 #   $1 label, $2 mode, $3 jq predicate over the id:2 result line, $4 grep -F marker
@@ -1045,96 +1068,159 @@ test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclu
 test_codex_strips_only_model_effort "codex strips model/effort, keeps sandbox/cwd/approval"
 test_codex_passes_through_unmodified "codex forwards no-strip tools/call byte-for-byte"
 
+# Stub-based per-session effort tests (fast — no real Codex needed). The
+# wrapper-only top-level arg is accepted only on a new `codex` call, translated
+# into Codex's config map, and never forwarded in its wrapper form.
+test_codex_call_transform "codex translates per-session xhigh effort" \
+  "" \
+  '{"prompt":"hi","model_reasoning_effort":"xhigh"}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config == {"model_reasoning_effort":"xhigh"}))'
+test_codex_call_transform "codex translates per-session max effort and keeps config" \
+  "" \
+  '{"prompt":"hi","model_reasoning_effort":"max","config":{"sandbox_mode":"workspace-write","cwd":"/tmp/work"}}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config.model_reasoning_effort == "max") and (.config.sandbox_mode == "workspace-write") and (.config.cwd == "/tmp/work"))'
+test_codex_call_transform "codex applies per-session effort when config is null" \
+  "" \
+  '{"prompt":"hi","model_reasoning_effort":"max","config":null}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config == {"model_reasoning_effort":"max"}))'
+# Sanitize every raw model-envelope bypass before applying the validated
+# wrapper value. A conflicting nested xhigh, dotted effort, profile, provider,
+# and alternate model must not beat the requested max.
+test_codex_call_transform "codex validated effort wins over raw config bypasses" \
+  "" \
+  '{"prompt":"hi","model":"evil-model","model_reasoning_effort":"max","config":{"model":"evil-model","model_reasoning_effort":"xhigh","model_reasoning_effort.level":"ultra","profile":"evil-profile","profiles":{"evil":{"model_reasoning_effort":"ultra"}},"model_provider":"evil-provider","model_providers":{"evil":{"base_url":"http://evil"}},"plan_mode_reasoning_effort":"ultra","review_model":"evil-review","sandbox_mode":"workspace-write"}}' \
+  '.params.arguments | ((has("model")|not) and (has("model_reasoning_effort")|not) and (.config == {"sandbox_mode":"workspace-write","model_reasoning_effort":"max"}))'
+
+# Unsupported and malformed wrapper values are stripped. The call still
+# forwards and inherits the server default; no invalid or raw nested effort is
+# allowed to reach Codex.
+test_codex_call_transform "codex strips unsupported ultra effort" \
+  "" \
+  '{"prompt":"hi","model_reasoning_effort":"ultra","config":{"model_reasoning_effort":"max","sandbox_mode":"read-only"}}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config == {"sandbox_mode":"read-only"}))'
+test_codex_call_transform "codex strips unsupported named effort" \
+  "" \
+  '{"prompt":"hi","model_reasoning_effort":"medium"}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("config")|not))'
+test_codex_call_transform "codex strips non-string effort" \
+  "" \
+  '{"prompt":"hi","model_reasoning_effort":false,"config":{"profiles":{"evil":{"model_reasoning_effort":"max"}}}}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("config")|not))'
+test_codex_call_transform "codex-reply cannot change session effort" \
+  "" \
+  '{"conversationId":"abc","prompt":"continue","model_reasoning_effort":"max","config":{"model_reasoning_effort":"xhigh"}}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("config")|not) and (.conversationId == "abc") and (.prompt == "continue"))' \
+  "codex-reply"
+
+# Goal and effort are independent wrapper features: both transformations must
+# compose on an initial call while preserving caller config/instructions.
+test_codex_call_transform "codex composes per-session max effort with goal" \
+  "" \
+  '{"prompt":"hi","model_reasoning_effort":"max","goal":"SHIPSAFE","developer-instructions":"EXISTINGDEV","config":{"sandbox_mode":"workspace-write"}}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("goal")|not) and (.config.model_reasoning_effort == "max") and (.config.sandbox_mode == "workspace-write") and (.["developer-instructions"]|test("SHIPSAFE")) and (.["developer-instructions"]|test("EXISTINGDEV")) and ((.["developer-instructions"]|index("SHIPSAFE")) < (.["developer-instructions"]|index("EXISTINGDEV"))))'
+
 # Stub-based codex goal injection tests (fast — no real codex needed).
 # For the initial `codex` tool the goal goes into developer-instructions (the
 # MCP-correct, thread-persistent vehicle) and the prompt is left untouched; for
 # `codex-reply` (no developer-instructions field) it is a concise prompt reminder.
-test_codex_goal_case "codex injects per-call goal into developer-instructions" \
+test_codex_call_transform "codex injects per-call goal into developer-instructions" \
   "" \
   '{"prompt":"hi","goal":"SHIPSAFE"}' \
   '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (.["developer-instructions"]|test("SHIPSAFE")))'
-test_codex_goal_case "codex injects server --goal into developer-instructions" \
+test_codex_call_transform "codex injects server --goal into developer-instructions" \
   "--goal SERVERGOAL" \
   '{"prompt":"hi"}' \
   '.params.arguments | ((.prompt == "hi") and (.["developer-instructions"]|test("SERVERGOAL")))'
-test_codex_goal_case "codex per-call goal overrides server --goal" \
+test_codex_call_transform "codex per-call goal overrides server --goal" \
   "--goal SERVERGOAL" \
   '{"prompt":"hi","goal":"CALLGOAL"}' \
   '.params.arguments | ((has("goal")|not) and (.["developer-instructions"]|test("CALLGOAL")) and (.["developer-instructions"]|test("SERVERGOAL")|not))'
-test_codex_goal_case "codex blank per-call goal suppresses server --goal" \
+test_codex_call_transform "codex blank per-call goal suppresses server --goal" \
   "--goal SERVERGOAL" \
   '{"prompt":"hi","goal":""}' \
   '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (has("developer-instructions")|not))'
 # A malformed (non-string) per-call goal is dropped without disturbing the
 # configured server default (must NOT suppress it like an empty string does).
-test_codex_goal_case "codex non-string per-call goal keeps server --goal" \
+test_codex_call_transform "codex non-string per-call goal keeps server --goal" \
   "--goal SERVERGOAL" \
   '{"prompt":"hi","goal":false}' \
   '.params.arguments | ((has("goal")|not) and (.["developer-instructions"]|test("SERVERGOAL")))'
 # The objective is merged AHEAD of any caller-supplied developer-instructions
 # (order asserted via index), which are preserved.
-test_codex_goal_case "codex merges goal ahead of existing developer-instructions" \
+test_codex_call_transform "codex merges goal ahead of existing developer-instructions" \
   "" \
   '{"prompt":"hi","goal":"GOALX","developer-instructions":"EXISTINGDEV"}' \
   '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (.["developer-instructions"]|startswith("Persistent objective")) and (.["developer-instructions"]|test("EXISTINGDEV")) and ((.["developer-instructions"]|index("GOALX")) < (.["developer-instructions"]|index("EXISTINGDEV"))))'
 # codex-reply has no developer-instructions field, so the goal is a concise
 # prompt reminder PREFIXED to the prompt (order asserted); conversationId kept.
-test_codex_goal_case "codex-reply injects per-call goal as prompt reminder" \
+test_codex_call_transform "codex-reply injects per-call goal as prompt reminder" \
   "" \
   '{"conversationId":"abc","prompt":"continue","goal":"STAYFOCUSED"}' \
   '.params.arguments | ((has("goal")|not) and (.conversationId == "abc") and (has("developer-instructions")|not) and (.prompt|startswith("Reminder")) and (.prompt|test("continue")) and ((.prompt|index("STAYFOCUSED")) < (.prompt|index("continue"))))' \
   "codex-reply"
 # Multi-word goal text survives intact.
-test_codex_goal_case "codex injects multi-word per-call goal" \
+test_codex_call_transform "codex injects multi-word per-call goal" \
   "" \
   '{"prompt":"hi","goal":"keep the public API unchanged"}' \
   '.params.arguments | (.["developer-instructions"]|test("keep the public API unchanged"))'
 # An unknown/future tool name is NOT goal-injected: the wrapper-only `goal` arg
 # is still stripped (never leaked) but neither the prompt nor developer-
 # instructions is mutated, preserving byte-for-byte behavior for unsupported tools.
-test_codex_goal_case "codex unknown tool name is not goal-injected" \
+test_codex_call_transform "codex unknown tool name is not goal-injected" \
   "--goal SERVERGOAL" \
   '{"prompt":"hi","goal":"X"}' \
   '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (has("developer-instructions")|not))' \
   "some-other-tool"
 
-# Stub-based codex tools/list goal-advertising tests (fast — no real codex needed).
-# The wrapper rewrites ONLY the tools/list RESPONSE to add a `goal` property to the
-# advertised codex/codex-reply schemas; everything else stays byte-for-byte.
-test_codex_toolslist_goal "tools/list advertises goal on codex AND codex-reply" \
+# Stub-based Codex tools/list schema tests (fast — no real Codex needed).
+# The wrapper rewrites ONLY the tools/list RESPONSE to advertise its wrapper
+# fields; everything else stays byte-for-byte.
+test_codex_toolslist_rewrite "tools/list advertises goal on codex AND codex-reply" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string") and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties.goal.type=="string"))'
-test_codex_toolslist_goal "tools/list keeps additionalProperties:false on codex, none on codex-reply" \
+test_codex_toolslist_rewrite "tools/list advertises exact xhigh|max effort on codex only" \
+  "normal" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["xhigh","max"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
+test_codex_toolslist_rewrite "tools/list explains effort choice and reply inheritance" \
+  "normal" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort.description|ascii_downcase) as $d | (($d|test("new codex session")) and ($d|test("xhigh.*hard")) and ($d|test("max.*extra-hard")) and ($d|test("repl.*inherit")) and ($d|test("cannot change")) and ($d|test("omit.*server.*default")))'
+# If upstream Codex starts declaring this property itself, mcp-agents still
+# owns the policy: constrain codex to the two allowed values and remove the
+# property from codex-reply rather than exposing upstream drift such as ultra.
+test_codex_toolslist_rewrite "tools/list constrains drifted upstream effort schema" \
+  "haveeffort" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["xhigh","max"]) and (.description != "STUB_DRIFTED_EFFORT_DESC"))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
+test_codex_toolslist_rewrite "tools/list keeps additionalProperties:false on codex, none on codex-reply" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.additionalProperties==false) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema|has("additionalProperties")|not))'
-test_codex_toolslist_goal "tools/list does not add goal to required; keeps other props" \
+test_codex_toolslist_rewrite "tools/list keeps wrapper fields optional and other props intact" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema|(.required|index("goal")|not) and (.properties["developer-instructions"]!=null) and (.properties.prompt!=null)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties.conversationId!=null))'
-test_codex_toolslist_goal "tools/list forwards interleaved notification byte-for-byte + rewrites result" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema|(.required|index("goal")|not) and (.required|index("model_reasoning_effort")|not) and (.properties["developer-instructions"]!=null) and (.properties.prompt!=null)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties.conversationId!=null))'
+test_codex_toolslist_rewrite "tools/list forwards interleaved notification byte-for-byte + rewrites result" \
   "interleaved" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")' \
   '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"PASSTHROUGH_SENTINEL"}}'
-test_codex_toolslist_goal "tools/list reassembles a split frame and rewrites it" \
+test_codex_toolslist_rewrite "tools/list reassembles a split frame and rewrites it" \
   "split" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")'
 test_codex_toolslist_reentry "tools/list latch re-entry: two calls both rewritten"
-test_codex_toolslist_goal "tools/list idempotent: existing goal preserved (not overwritten)" \
+test_codex_toolslist_rewrite "tools/list idempotent: existing goal preserved (not overwritten)" \
   "havegoal" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.description=="STUB_OWN_GOAL_DESC")'
-test_codex_toolslist_goal "tools/list with no codex tools forwarded byte-for-byte" \
+test_codex_toolslist_rewrite "tools/list with no codex tools forwarded byte-for-byte" \
   "noctools" \
-  'select(.id==2) | ((.result.tools|length==1) and (.result.tools[0].name=="ping") and (.result.tools[0].inputSchema.properties|has("goal")|not))'
-test_codex_toolslist_goal "tools/list error response forwarded unchanged" \
+  'select(.id==2) | ((.result.tools|length==1) and (.result.tools[0].name=="ping") and (.result.tools[0].inputSchema.properties|has("goal")|not) and (.result.tools[0].inputSchema.properties|has("model_reasoning_effort")|not))'
+test_codex_toolslist_rewrite "tools/list error response forwarded unchanged" \
   "error" \
   'select(.id==2) | (.error.code==-32601)'
-test_codex_toolslist_goal "tools/list partial-then-die yields one -32001 (no hang)" \
+test_codex_toolslist_rewrite "tools/list partial-then-die yields one -32001 (no hang)" \
   "partialdie" \
   'select(.id==2) | (has("error") and .error.code==-32001)'
-test_codex_toolslist_goal "tools/list finalize recovers a complete-but-unterminated frame" \
+test_codex_toolslist_rewrite "tools/list finalize recovers a complete-but-unterminated frame" \
   "nonewlinedie" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")'
 test_codex_toolslist_backpressure "tools/list both responses survive backpressure (no strand)"
-test_codex_toolslist_goal "tools/list mode-boundary straddle reassembled byte-for-byte + rewritten" \
+test_codex_toolslist_rewrite "tools/list mode-boundary straddle reassembled byte-for-byte + rewritten" \
   "straddle" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")' \
   '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"STRADDLE_SENTINEL"}}'
@@ -1167,7 +1253,7 @@ else
   test_connectivity "call claude (connectivity)" "claude" "claude_code" 30
   test_connectivity "call gemini (connectivity)" "gemini" "gemini"     30
   test_codex_passthrough "codex passthrough (tools/list)"
-  test_codex_isolated_runtime "codex passthrough (isolated runtime)"
+  test_codex_isolated_runtime "codex passthrough (isolated runtime + per-session max)"
   test_codex_percall_write "codex per-call workspace-write grants writes"
 fi
 
