@@ -18,9 +18,37 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 PASS=0
 FAIL=0
+TEST_CHILD_REGISTRY=$(mktemp)
+export MCP_AGENTS_TEST_CHILD_REGISTRY="$TEST_CHILD_REGISTRY"
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+
+terminate_test_child() {
+  local pid="${1:-}"
+  [ -n "$pid" ] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.05
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+
+cleanup_registered_test_children() {
+  [ -f "$TEST_CHILD_REGISTRY" ] || return 0
+  while IFS= read -r pid; do terminate_test_child "$pid"; done < "$TEST_CHILD_REGISTRY"
+}
+
+on_test_exit() {
+  local status=$?
+  trap - EXIT
+  cleanup_registered_test_children
+  rm -f "$TEST_CHILD_REGISTRY"
+  exit "$status"
+}
+trap on_test_exit EXIT
 
 # ── Helper: run tools/list with a given --provider and check for expected tool ──
 test_tools_list() {
@@ -349,6 +377,7 @@ test_provider_shutdown_kills_child() {
 
   cat >"$tmpdir/claude" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 printf '%s' "$$" > "$MCP_AGENTS_TEST_PID_FILE"
 sleep 30
 printf '%s\n' '{"type":"result","result":"OK","is_error":false}'
@@ -372,6 +401,7 @@ EOF
     red "FAIL: $label (exit $status)"
     cat "$output_file"
     FAIL=$((FAIL + 1))
+    terminate_test_child "$(cat "$pid_file" 2>/dev/null || true)"
     rm -rf "$tmpdir"
     return
   fi
@@ -387,6 +417,7 @@ EOF
     red "FAIL: $label (missing child pid)"
     cat "$output_file"
     FAIL=$((FAIL + 1))
+    terminate_test_child "$(cat "$pid_file" 2>/dev/null || true)"
     rm -rf "$tmpdir"
     return
   fi
@@ -397,6 +428,7 @@ EOF
   if kill -0 "$child_pid" 2>/dev/null; then
     red "FAIL: $label (child still running: $child_pid)"
     FAIL=$((FAIL + 1))
+    terminate_test_child "$child_pid"
   else
     green "PASS: $label"
     PASS=$((PASS + 1))
@@ -410,6 +442,7 @@ EOF
 write_codex_capture_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 # Stub codex mcp-server: echo each received stdin line into the capture file.
 # `|| [ -n "$line" ]` also captures a final line with no trailing newline
 # (exercises the wrapper's end-of-stdin partial-frame path).
@@ -425,6 +458,7 @@ EOF
 write_codex_config_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 cp "$CODEX_HOME/config.toml" "$MCP_AGENTS_TEST_CONFIG_CAPTURE"
 while IFS= read -r _line; do :; done
 EOF
@@ -436,6 +470,7 @@ EOF
 write_codex_auth_rotation_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 stale="$MCP_AGENTS_TEST_REAL_CODEX_HOME/.auth.json.mcp-agents-${PPID}.tmp"
 printf '%s' '{"token":"stale"}' > "$stale"
 chmod 0644 "$stale"
@@ -550,6 +585,7 @@ write_codex_watchdog_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env node
 const MODE = process.env.MCP_STUB_MODE || "stall";
+require("fs").appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
 // Record our pid so the test can assert the wrapper actually killed us on
 // teardown (no orphaned stalled codex), mirroring the claude shutdown test.
 if (process.env.MCP_AGENTS_TEST_PID_FILE) {
@@ -635,7 +671,7 @@ run_codex_watchdog_case() {
     echo "  Response: $RESPONSE"
     if [ "$child_ok" -ne 1 ]; then
       echo "  codex stub still alive (orphan): ${child_pid:-<no pid>}"
-      [ -n "$child_pid" ] && kill -9 "$child_pid" 2>/dev/null
+      terminate_test_child "$child_pid"
     fi
     FAIL=$((FAIL + 1))
   fi
@@ -822,6 +858,7 @@ write_codex_toolslist_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env node
 const MODE = process.env.MCP_STUB_TLMODE || "normal";
+require("fs").appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
 const SENTINEL = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"PASSTHROUGH_SENTINEL"}}';
 const STRADDLE = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"STRADDLE_SENTINEL"}}';
 const STRADDLE_HEAD = STRADDLE.slice(0, 40);   // emitted on initialize, NO newline (orphan head)
@@ -878,6 +915,7 @@ process.stdin.on("data", (d) => {
     }
   }
 });
+process.stdin.on("end", () => process.exit(0));
 setInterval(() => {}, 1 << 30);
 EOF
   chmod +x "$1/codex"
@@ -961,12 +999,14 @@ const stubDir = process.argv[2], serverDir = process.argv[3];
 const child = spawn("node", ["server.js", "--provider", "codex"], {
   cwd: serverDir,
   env: { ...process.env, PATH: stubDir + ":" + process.env.PATH, MCP_STUB_TLMODE: "bp" },
-  stdio: ["pipe", "pipe", "ignore"],
+  stdio: ["pipe", "pipe", "pipe"],
 });
 let out = "";
+let err = "";
 child.stdout.pause();                                   // induce backpressure: stop reading
 child.stdout.on("data", (d) => { out += d.toString(); });
 child.stdin.on("error", () => {});
+child.stderr.on("data", (data) => { err += data.toString(); });
 const send = (o) => { try { child.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
 send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
 setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/initialized" }), 120);
@@ -981,10 +1021,16 @@ setTimeout(() => {
     if (m.id === 2 && hasGoal) ok2 = true;
     if (m.id === 3 && hasGoal) ok3 = true;
   }
-  process.stdout.write(ok2 && ok3 ? "BP_OK\n" : `BP_FAIL ok2=${ok2} ok3=${ok3}\n`);
-  try { child.kill("SIGKILL"); } catch {}
-  process.exit(ok2 && ok3 ? 0 : 1);
+  const ok = ok2 && ok3;
+  process.stdout.write(ok ? "BP_OK\n" : `BP_FAIL ok2=${ok2} ok3=${ok3}\n`);
+  child.once("close", () => process.exit(ok ? 0 : 1));
+  try { child.stdin.end(); } catch {}
+  setTimeout(() => { try { child.kill("SIGTERM"); } catch {} }, 1000);
 }, 1800);
+process.once("SIGTERM", () => {
+  child.once("close", () => process.exit(124));
+  try { child.kill("SIGTERM"); } catch {}
+});
 EOF
   set +e
   out=$($TIMEOUT_CMD 15 node "$tmpdir/driver.mjs" "$tmpdir" "$(pwd)" 2>/dev/null)
@@ -1058,6 +1104,270 @@ test_codex_toolslist_cancel() {
   if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
     red "FAIL: $label (status=$status)"; echo "  out: $(cat "$output_file")"; FAIL=$((FAIL + 1)); fi
   rm -rf "$tmpdir"
+}
+
+# ── Helper: Codex lifecycle stub for per-request liveness/recovery tests. ──
+write_codex_lifecycle_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env node
+const fs = require("fs");
+const mode = process.env.MCP_STUB_LIFECYCLE_MODE;
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+fs.writeFileSync(process.env.MCP_AGENTS_TEST_PID_FILE, String(process.pid));
+
+const timers = [];
+const threadId = (id) => `00000000-0000-4000-8000-${String(id).padStart(12, "0")}`;
+const send = (message, callback) => process.stdout.write(`${JSON.stringify(message)}\n`, callback);
+const event = (requestId, type, extra = {}, callback) => send({
+  jsonrpc: "2.0",
+  method: "codex/event",
+  params: {
+    _meta: { requestId, threadId: threadId(requestId) },
+    id: `event-${requestId}-${type}`,
+    msg: { type, ...extra },
+  },
+}, callback);
+const result = (id, content) => send({
+  jsonrpc: "2.0",
+  id,
+  result: {
+    content: [{ type: "text", text: content }],
+    structuredContent: { threadId: threadId(id), content },
+  },
+});
+const later = (delay, fn) => timers.push(setTimeout(fn, delay));
+const every = (delay, fn) => timers.push(setInterval(fn, delay));
+
+function startCall(id) {
+  event(id, "session_configured", { thread_id: threadId(id) });
+  switch (mode) {
+    case "stderr":
+      every(30, () => process.stderr.write("still noisy\n"));
+      break;
+    case "unrelated":
+      every(30, () => event(999, "agent_message_content_delta", { delta: "noise" }));
+      break;
+    case "progress":
+      for (const delay of [100, 200, 300, 400, 500, 600, 700]) {
+        later(delay, () => event(id, "agent_message_content_delta", { delta: "." }));
+      }
+      later(780, () => result(id, `PROGRESS_${id}`));
+      break;
+    case "terminal":
+      later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }));
+      break;
+    case "terminalexit":
+      later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }, () => process.exit(0)));
+      break;
+    case "native":
+      later(40, () => event(id, "turn_complete", { last_agent_message: "DONE" }));
+      later(80, () => result(id, "NATIVE"));
+      break;
+    case "late":
+      later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }));
+      later(220, () => result(id, "LATE"));
+      break;
+    case "reuse":
+      later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }));
+      later(300, () => result(id, "LATE"));
+      break;
+    case "hard":
+      every(30, () => event(id, "agent_message_content_delta", { delta: "." }));
+      break;
+    case "cancel":
+      every(30, () => event(id, "agent_message_content_delta", { delta: "." }));
+      break;
+  }
+}
+
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (data) => {
+  buf += data;
+  let newline;
+  while ((newline = buf.indexOf("\n")) !== -1) {
+    const line = buf.slice(0, newline); buf = buf.slice(newline + 1);
+    let message; try { message = JSON.parse(line); } catch { continue; }
+    if (message.method === "initialize") {
+      send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "lifecycle-stub", version: "0" } } });
+    } else if (message.method === "tools/call") {
+      fs.appendFileSync(process.env.MCP_AGENTS_TEST_CALL_CAPTURE, `${JSON.stringify({ id: message.id, prompt: message.params?.arguments?.prompt })}\n`);
+      startCall(message.id);
+    } else if (message.method === "ping") {
+      send({ jsonrpc: "2.0", id: message.id, result: {} });
+    }
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+setInterval(() => {}, 1 << 30);
+EOF
+  chmod +x "$1/codex"
+}
+
+# Drives one lifecycle mode and emits a single JSON summary for jq assertions.
+write_codex_lifecycle_driver() {
+  cat >"$1/driver.mjs" <<'EOF'
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+const [stubDir, serverDir, mode, idle, hard, settle, terminal, cancel, progress] = process.argv.slice(2);
+const pidFile = `${stubDir}/codex.pid`;
+const callFile = `${stubDir}/calls.jsonl`;
+const started = Date.now();
+const child = spawn("node", ["server.js", "--provider", "codex", "--codex_idle_timeout", idle, "--timeout", hard], {
+  cwd: serverDir,
+  env: {
+    ...process.env,
+    PATH: `${stubDir}:${process.env.PATH}`,
+    MCP_STUB_LIFECYCLE_MODE: mode,
+    MCP_AGENTS_TEST_PID_FILE: pidFile,
+    MCP_AGENTS_TEST_CALL_CAPTURE: callFile,
+    MCP_AGENTS_CODEX_TERMINAL_GRACE_MS: terminal,
+    MCP_AGENTS_CODEX_CANCEL_GRACE_MS: cancel,
+    MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS: progress,
+  },
+  stdio: ["pipe", "pipe", "ignore"],
+});
+let out = "";
+let parseBuf = "";
+let scenarioStarted = false;
+let reuseSent = false;
+let bootTimer;
+let pingTimer;
+let settleTimer;
+let fallbackTimer;
+child.stdin.on("error", () => {});
+const send = (message) => {
+  if (child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
+};
+const call = (id, token, prompt = `call ${id}`) => send({
+  jsonrpc: "2.0",
+  id,
+  method: "tools/call",
+  params: {
+    name: "codex",
+    arguments: { prompt },
+    ...(token === undefined ? {} : { _meta: { progressToken: token } }),
+  },
+});
+
+const startScenario = () => {
+  if (scenarioStarted) return;
+  scenarioStarted = true;
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  if (mode === "progress") {
+    call(2);
+    call(3, "progress-3");
+  } else if (mode === "cancel") {
+    call(2, "cancel-2");
+    call(3);
+    setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2, reason: "test" } }), 60);
+  } else {
+    call(2, mode === "hard" ? "hard-2" : undefined);
+  }
+  if (mode === "unrelated") {
+    let pingId = 100;
+    pingTimer = setInterval(() => send({ jsonrpc: "2.0", id: pingId++, method: "ping", params: {} }), 30);
+  }
+  settleTimer = setTimeout(() => {
+    if (pingTimer) clearInterval(pingTimer);
+    try { child.stdin.end(); } catch {}
+    fallbackTimer = setTimeout(() => { try { child.kill("SIGTERM"); } catch {} }, 500);
+  }, Number(settle));
+};
+child.stdout.on("data", (data) => {
+  const chunk = data.toString();
+  out += chunk;
+  parseBuf += chunk;
+  let newline;
+  while ((newline = parseBuf.indexOf("\n")) !== -1) {
+    const line = parseBuf.slice(0, newline); parseBuf = parseBuf.slice(newline + 1);
+    let frame; try { frame = JSON.parse(line); } catch { continue; }
+    if (frame.id === 1 && frame.result) startScenario();
+    if (mode === "reuse" && frame.id === 2 && frame.result?.structuredContent?.content === "DONE" && !reuseSent) {
+      reuseSent = true;
+      call(2, undefined, "REUSED");
+    }
+  }
+});
+bootTimer = setInterval(() => {
+  try { readFileSync(pidFile, "utf8"); } catch { return; }
+  clearInterval(bootTimer);
+  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "lifecycle-test", version: "0" } } });
+}, 10);
+
+child.once("close", (code, signal) => {
+  clearInterval(bootTimer);
+  clearTimeout(settleTimer);
+  clearTimeout(fallbackTimer);
+  if (pingTimer) clearInterval(pingTimer);
+  setTimeout(() => {
+    const frames = out.split("\n").filter(Boolean).flatMap((line) => {
+      try { return [JSON.parse(line)]; } catch { return []; }
+    });
+    let stubPid = null;
+    try { stubPid = Number(readFileSync(pidFile, "utf8")); } catch {}
+    let stubAlive = false;
+    try { if (stubPid) process.kill(stubPid, 0); stubAlive = Boolean(stubPid); } catch {}
+    let calls = [];
+    try { calls = readFileSync(callFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch {}
+    process.stdout.write(`${JSON.stringify({ code, signal, elapsedMs: Date.now() - started, stubAlive, calls, frames })}\n`);
+    process.exit(0);
+  }, 80);
+});
+
+process.once("SIGTERM", () => {
+  try { child.kill("SIGTERM"); } catch {}
+  setTimeout(() => process.exit(124), 1000);
+});
+EOF
+}
+
+test_codex_lifecycle() {
+  local label="$1" mode="$2" idle="$3" hard="$4" settle="$5"
+  local terminal="$6" cancel="$7" progress="$8" predicate="$9"
+  local tmpdir status summary ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  write_codex_lifecycle_stub "$tmpdir"
+  write_codex_lifecycle_driver "$tmpdir"
+  set +e
+  summary=$($TIMEOUT_CMD 8 node "$tmpdir/driver.mjs" "$tmpdir" "$(pwd)" "$mode" "$idle" "$hard" "$settle" "$terminal" "$cancel" "$progress" 2>/dev/null)
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  printf '%s' "$summary" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Summary: ${summary:0:1000}"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+test_no_registered_child_leaks() {
+  local label="$1" survivors="" pid
+  echo "--- $label ---"
+  for _ in $(seq 1 30); do
+    survivors=""
+    while IFS= read -r pid; do
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then survivors="$survivors $pid"; fi
+    done < "$TEST_CHILD_REGISTRY"
+    [ -z "$survivors" ] && break
+    sleep 0.1
+  done
+  if [ -z "$survivors" ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (survivors:$survivors)"
+    FAIL=$((FAIL + 1))
+    cleanup_registered_test_children
+  fi
 }
 
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
@@ -1240,6 +1550,67 @@ test_codex_toolslist_file "tools/list oversized frame forwarded raw, result stil
 # partial is withheld must flush it raw (not byte-lose it when codex then dies).
 test_codex_toolslist_cancel "tools/list cancel flushes a withheld partial raw (not lost)"
 
+# Stub-based per-request Codex lifecycle tests.
+test_codex_lifecycle "codex stderr does not reset request idle deadline" \
+  "stderr" "0.3" "2" "1000" "80" "100" "0" \
+  '(.code == 1) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")))] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
+test_codex_lifecycle "codex unrelated pings/events do not reset request idle deadline" \
+  "unrelated" "0.3" "2" "1000" "80" "100" "0" \
+  '(.code == 1) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")))] | length == 1) and
+   ([.frames[] | select((.id // 0) >= 100 and has("result"))] | length >= 1)'
+test_codex_lifecycle "codex matching events extend idle and progress uses supplied token only" \
+  "progress" "0.3" "2" "1000" "80" "100" "60" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "PROGRESS_2")] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "PROGRESS_3")] | length == 1) and
+   ([.frames[] | select(.method == "notifications/progress")] as $p |
+     (($p | length) >= 1) and ([$p[] | select(.params.progressToken != "progress-3")] | length == 0))'
+test_codex_lifecycle "codex terminal event synthesizes result with early thread id" \
+  "terminal" "0.3" "2" "350" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .result.content[0].text == "DONE" and .result.structuredContent == {"threadId":"00000000-0000-4000-8000-000000000002","content":"DONE"})] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("error"))] | length == 0)'
+test_codex_lifecycle "codex terminal event survives immediate child exit" \
+  "terminalexit" "0.3" "2" "350" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.calls[] | select(.id == 2 and .prompt == "call 2")] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.content[0].text == "DONE" and .result.structuredContent == {"threadId":"00000000-0000-4000-8000-000000000002","content":"DONE"})] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("error"))] | length == 0)'
+test_codex_lifecycle "codex native result inside terminal grace wins" \
+  "native" "0.3" "2" "300" "150" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "NATIVE")] | length == 1) and
+   ([.frames[] | select(.id == 2 and (.result.structuredContent.content // "") == "DONE")] | length == 0)'
+test_codex_lifecycle "codex late native result is suppressed after terminal fallback" \
+  "late" "0.3" "2" "400" "70" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "DONE")] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "LATE")] | length == 0)'
+test_codex_lifecycle "codex request-id reuse is rejected while late response is suppressed" \
+  "reuse" "0.3" "2" "600" "70" "100" "0" \
+  '(.code == 1) and (.stubAlive == false) and
+   ([.calls[] | select(.id == 2 and .prompt == "call 2")] | length == 1) and
+   ([.calls[] | select(.prompt == "REUSED")] | length == 0) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "DONE")] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "LATE")] | length == 0) and
+   ([.frames[] | select(.id == 2 and has("error"))] | length == 1) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("reused")))] | length == 1)'
+test_codex_lifecycle "codex hard deadline is immutable despite matching progress" \
+  "hard" "0.3" "0.55" "1000" "80" "100" "0" \
+  '(.code == 1) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | test("hard|deadline")))] | length == 1) and
+   ([.frames[] | select(.method == "notifications/progress" and .params.progressToken == "hard-2")] | length >= 1)'
+test_codex_lifecycle "codex cancellation tears wrapper down after bounded grace" \
+  "cancel" "2" "2" "800" "80" "100" "0" \
+  '(.code == 1) and (.elapsedMs < 1000) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and (has("result") or has("error")))] | length == 0) and
+   ([.frames[] | select(.id == 3 and .error.code == -32001)] | length == 1)'
+
 # Stub-based codex watchdog/child-death tests (fast — no real codex needed)
 run_codex_watchdog_case "codex idle watchdog synthesizes error for stalled call" \
   "stall" "--codex_idle_timeout 1" 1
@@ -1256,6 +1627,8 @@ else
   test_codex_isolated_runtime "codex passthrough (isolated runtime + per-session max)"
   test_codex_percall_write "codex per-call workspace-write grants writes"
 fi
+
+test_no_registered_child_leaks "test suite leaves no provider stub children"
 
 # ---------- Summary ----------
 echo ""

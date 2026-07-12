@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] - 2026-07-12
+
+### Added
+
+- Send throttled MCP `notifications/progress` for active Codex calls when the
+  caller supplied `_meta.progressToken`; the bridge uses that exact token and
+  never invents one. Progress prevents client-side idle expiry but does not
+  extend a client's separate hard wall-clock tool timeout
+- Capture a Codex thread ID from the early request-correlated session event and
+  retain the terminal agent message. If the native final response does not
+  arrive within its grace period, synthesize the equivalent successful
+  `tools/call` result with `structuredContent.threadId` and suppress a matching
+  late response so the caller still receives exactly one result
+
+### Changed
+
+- Replace the global Codex idle watchdog with per-call liveness tracking.
+  `--codex_idle_timeout` is now refreshed only by activity correlated through
+  the request's `_meta.requestId`; stderr, pings, unrelated client traffic, and
+  another call's events can no longer hide a stalled request
+- Enforce `--timeout` for Codex as an immutable per-call hard deadline (default
+  two hours), independent of correlated progress and the idle watchdog
+- Set the tracked Claude project MCP timeout above the Codex bridge deadline so
+  the client does not preempt the wrapper's own terminal/error recovery
+- Give cancellation a short, non-resettable grace period. A Codex child that
+  does not settle is killed and reaped, other open calls receive one teardown
+  error, and the wrapper exits so the MCP client can reconnect cleanly. The
+  canceled call is never replayed
+- Document the legacy recovery boundary: the wrapper does not respawn
+  `codex mcp-server` inside the existing stdio connection, and old
+  `codex-reply` threads cannot survive a child teardown. Durable thread replay
+  and same-connection recovery require a future `codex app-server` adapter
+
 ## [0.13.0] - 2026-07-10
 
 ### Added

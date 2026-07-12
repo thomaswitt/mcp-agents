@@ -33,15 +33,19 @@ const VERSION = JSON.parse(
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 900_000;
+const DEFAULT_CODEX_TIMEOUT_MS = 7_200_000;
 const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
 const DEFAULT_CODEX_APPROVAL_POLICY = "never";
-// Idle watchdog for the codex pass-through: if a request is in flight and codex
-// emits nothing on stdout/stderr for this long, the wrapper synthesizes a
-// JSON-RPC error for the open request(s) and tears codex down — converting an
-// unbounded post-completion stall into a surfaced error. 0 disables it.
+// Correlated watchdogs for the codex pass-through. Only a codex/event carrying
+// the matching MCP request id extends a call's idle window; stderr, pings, and
+// unrelated calls cannot keep a wedged request alive. 0 disables the idle cap.
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
+const DEFAULT_CODEX_TERMINAL_GRACE_MS = 1_000;
+const DEFAULT_CODEX_CANCEL_GRACE_MS = 3_000;
+const DEFAULT_CODEX_PROGRESS_INTERVAL_MS = 15_000;
+const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 // tools/call argument keys stripped from the codex pass-through so callers
@@ -82,6 +86,13 @@ const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
 const SHUTDOWN_TIMEOUT_MS = 3_000;
 let fatalShutdown;
+
+const testTunableMs = (name, fallback) => {
+  const value = process.env[name];
+  if (value == null) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : fallback;
+};
 
 // ---------------------------------------------------------------------------
 // CLI Backend Definitions
@@ -213,7 +224,7 @@ Options:
   --codex_idle_timeout <secs>    Codex pass-through idle watchdog; 0 disables
                                  [default: ${DEFAULT_CODEX_IDLE_TIMEOUT_MS / 1000}]
   --timeout <seconds>            Default timeout per call
-                                 [default: claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
+                                 [default: codex ${DEFAULT_CODEX_TIMEOUT_MS / 1000}, claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
 }
@@ -894,10 +905,10 @@ function injectCodexPropertiesIntoToolsListMessage(msg) {
  * Spawn codex mcp-server as a pass-through. codex stdout is forwarded back to
  * the client byte-for-byte, but the client's stdin is intercepted line-by-line
  * so per-call model/config overrides are stripped before reaching codex. An
- * idle watchdog converts an unbounded codex stall (no stdout/stderr while a
- * request is in flight) into a synthesized JSON-RPC error so the caller never
- * hangs forever.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, idleTimeoutMs?: number, goal?: string }} opts
+ * Per-request idle and hard deadlines convert unbounded Codex stalls into
+ * surfaced JSON-RPC errors. Correlated events also provide client-visible MCP
+ * progress and enough terminal metadata to recover a missing final response.
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, idleTimeoutMs?: number, hardTimeoutMs?: number, goal?: string }} opts
  */
 function runCodexPassthrough({
   model,
@@ -905,6 +916,7 @@ function runCodexPassthrough({
   sandboxMode,
   approvalPolicy,
   idleTimeoutMs,
+  hardTimeoutMs,
   goal,
 }) {
   const resolvedModel = model || DEFAULT_CODEX_MODEL;
@@ -913,6 +925,19 @@ function runCodexPassthrough({
   const resolvedSandboxMode = sandboxMode || DEFAULT_CODEX_SANDBOX_MODE;
   const resolvedApprovalPolicy = approvalPolicy || DEFAULT_CODEX_APPROVAL_POLICY;
   const resolvedIdleTimeoutMs = idleTimeoutMs ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
+  const resolvedHardTimeoutMs = hardTimeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS;
+  const terminalGraceMs = testTunableMs(
+    "MCP_AGENTS_CODEX_TERMINAL_GRACE_MS",
+    DEFAULT_CODEX_TERMINAL_GRACE_MS,
+  );
+  const cancelGraceMs = testTunableMs(
+    "MCP_AGENTS_CODEX_CANCEL_GRACE_MS",
+    DEFAULT_CODEX_CANCEL_GRACE_MS,
+  );
+  const progressIntervalMs = testTunableMs(
+    "MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS",
+    DEFAULT_CODEX_PROGRESS_INTERVAL_MS,
+  );
   // Server-wide default goal (string or undefined); per-call `goal` overrides it.
   const resolvedGoal = goal;
   let isolatedCodexHome;
@@ -953,7 +978,8 @@ function runCodexPassthrough({
       `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, ` +
       `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
       `goal=${resolvedGoal && resolvedGoal.trim() ? "set" : "none"}, ` +
-      `idle_timeout_ms=${resolvedIdleTimeoutMs}, isolated_home=true)`,
+      `idle_timeout_ms=${resolvedIdleTimeoutMs}, hard_timeout_ms=${resolvedHardTimeoutMs}, ` +
+      `isolated_home=true)`,
   );
 
   const child = spawn("codex", args, {
@@ -986,36 +1012,10 @@ function runCodexPassthrough({
     });
   }
 
-  // ── In-flight request tracking ──────────────────────────────────────────
-  // Client requests (id + method) awaiting a codex response. Keyed by a
-  // type-preserving key so JSON-RPC `1` (number) and `"1"` (string) never
-  // collide. `canceled` marks ids the client gave up on (notifications/
-  // cancelled): we never synthesize a response for them, but they still count
-  // toward teardown so a canceled-but-wedged codex is not left running.
-  const inFlight = new Map();
-  const idKey = (id) => `${typeof id}:${id}`;
-  const addInFlight = (id) => {
-    if (id == null) return;
-    const key = idKey(id);
-    if (!inFlight.has(key)) inFlight.set(key, { id, canceled: false });
-  };
-  const clearInFlight = (id) => {
-    if (id != null) inFlight.delete(idKey(id));
-  };
-  const cancelInFlight = (id) => {
-    const entry = id == null ? undefined : inFlight.get(idKey(id));
-    if (entry) entry.canceled = true;
-  };
-  const hasEmittableInFlight = () => {
-    for (const entry of inFlight.values()) if (!entry.canceled) return true;
-    return false;
-  };
-
   // ── Liveness / lifecycle state ──────────────────────────────────────────
   let finalizing = false;
   let exited = false;
   let stdoutPaused = false; // process.stdout backpressured (downstream, not idle)
-  let idleTimer;
   let lastForwardedByteWasNewline = true; // nothing forwarded yet
   let stdoutObsBuf = Buffer.alloc(0); // observation copy of codex stdout
   let skippingFrame = false; // mid-skip of an oversized stdout frame (resync at \n)
@@ -1029,10 +1029,245 @@ function runCodexPassthrough({
   // Observation above stays the SOLE authority for inFlight/the watchdog; this
   // path only changes HOW bytes reach the wire.
   const pendingToolsListIds = new Set(); // idKey(id) of outstanding tools/list requests (the latch)
+  const suppressedResponseIds = new Set(); // late native responses already synthesized upstream
   let rewriteBuf = Buffer.alloc(0); // buffer-mode accumulator; holds ≤1 trailing partial after a flush
   let rewriteSkipUntilNewline = false; // forwarding raw to the next newline (oversized frame or mode-boundary align)
   let rewriteSkipReleaseId; // idKey to release when the skipped frame's newline lands (oversized response only)
+  let rewriteDropUntilNewline = false; // discarding an oversized suppressed response through its delimiter
+  let rewriteDropReleaseId;
   let oversizedToolsListLogged = false; // log the first rewrite-cap drop only
+  const generatedFrames = [];
+  let flushGeneratedFrames = () => {};
+
+  // ── In-flight request tracking ──────────────────────────────────────────
+  // Every request owns its own idle, hard, terminal, and cancellation timers.
+  // JSON-RPC numeric `1` and string `"1"` remain distinct keys.
+  const inFlight = new Map();
+  const serverRequestParents = new Map();
+  const idKey = (id) => `${typeof id}:${id}`;
+  const clearTimer = (entry, name) => {
+    if (!entry?.[name]) return;
+    clearTimeout(entry[name]);
+    entry[name] = undefined;
+  };
+  const clearEntryTimers = (entry) => {
+    for (const name of ["idleTimer", "hardTimer", "terminalTimer", "cancelTimer"]) {
+      clearTimer(entry, name);
+    }
+  };
+  const clearAllEntryTimers = () => {
+    for (const entry of inFlight.values()) clearEntryTimers(entry);
+  };
+  const settleInFlight = (id) => {
+    if (id == null) return undefined;
+    const key = idKey(id);
+    const entry = inFlight.get(key);
+    if (!entry) return undefined;
+    clearEntryTimers(entry);
+    inFlight.delete(key);
+    pendingToolsListIds.delete(key);
+    for (const [serverRequestKey, parentKey] of serverRequestParents) {
+      if (parentKey === key) serverRequestParents.delete(serverRequestKey);
+    }
+    return entry;
+  };
+  const armEntryIdle = (entry) => {
+    clearTimer(entry, "idleTimer");
+    if (
+      !(resolvedIdleTimeoutMs > 0) || finalizing || stdoutPaused ||
+      entry.state !== "open"
+    ) return;
+    entry.idleTimer = setTimeout(() => {
+      if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+      finalize({
+        reason:
+          `request ${JSON.stringify(entry.id)} idle timeout ` +
+          `(${Math.round(resolvedIdleTimeoutMs / 1000)}s)`,
+        emit: true,
+        exitCode: 1,
+      });
+    }, resolvedIdleTimeoutMs);
+  };
+  const armEntryHard = (entry) => {
+    if (!(resolvedHardTimeoutMs > 0)) return;
+    entry.hardTimer = setTimeout(() => {
+      if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+      finalize({
+        reason:
+          `request ${JSON.stringify(entry.id)} hard timeout ` +
+          `(${Math.round(resolvedHardTimeoutMs / 1000)}s)`,
+        emit: true,
+        exitCode: 1,
+      });
+    }, resolvedHardTimeoutMs);
+  };
+  const addInFlight = (msg) => {
+    if (msg.id == null) return true;
+    const key = idKey(msg.id);
+    if (inFlight.has(key) || suppressedResponseIds.has(key)) {
+      const entry = inFlight.get(key) ?? {
+        id: msg.id,
+        method: msg.method,
+        toolName: msg.method === "tools/call" ? msg.params?.name : undefined,
+        threadId: undefined,
+      };
+      clearEntryTimers(entry);
+      entry.state = "open";
+      inFlight.set(key, entry);
+      finalize({
+        reason:
+          `request id ${JSON.stringify(msg.id)} was reused before the prior ` +
+          `Codex response settled`,
+        emit: true,
+        exitCode: 1,
+      });
+      return false;
+    }
+    const suppliedProgressToken = msg.params?._meta?.progressToken;
+    const progressToken =
+      typeof suppliedProgressToken === "string" ||
+      (typeof suppliedProgressToken === "number" && Number.isFinite(suppliedProgressToken))
+        ? suppliedProgressToken
+        : undefined;
+    const entry = {
+      id: msg.id,
+      method: msg.method,
+      toolName: msg.method === "tools/call" ? msg.params?.name : undefined,
+      progressToken,
+      threadId: undefined,
+      state: "open",
+      lastAgentMessage: undefined,
+      progressSequence: 0,
+      lastProgressAt: undefined,
+      fallbackReady: false,
+    };
+    inFlight.set(key, entry);
+    armEntryIdle(entry);
+    armEntryHard(entry);
+    return true;
+  };
+  const hasEmittableInFlight = () => {
+    for (const entry of inFlight.values()) if (entry.state !== "canceled") return true;
+    return false;
+  };
+  const canArmResponseSuppression = () =>
+    lastForwardedByteWasNewline && rewriteBuf.length === 0 &&
+    !rewriteSkipUntilNewline && !rewriteDropUntilNewline;
+  const canInjectGeneratedFrame = () =>
+    !stdoutPaused && canArmResponseSuppression();
+  const queueGeneratedFrame = (frame, { requestKey, kind } = {}) => {
+    generatedFrames.push({
+      buffer: Buffer.from(`${JSON.stringify(frame)}\n`, "utf8"),
+      requestKey,
+      kind,
+    });
+    queueMicrotask(() => flushGeneratedFrames());
+  };
+  const generatedFrameIsLive = (frame) => {
+    if (frame.kind !== "progress") return true;
+    const entry = inFlight.get(frame.requestKey);
+    return entry != null && entry.state !== "canceled";
+  };
+  const emitProgress = (entry, eventType) => {
+    if (entry.progressToken == null || entry.state === "canceled") return;
+    const now = Date.now();
+    if (
+      entry.lastProgressAt != null &&
+      now - entry.lastProgressAt < progressIntervalMs
+    ) return;
+    entry.lastProgressAt = now;
+    entry.progressSequence += 1;
+    const label = typeof eventType === "string"
+      ? eventType.replaceAll("_", " ")
+      : "working";
+    queueGeneratedFrame(
+      {
+        jsonrpc: "2.0",
+        method: "notifications/progress",
+        params: {
+          progressToken: entry.progressToken,
+          progress: entry.progressSequence,
+          message: `Codex: ${label}`,
+        },
+      },
+      { requestKey: idKey(entry.id), kind: "progress" },
+    );
+  };
+  const terminalResultFrame = (entry) => {
+    const text = entry.lastAgentMessage ?? "";
+    return {
+      jsonrpc: "2.0",
+      id: entry.id,
+      result: {
+        content: [{ type: "text", text }],
+        structuredContent: { threadId: entry.threadId ?? "", content: text },
+      },
+    };
+  };
+  const synthesizeTerminalResult = (entry) => {
+    if (
+      finalizing || inFlight.get(idKey(entry.id)) !== entry ||
+      entry.state !== "terminal_grace"
+    ) return;
+    if (!canInjectGeneratedFrame()) {
+      entry.fallbackReady = true;
+      return;
+    }
+    entry.fallbackReady = false;
+    const key = idKey(entry.id);
+    suppressedResponseIds.add(key);
+    settleInFlight(entry.id);
+    queueGeneratedFrame(
+      terminalResultFrame(entry),
+      { kind: "terminal_result" },
+    );
+    logErr(
+      `[mcp-agents] recovered missing codex response for request ` +
+        `${JSON.stringify(entry.id)} (thread_id=${entry.threadId ?? "unknown"})`,
+    );
+    if (suppressedResponseIds.size >= MAX_SUPPRESSED_CODEX_RESPONSES) {
+      setImmediate(() => finalize({
+        reason: "late-response suppression limit reached",
+        emit: true,
+        exitCode: 1,
+      }));
+    }
+  };
+  const flushReadyTerminalResults = () => {
+    if (!canInjectGeneratedFrame()) return;
+    for (const entry of [...inFlight.values()]) {
+      if (entry.fallbackReady) synthesizeTerminalResult(entry);
+    }
+  };
+  const beginTerminalGrace = (entry, message) => {
+    if (entry.state !== "open") return;
+    entry.state = "terminal_grace";
+    entry.lastAgentMessage = typeof message === "string" ? message : "";
+    clearTimer(entry, "idleTimer");
+    entry.terminalTimer = setTimeout(
+      () => synthesizeTerminalResult(entry),
+      terminalGraceMs,
+    );
+  };
+  const cancelInFlight = (id) => {
+    const entry = id == null ? undefined : inFlight.get(idKey(id));
+    if (!entry || entry.state === "canceled") return;
+    entry.state = "canceled";
+    clearTimer(entry, "idleTimer");
+    clearTimer(entry, "hardTimer");
+    clearTimer(entry, "terminalTimer");
+    if (canArmResponseSuppression()) suppressedResponseIds.add(idKey(id));
+    entry.cancelTimer = setTimeout(() => {
+      if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+      finalize({
+        reason:
+          `request ${JSON.stringify(entry.id)} cancellation did not settle ` +
+          `within ${cancelGraceMs}ms`,
+        emit: true,
+        exitCode: 1,
+      });
+    }, cancelGraceMs);
+  };
 
   const killGroup = (signal) => {
     try {
@@ -1043,23 +1278,9 @@ function runCodexPassthrough({
     }
   };
 
-  const clearIdle = () => {
-    if (idleTimer) {
-      clearTimeout(idleTimer);
-      idleTimer = undefined;
-    }
-  };
-  const armIdle = () => {
-    clearIdle();
-    // No watchdog when disabled, while finalizing, or while downstream is
-    // backpressured (blocked downstream != idle upstream).
-    if (!(resolvedIdleTimeoutMs > 0) || finalizing || stdoutPaused) return;
-    idleTimer = setTimeout(onIdle, resolvedIdleTimeoutMs);
-  };
-  const resetIdle = armIdle;
-
   // Parse one complete codex->client stdout frame (observation only — the raw
-  // bytes are forwarded separately). Clears an id once its result/error lands.
+  // bytes are forwarded separately). Correlated events are the ONLY activity
+  // that extends a request's idle window.
   const observeOutgoingLine = (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -1069,7 +1290,40 @@ function runCodexPassthrough({
       msg && typeof msg === "object" && "id" in msg &&
       ("result" in msg || "error" in msg)
     ) {
-      clearInFlight(msg.id);
+      settleInFlight(msg.id);
+      return;
+    }
+    if (msg?.id != null && typeof msg.method === "string") {
+      const correlatedId = msg.params?._meta?.requestId;
+      let entry = correlatedId == null
+        ? undefined
+        : inFlight.get(idKey(correlatedId));
+      if (!entry) {
+        const threadId = msg.params?._meta?.threadId ??
+          msg.params?.threadId ?? msg.params?.thread_id;
+        if (typeof threadId === "string") {
+          entry = [...inFlight.values()].find((candidate) =>
+            candidate.threadId === threadId && candidate.state === "open"
+          );
+        }
+      }
+      if (entry) {
+        serverRequestParents.set(idKey(msg.id), idKey(entry.id));
+        clearTimer(entry, "idleTimer");
+      }
+      return;
+    }
+    if (msg?.method !== "codex/event") return;
+    const requestId = msg.params?._meta?.requestId;
+    const entry = requestId == null ? undefined : inFlight.get(idKey(requestId));
+    if (!entry || entry.state === "canceled") return;
+    const threadId = msg.params?._meta?.threadId;
+    if (typeof threadId === "string" && threadId) entry.threadId = threadId;
+    const eventType = msg.params?.msg?.type;
+    if (entry.state === "open") armEntryIdle(entry);
+    emitProgress(entry, eventType);
+    if (eventType === "task_complete" || eventType === "turn_complete") {
+      beginTerminalGrace(entry, msg.params?.msg?.last_agent_message);
     }
   };
 
@@ -1122,7 +1376,7 @@ function runCodexPassthrough({
   // never finish writing, re-introducing a hang.
   const resolveDroppedFrame = (prefix) => {
     const id = peekResponseId(prefix);
-    if (id !== undefined) clearInFlight(id);
+    if (id !== undefined) settleInFlight(id);
   };
 
   // Accumulate codex stdout into the observation buffer and parse each complete
@@ -1142,7 +1396,7 @@ function runCodexPassthrough({
       // the id stays tracked so the watchdog still catches the stall.)
       skippingFrame = false;
       if (droppedFrameResponseId !== undefined) {
-        clearInFlight(droppedFrameResponseId);
+        settleInFlight(droppedFrameResponseId);
         droppedFrameResponseId = undefined;
       }
       data = data.subarray(nl + 1); // resume parsing after the frame boundary
@@ -1176,7 +1430,7 @@ function runCodexPassthrough({
   const hardExit = (code) => {
     if (exited) return;
     exited = true;
-    clearIdle();
+    clearAllEntryTimers();
     cleanupIsolatedCodexHome();
     process.exit(code);
   };
@@ -1201,7 +1455,7 @@ function runCodexPassthrough({
   const finalize = ({ reason, emit, exitCode }) => {
     if (finalizing) return;
     finalizing = true;
-    clearIdle();
+    clearAllEntryTimers();
     logErr(`[mcp-agents] codex passthrough finalize: ${reason}`);
 
     // Stop forwarding further codex stdout so a late real response cannot race
@@ -1217,7 +1471,7 @@ function runCodexPassthrough({
     // harmless ESRCH (swallowed by killGroup).
     killGroup("SIGKILL");
 
-    if (emit && hasEmittableInFlight()) {
+    if (emit && (hasEmittableInFlight() || generatedFrames.length > 0)) {
       // Framing recovery. Precedence handles bytes WITHHELD by buffer mode (which
       // the plain stdoutObsBuf recovery would mis-handle). EVERY write here is
       // try/catch-guarded: finalize runs synchronously from close/exit/idle/signal
@@ -1234,6 +1488,10 @@ function runCodexPassthrough({
           try { process.stdout.write("\n"); } catch {}
           lastForwardedByteWasNewline = true;
         }
+      } else if (rewriteDropUntilNewline) {
+        rewriteBuf = Buffer.alloc(0);
+        rewriteDropUntilNewline = false;
+        stdoutObsBuf = Buffer.alloc(0);
       } else if (rewriteBuf.length > 0) {
         // A withheld buffered partial (never forwarded). If it parses as a COMPLETE
         // message (only its trailing newline missing) — possible only when the whole
@@ -1247,6 +1505,13 @@ function runCodexPassthrough({
           const m = JSON.parse(frameStr);
           outStr = frameStr;
           if (
+            m && typeof m === "object" && "id" in m &&
+            ("result" in m || "error" in m) &&
+            suppressedResponseIds.has(idKey(m.id))
+          ) {
+            suppressedResponseIds.delete(idKey(m.id));
+            outStr = null;
+          } else if (
             m && typeof m === "object" && "id" in m &&
             ("result" in m || "error" in m) &&
             pendingToolsListIds.has(idKey(m.id)) &&
@@ -1275,8 +1540,27 @@ function runCodexPassthrough({
         lastForwardedByteWasNewline = true;
       }
 
+      while (generatedFrames.length > 0 && lastForwardedByteWasNewline) {
+        const frame = generatedFrames.shift();
+        if (!generatedFrameIsLive(frame)) continue;
+        try { process.stdout.write(frame.buffer); } catch {}
+      }
+
+      for (const entry of [...inFlight.values()]) {
+        if (entry.state !== "terminal_grace") continue;
+        try {
+          process.stdout.write(`${JSON.stringify(terminalResultFrame(entry))}\n`);
+        } catch {}
+        settleInFlight(entry.id);
+        logErr(
+          `[mcp-agents] recovered completed codex request ` +
+            `${JSON.stringify(entry.id)} during teardown ` +
+            `(thread_id=${entry.threadId ?? "unknown"})`,
+        );
+      }
+
       for (const entry of inFlight.values()) {
-        if (entry.canceled) continue;
+        if (entry.state === "canceled") continue;
         const frame = {
           jsonrpc: "2.0",
           id: entry.id,
@@ -1285,7 +1569,8 @@ function runCodexPassthrough({
             message:
               `mcp-agents: codex pass-through aborted before responding ` +
               `(${reason}); the request was still open. Any applied edits may ` +
-              `exist — verify the tree.`,
+              `exist — verify the tree.` +
+              (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
           },
         };
         try { process.stdout.write(`${JSON.stringify(frame)}\n`); } catch {}
@@ -1294,9 +1579,14 @@ function runCodexPassthrough({
 
     // Hygiene: drop the rewrite latch/skip state (forwarding has stopped).
     pendingToolsListIds.clear();
+    suppressedResponseIds.clear();
+    serverRequestParents.clear();
     rewriteSkipUntilNewline = false;
     rewriteSkipReleaseId = undefined;
+    rewriteDropUntilNewline = false;
+    rewriteDropReleaseId = undefined;
     rewriteBuf = Buffer.alloc(0);
+    generatedFrames.length = 0;
 
     flushThenExit(exitCode);
   };
@@ -1308,32 +1598,7 @@ function runCodexPassthrough({
   fatalShutdown = (reason, code) =>
     finalize({ reason: `fatal: ${reason}`, emit: true, exitCode: code ?? 1 });
 
-  function onIdle() {
-    idleTimer = undefined;
-    if (finalizing) return;
-    if (hasEmittableInFlight()) {
-      finalize({
-        reason: `idle timeout (${Math.round(resolvedIdleTimeoutMs / 1000)}s)`,
-        emit: true,
-        exitCode: 1,
-      });
-      return;
-    }
-    // Only canceled requests left -> tear down quietly. Nothing open at all ->
-    // healthy idle between calls, just re-arm.
-    if (inFlight.size > 0) {
-      finalize({
-        reason: "idle timeout (canceled-only)",
-        emit: false,
-        exitCode: 1,
-      });
-    } else {
-      armIdle();
-    }
-  }
-
   child.stderr.on("data", (chunk) => {
-    resetIdle();
     logErr(`[codex] ${chunk.toString().trimEnd()}`);
   });
 
@@ -1356,13 +1621,21 @@ function runCodexPassthrough({
     lastForwardedByteWasNewline = buf[buf.length - 1] === NEWLINE;
     const ok = process.stdout.write(buf);
     if (!ok && !stdoutPaused) {
-      // Downstream full: pause codex and suspend the idle watchdog until the
-      // client drains, so a slow reader is never mistaken for a stalled codex.
+      // Downstream full: pause codex and suspend per-request idle timers until
+      // the client drains. Immutable hard deadlines continue running.
       stdoutPaused = true;
-      clearIdle();
+      for (const entry of inFlight.values()) clearTimer(entry, "idleTimer");
       child.stdout.pause();
     }
     return ok;
+  };
+  flushGeneratedFrames = () => {
+    if (finalizing || stdoutPaused || !canInjectGeneratedFrame()) return;
+    while (generatedFrames.length > 0 && !stdoutPaused) {
+      const frame = generatedFrames.shift();
+      if (!generatedFrameIsLive(frame)) continue;
+      forwardChunk(frame.buffer);
+    }
   };
 
   // Once no tools/list id is outstanding (and not mid-skip), a trailing partial in
@@ -1375,7 +1648,8 @@ function runCodexPassthrough({
   const returnToRawIfLatchClear = () => {
     if (
       !finalizing && pendingToolsListIds.size === 0 &&
-      !rewriteSkipUntilNewline && rewriteBuf.length > 0
+      suppressedResponseIds.size === 0 && !rewriteSkipUntilNewline &&
+      !rewriteDropUntilNewline && rewriteBuf.length > 0
     ) {
       forwardChunk(rewriteBuf);
       rewriteBuf = Buffer.alloc(0);
@@ -1390,6 +1664,19 @@ function runCodexPassthrough({
   // pause the source" semantics. After this returns rewriteBuf holds at most one
   // trailing INCOMPLETE partial.
   const flushRewriteBuf = () => {
+    if (rewriteDropUntilNewline) {
+      const nl = rewriteBuf.indexOf(NEWLINE);
+      if (nl === -1) {
+        rewriteBuf = Buffer.alloc(0);
+        return;
+      }
+      rewriteBuf = rewriteBuf.subarray(nl + 1);
+      if (rewriteDropReleaseId !== undefined) {
+        suppressedResponseIds.delete(rewriteDropReleaseId);
+        rewriteDropReleaseId = undefined;
+      }
+      rewriteDropUntilNewline = false;
+    }
     if (rewriteSkipUntilNewline) {
       const nl = rewriteBuf.indexOf(NEWLINE);
       if (nl === -1) {
@@ -1415,8 +1702,13 @@ function runCodexPassthrough({
         // observeOutgoing's oversized branch), releasing only a matching pending id.
         logRewriteDropOnce();
         const pid = peekResponseId(frameBytes);
-        if (pid !== undefined && pendingToolsListIds.has(idKey(pid))) {
-          pendingToolsListIds.delete(idKey(pid));
+        const key = pid === undefined ? undefined : idKey(pid);
+        if (key !== undefined && suppressedResponseIds.has(key)) {
+          suppressedResponseIds.delete(key);
+          continue;
+        }
+        if (key !== undefined && pendingToolsListIds.has(key)) {
+          pendingToolsListIds.delete(key);
         }
         forwardChunk(frameBytes);
         continue;
@@ -1428,18 +1720,23 @@ function runCodexPassthrough({
         );
         if (
           msg && typeof msg === "object" && "id" in msg &&
-          ("result" in msg || "error" in msg) &&
-          pendingToolsListIds.has(idKey(msg.id))
+          ("result" in msg || "error" in msg)
         ) {
-          pendingToolsListIds.delete(idKey(msg.id));
-          if (injectCodexPropertiesIntoToolsListMessage(msg)) {
-            outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
+          const key = idKey(msg.id);
+          if (suppressedResponseIds.has(key)) {
+            suppressedResponseIds.delete(key);
+            outBuf = null;
+          } else if (pendingToolsListIds.has(key)) {
+            pendingToolsListIds.delete(key);
+            if (injectCodexPropertiesIntoToolsListMessage(msg)) {
+              outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
+            }
           }
         }
       } catch {
         outBuf = frameBytes; // unparseable (mode-boundary tail / partial) — forward original bytes
       }
-      forwardChunk(outBuf);
+      if (outBuf) forwardChunk(outBuf);
     }
     if (rewriteBuf.length > MAX_BUFFER_BYTES) {
       // Partial frame already past the cap with no newline: abandon rewriting for
@@ -1447,11 +1744,18 @@ function runCodexPassthrough({
       // a matching id, deferred to that newline.
       logRewriteDropOnce();
       const pid = peekResponseId(rewriteBuf);
-      rewriteSkipReleaseId =
-        pid !== undefined && pendingToolsListIds.has(idKey(pid)) ? idKey(pid) : undefined;
-      forwardChunk(rewriteBuf);
-      rewriteBuf = Buffer.alloc(0);
-      rewriteSkipUntilNewline = true;
+      const key = pid === undefined ? undefined : idKey(pid);
+      if (key !== undefined && suppressedResponseIds.has(key)) {
+        rewriteDropReleaseId = key;
+        rewriteBuf = Buffer.alloc(0);
+        rewriteDropUntilNewline = true;
+      } else {
+        rewriteSkipReleaseId =
+          key !== undefined && pendingToolsListIds.has(key) ? key : undefined;
+        forwardChunk(rewriteBuf);
+        rewriteBuf = Buffer.alloc(0);
+        rewriteSkipUntilNewline = true;
+      }
     }
     // Latch boundary: a response just completed may have emptied the latch — if so,
     // flush any trailing NON-tools/list partial raw and return to the fast path.
@@ -1470,9 +1774,11 @@ function runCodexPassthrough({
   // frame in this chunk was already forwarded/queued, so it never leads forwarding.
   child.stdout.on("data", (chunk) => {
     if (finalizing) return; // stream ownership has been taken over
-    resetIdle(); // UNCONDITIONAL, before the mode branch — buffer-mode activity must keep the watchdog alive
 
-    if (pendingToolsListIds.size > 0 || rewriteBuf.length > 0 || rewriteSkipUntilNewline) {
+    if (
+      pendingToolsListIds.size > 0 || suppressedResponseIds.size > 0 ||
+      rewriteBuf.length > 0 || rewriteSkipUntilNewline || rewriteDropUntilNewline
+    ) {
       bufferModeForward(chunk);
     } else {
       forwardChunk(chunk);
@@ -1484,6 +1790,8 @@ function runCodexPassthrough({
       const msg = err instanceof Error ? err.message : String(err);
       logErr(`[mcp-agents] codex passthrough: stdout observation error (ignored): ${msg}`);
     }
+    flushReadyTerminalResults();
+    flushGeneratedFrames();
   });
 
   process.stdout.on("drain", () => {
@@ -1491,7 +1799,9 @@ function runCodexPassthrough({
     stdoutPaused = false;
     if (finalizing) return;
     child.stdout.resume();
-    resetIdle();
+    for (const entry of inFlight.values()) armEntryIdle(entry);
+    flushReadyTerminalResults();
+    flushGeneratedFrames();
   });
 
   process.stdout.on("error", (err) => {
@@ -1512,13 +1822,10 @@ function runCodexPassthrough({
   // filterCodexToolCall remains the sole authority on the forwarded bytes.
   const noteInbound = (line) => {
     const trimmed = line.trim();
-    if (!trimmed) return;
+    if (!trimmed) return true;
     let msg;
-    try { msg = JSON.parse(trimmed); } catch { return; }
-    if (!msg || typeof msg !== "object") return;
-    // (Watchdog liveness is reset at the byte level in the stdin 'data' handler,
-    // so even an elicitation response — bare id, no method — keeps a healthy
-    // interactive flow alive.)
+    try { msg = JSON.parse(trimmed); } catch { return true; }
+    if (!msg || typeof msg !== "object") return true;
     if (msg.method === "notifications/cancelled") {
       const rid = msg.params?.requestId;
       cancelInFlight(rid);
@@ -1530,13 +1837,20 @@ function runCodexPassthrough({
         pendingToolsListIds.delete(idKey(rid));
         returnToRawIfLatchClear();
       }
-      return;
+      return true;
+    }
+    if (msg.id != null && typeof msg.method !== "string") {
+      const parentKey = serverRequestParents.get(idKey(msg.id));
+      serverRequestParents.delete(idKey(msg.id));
+      const entry = parentKey == null ? undefined : inFlight.get(parentKey);
+      if (entry?.state === "open") armEntryIdle(entry);
+      return true;
     }
     // A client message awaits a response iff it carries BOTH an id and a method.
     // A bare id with no method is a *response* to a codex elicitation — skip it
     // for in-flight tracking.
     if (msg.id != null && typeof msg.method === "string") {
-      addInFlight(msg.id);
+      if (!addInFlight(msg)) return false;
       if (msg.method === "tools/list") {
         // Arm the wrapper-property rewrite latch for this tools/list response. If
         // buffer mode would START mid-frame (a pre-latch frame's head was already
@@ -1545,8 +1859,9 @@ function runCodexPassthrough({
         // byte-for-byte and never mis-parsed as a standalone frame nor byte-lost at
         // finalize. Equivalent to today's raw behaviour for that straddled frame.
         if (
-          pendingToolsListIds.size === 0 && rewriteBuf.length === 0 &&
-          !rewriteSkipUntilNewline && !lastForwardedByteWasNewline
+          pendingToolsListIds.size === 0 && suppressedResponseIds.size === 0 &&
+          rewriteBuf.length === 0 && !rewriteSkipUntilNewline &&
+          !rewriteDropUntilNewline && !lastForwardedByteWasNewline
         ) {
           rewriteSkipUntilNewline = true;
           rewriteSkipReleaseId = undefined;
@@ -1554,31 +1869,28 @@ function runCodexPassthrough({
         pendingToolsListIds.add(idKey(msg.id));
       }
     }
+    return true;
   };
 
   let stdinBuf = Buffer.alloc(0);
   process.stdin.on("data", (chunk) => {
-    // ANY inbound bytes mean the client side of the exchange is alive — even a
-    // large/slow elicitation response arriving across chunks without a newline.
-    // Reset the watchdog here at the BYTE level (not per parsed line): a truly
-    // stalled exchange (codex silent AND client sending nothing) still produces
-    // no inbound, so the genuine stall is still caught.
-    resetIdle();
     stdinBuf = stdinBuf.length ? Buffer.concat([stdinBuf, chunk]) : chunk;
     let nl;
     while ((nl = stdinBuf.indexOf(NEWLINE)) !== -1) {
       const line = stdinBuf.subarray(0, nl).toString("utf8");
       stdinBuf = stdinBuf.subarray(nl + 1);
-      noteInbound(line);
-      child.stdin.write(`${filterCodexToolCall(line, { serverGoal: resolvedGoal })}\n`);
+      if (noteInbound(line) && !finalizing) {
+        child.stdin.write(`${filterCodexToolCall(line, { serverGoal: resolvedGoal })}\n`);
+      }
     }
   });
   process.stdin.on("error", () => {});
   process.stdin.on("end", () => {
     if (stdinBuf.length > 0) {
       const line = stdinBuf.toString("utf8");
-      noteInbound(line);
-      child.stdin.write(filterCodexToolCall(line, { serverGoal: resolvedGoal }));
+      if (noteInbound(line) && !finalizing) {
+        child.stdin.write(filterCodexToolCall(line, { serverGoal: resolvedGoal }));
+      }
     }
     child.stdin.end();
   });
@@ -1666,6 +1978,7 @@ async function main() {
       approvalPolicy,
       goal,
       idleTimeoutMs: codexIdleTimeoutMs,
+      hardTimeoutMs: defaultTimeoutMs,
     });
     return;
   }

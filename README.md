@@ -199,18 +199,58 @@ start a new `codex` call rather than changing it on a `codex-reply`.
 > (the MCP-native vehicle for a standing objective), which is prompt/role
 > conditioning, not the native goal-lifecycle subsystem.
 
-**Idle watchdog.** The codex pass-through is transparent, so a Codex session that
-stalls after doing work (e.g. its final model turn hangs, or it waits on an
-elicitation the client never answers) would otherwise hang the caller's
-`tools/call` forever. `--codex_idle_timeout <seconds>` (default `600`, `0`
-disables) bounds this: if Codex emits nothing while a request is in flight for
-that long, the wrapper returns a JSON-RPC error (`-32001`) for the open
-request(s), kills the Codex process group, and exits — turning an unbounded stall
-into a surfaced error. The timer resets on any Codex output or inbound client
-activity and is suspended while the client backpressures stdout, so healthy long
-or interactive runs are not killed. The wrapper also exits (instead of lingering)
-if Codex dies or fails to start, so a dead Codex can never leave the caller
-hanging.
+**Per-call liveness.** The codex pass-through tracks every open `tools/call`
+independently. `--codex_idle_timeout <seconds>` (default `600`, `0` disables)
+bounds how long one call may go without correlated Codex activity. Only a Codex
+event carrying that call's `_meta.requestId` (or its matching response or
+interactive exchange) refreshes its idle deadline. Codex stderr, client pings,
+unrelated requests, and events belonging to another call cannot keep a stalled
+call alive. If a call reaches its idle deadline, the wrapper surfaces a JSON-RPC
+error (`-32001`), tears down the shared Codex process group, fails any other open
+calls, and exits so the MCP client can reconnect to a clean bridge.
+
+`--timeout <seconds>` is also enforced for Codex calls (default `7200`) as an
+immutable hard deadline. Correlated activity can extend the idle window but
+never this hard deadline. Set the wrapper deadline below the MCP client's own
+wall-clock tool timeout when the client must always receive the wrapper's
+explicit error before it gives up.
+
+When the incoming request supplies `_meta.progressToken`, the wrapper sends
+throttled standard MCP `notifications/progress` updates using that exact token.
+It never invents a progress token. These updates keep clients from mistaking an
+active Codex call for an idle one, but they extend neither the wrapper's hard
+deadline nor a client's separate hard wall-clock tool timeout. Configure the
+client timeout to exceed the longest expected Codex run plus response headroom;
+when it expires, the client cancels the call and the bounded cancellation path
+below takes over.
+
+**Terminal-result recovery.** Codex announces the thread ID on an early,
+request-correlated session event, so the wrapper retains it before the build
+finishes. If Codex later emits its terminal completion event and final agent
+message but its native `tools/call` response does not arrive within the short
+terminal-response grace period, the wrapper returns an equivalent successful
+result containing both `content` and `structuredContent.threadId`. A matching
+late native response is discarded, preserving exactly-once JSON-RPC response
+semantics. This covers the failure mode where work landed in the tree but the
+caller otherwise received neither the result nor the thread ID.
+
+**Cancellation and reconnect.** Client cancellation starts a short,
+non-resettable grace period. If Codex does not settle within that bound, the
+wrapper synthesizes no response for the canceled ID, fails any other open calls
+once, kills and reaps the detached Codex process group, and exits. A native
+response that arrives inside the grace period is discarded whenever it can be
+intercepted without corrupting a partially forwarded frame. The MCP client can
+then reconnect to a fresh bridge; the canceled, potentially write-capable call
+is never replayed automatically. Inspect the working tree before manually
+retrying it because cancellation does not prove that Codex made no changes.
+
+This legacy bridge deliberately does **not** respawn `codex mcp-server` inside
+the existing stdio connection or transparently replay threads. `codex-reply`
+state belongs to the old Codex process, so a thread ID from a torn-down child
+cannot be resumed after reconnect. Durable same-connection recovery requires a
+separate migration from the transparent legacy pass-through to an MCP adapter
+over `codex app-server` (`thread/start`, `turn/start`, `turn/interrupt`, and
+`thread/resume`).
 
 ## Integration with Claude Code
 
@@ -222,7 +262,8 @@ binary:
   "mcpServers": {
     "codex": {
       "command": "mcp-agents",
-      "args": ["--provider", "codex"]
+      "args": ["--provider", "codex"],
+      "timeout": 7500000
     },
     "gemini": {
       "command": "mcp-agents",
@@ -239,7 +280,8 @@ Override codex defaults at server startup:
   "mcpServers": {
     "codex": {
       "command": "mcp-agents",
-      "args": ["--provider", "codex", "--model", "gpt-5.6-sol", "--model_reasoning_effort", "medium"]
+      "args": ["--provider", "codex", "--model", "gpt-5.6-sol", "--model_reasoning_effort", "medium"],
+      "timeout": 7500000
     }
   }
 }
@@ -255,6 +297,12 @@ constraints (`sandbox`/`cwd`/`approval-policy` remain steerable per call). Add
 `"--goal", "<text>"` to `args` to inject a persistent objective into every Codex
 call (see [Goal injection](#codex-pass-through) above).
 
+Claude interprets the per-server `timeout` in milliseconds as a hard wall-clock
+cap; progress does not extend it. Keep it above the wrapper's `--timeout`
+(7,200 seconds by default), including response headroom. A project `.mcp.json`
+entry can override a user-level MCP entry of the same name, so put the timeout
+on the project entry instead of relying on the user-level copy.
+
 Because the bridge runs in an isolated Codex home, inherited MCP servers from your normal
 `~/.codex/config.toml` are intentionally unavailable inside bridged Codex sessions.
 
@@ -266,7 +314,8 @@ Because the bridge runs in an isolated Codex home, inherited MCP servers from yo
   "mcpServers": {
     "codex": {
       "command": "npx",
-      "args": ["-y", "mcp-agents", "--provider", "codex"]
+      "args": ["-y", "mcp-agents", "--provider", "codex"],
+      "timeout": 7500000
     }
   }
 }
