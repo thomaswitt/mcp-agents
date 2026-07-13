@@ -1118,7 +1118,7 @@ fs.writeFileSync(process.env.MCP_AGENTS_TEST_PID_FILE, String(process.pid));
 const timers = [];
 const threadId = (id) => `00000000-0000-4000-8000-${String(id).padStart(12, "0")}`;
 const send = (message, callback) => process.stdout.write(`${JSON.stringify(message)}\n`, callback);
-const event = (requestId, type, extra = {}, callback) => send({
+const eventMessage = (requestId, type, extra = {}) => ({
   jsonrpc: "2.0",
   method: "codex/event",
   params: {
@@ -1126,7 +1126,9 @@ const event = (requestId, type, extra = {}, callback) => send({
     id: `event-${requestId}-${type}`,
     msg: { type, ...extra },
   },
-}, callback);
+});
+const event = (requestId, type, extra = {}, callback) =>
+  send(eventMessage(requestId, type, extra), callback);
 const result = (id, content) => send({
   jsonrpc: "2.0",
   id,
@@ -1148,10 +1150,70 @@ function startCall(id) {
       every(30, () => event(999, "agent_message_content_delta", { delta: "noise" }));
       break;
     case "progress":
+      event(id, "item_started", { item: { type: "AgentMessage", id: `commentary-${id}`, phase: "commentary" } });
       for (const delay of [100, 200, 300, 400, 500, 600, 700]) {
-        later(delay, () => event(id, "agent_message_content_delta", { delta: "." }));
+        later(delay, () => event(id, "agent_message_content_delta", { item_id: `commentary-${id}`, delta: "." }));
       }
       later(780, () => result(id, `PROGRESS_${id}`));
+      break;
+    case "tokens":
+      event(id, "task_started");
+      later(100, () => result(id, `TOKEN_${id}`));
+      break;
+    case "visibility": {
+      event(id, "item_started", { item: { type: "AgentMessage", id: "commentary-safe", phase: "commentary" } });
+      later(20, () => event(id, "agent_message_content_delta", { item_id: "commentary-safe", delta: "Working\n on \u0000 tests 🚀" }));
+      later(40, () => event(id, "item_started", { item: { type: "AgentMessage", id: "final-secret", phase: "final_answer" } }));
+      later(50, () => event(id, "agent_message_content_delta", { item_id: "final-secret", delta: "SENTINEL_FINAL" }));
+      later(60, () => event(id, "agent_message_content_delta", { item_id: "unknown", delta: "SENTINEL_UNKNOWN" }));
+      later(70, () => event(id, "agent_message", { phase: "final_answer", message: "SENTINEL_FINAL_COMPLETE" }));
+      later(80, () => event(id, "agent_message", { message: "SENTINEL_PHASELESS" }));
+      later(90, () => event(id, "item_started", { item: { type: "agent_message", id: "wrong-case", phase: "commentary" } }));
+      later(95, () => event(id, "agent_message_content_delta", { item_id: "wrong-case", delta: "SENTINEL_WRONG_TYPE" }));
+      later(100, () => event(id, "plan_update", { plan: [{ step: "Verify bridge", status: "in_progress" }] }));
+      later(150, () => event(id, "exec_command_begin", { command: "SENTINEL_COMMAND" }));
+      later(200, () => event(id, "exec_command_end", { exit_code: 7, output: "SENTINEL_OUTPUT" }));
+      later(250, () => event(id, "patch_apply_begin", { changes: { "/SENTINEL_PATH_A": {}, "/SENTINEL_PATH_B": {} } }));
+      later(300, () => event(id, "mcp_tool_call_begin", { invocation: { server: "safe-server", tool: "safe-tool", arguments: { secret: "SENTINEL_ARGUMENT" } } }));
+      later(350, () => event(id, "web_search_end", { query: "SENTINEL_QUERY" }));
+      later(400, () => event(id, "raw_response_item", { prompt: "SENTINEL_PROMPT", reasoning: "SENTINEL_REASONING" }));
+      later(420, () => event(id, "item_completed", { item: { type: "AgentMessage", id: "completed-safe", phase: "commentary", content: [{ type: "Text", text: "Completed commentary" }] } }));
+      later(440, () => event(id, "item_completed", { item: { type: "AgentMessage", id: "completed-final", phase: "final_answer", content: [{ type: "Text", text: "SENTINEL_COMPLETED_FINAL" }] } }));
+      later(470, () => event(id, "agent_message", { phase: "commentary", message: "🚀".repeat(250) }));
+      later(550, () => result(id, "VISIBLE"));
+      break;
+    }
+    case "coalesce":
+      event(id, "task_started");
+      later(10, () => event(id, "exec_command_begin", { command: "SENTINEL_COALESCE" }));
+      later(20, () => event(id, "plan_update", { plan: [{ step: "Old status", status: "in_progress" }] }));
+      later(30, () => event(id, "plan_update", { plan: [{ step: "Latest status", status: "in_progress" }] }));
+      later(40, () => event(id, "plan_update", { plan: [{ step: "Latest status", status: "in_progress" }] }));
+      later(140, () => result(id, "COALESCED"));
+      break;
+    case "wait":
+      later(650, () => event(id, "unknown_activity", { secret: "SENTINEL_WAIT" }));
+      break;
+    case "partial":
+    case "partialstall": {
+      const partial = JSON.stringify(eventMessage(id, "warning", { message: "SAFE" }));
+      const splitAt = partial.length - 5;
+      process.stdout.write(`${JSON.stringify(eventMessage(id, "task_started"))}\n${partial.slice(0, splitAt)}`);
+      if (mode === "partial") {
+        later(220, () => process.stdout.write(`${partial.slice(splitAt)}\n`));
+        later(360, () => result(id, "PARTIAL"));
+      }
+      break;
+    }
+    case "settled":
+      event(id, "task_started");
+      later(40, () => result(id, "SETTLED"));
+      later(120, () => event(id, "exec_command_begin", { command: "SENTINEL_LATE" }));
+      break;
+    case "terminalstop":
+      event(id, "task_started");
+      later(30, () => event(id, "task_complete", { last_agent_message: "DONE" }));
+      later(100, () => event(id, "exec_command_begin", { command: "SENTINEL_TERMINAL" }));
       break;
     case "terminal":
       later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }));
@@ -1172,10 +1234,12 @@ function startCall(id) {
       later(300, () => result(id, "LATE"));
       break;
     case "hard":
-      every(30, () => event(id, "agent_message_content_delta", { delta: "." }));
+      event(id, "task_started");
+      every(30, () => event(id, "exec_command_begin", { command: "SENTINEL_HARD" }));
       break;
     case "cancel":
-      every(30, () => event(id, "agent_message_content_delta", { delta: "." }));
+      event(id, "task_started");
+      every(30, () => event(id, "exec_command_begin", { command: "SENTINEL_CANCEL" }));
       break;
   }
 }
@@ -1210,7 +1274,8 @@ write_codex_lifecycle_driver() {
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-const [stubDir, serverDir, mode, idle, hard, settle, terminal, cancel, progress] = process.argv.slice(2);
+const [stubDir, serverDir, mode, idle, hard, settle, terminal, cancel, progressConfig] = process.argv.slice(2);
+const [progress, wait = "10000"] = progressConfig.split(",");
 const pidFile = `${stubDir}/codex.pid`;
 const callFile = `${stubDir}/calls.jsonl`;
 const started = Date.now();
@@ -1225,10 +1290,13 @@ const child = spawn("node", ["server.js", "--provider", "codex", "--codex_idle_t
     MCP_AGENTS_CODEX_TERMINAL_GRACE_MS: terminal,
     MCP_AGENTS_CODEX_CANCEL_GRACE_MS: cancel,
     MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS: progress,
+    MCP_AGENTS_CODEX_WAIT_INTERVAL_MS: wait,
+    MCP_AGENTS_TEST_TIMER_AUDIT: "1",
   },
-  stdio: ["pipe", "pipe", "ignore"],
+  stdio: ["pipe", "pipe", "pipe"],
 });
 let out = "";
+let err = "";
 let parseBuf = "";
 let scenarioStarted = false;
 let reuseSent = false;
@@ -1237,6 +1305,7 @@ let pingTimer;
 let settleTimer;
 let fallbackTimer;
 child.stdin.on("error", () => {});
+child.stderr.on("data", (data) => { err += data.toString(); });
 const send = (message) => {
   if (child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
 };
@@ -1258,12 +1327,20 @@ const startScenario = () => {
   if (mode === "progress") {
     call(2);
     call(3, "progress-3");
+  } else if (mode === "tokens") {
+    call(2, "string-token");
+    call(3, 42);
+    call(4);
+    call(5, { invalid: true });
   } else if (mode === "cancel") {
     call(2, "cancel-2");
     call(3);
     setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2, reason: "test" } }), 60);
   } else {
-    call(2, mode === "hard" ? "hard-2" : undefined);
+    const tokenModes = new Set([
+      "hard", "visibility", "coalesce", "wait", "partial", "partialstall", "settled", "terminalstop",
+    ]);
+    call(2, tokenModes.has(mode) ? `${mode}-2` : undefined);
   }
   if (mode === "unrelated") {
     let pingId = 100;
@@ -1302,8 +1379,9 @@ child.once("close", (code, signal) => {
   clearTimeout(fallbackTimer);
   if (pingTimer) clearInterval(pingTimer);
   setTimeout(() => {
+    let parseErrors = 0;
     const frames = out.split("\n").filter(Boolean).flatMap((line) => {
-      try { return [JSON.parse(line)]; } catch { return []; }
+      try { return [JSON.parse(line)]; } catch { parseErrors += 1; return []; }
     });
     let stubPid = null;
     try { stubPid = Number(readFileSync(pidFile, "utf8")); } catch {}
@@ -1311,7 +1389,8 @@ child.once("close", (code, signal) => {
     try { if (stubPid) process.kill(stubPid, 0); stubAlive = Boolean(stubPid); } catch {}
     let calls = [];
     try { calls = readFileSync(callFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch {}
-    process.stdout.write(`${JSON.stringify({ code, signal, elapsedMs: Date.now() - started, stubAlive, calls, frames })}\n`);
+    const timerAudits = [...err.matchAll(/settled timer count=(\d+)/g)].map((match) => Number(match[1]));
+    process.stdout.write(`${JSON.stringify({ code, signal, elapsedMs: Date.now() - started, stubAlive, calls, frames, parseErrors, rawHasProgress: out.includes('"method":"notifications/progress"'), timerAudits })}\n`);
     process.exit(0);
   }, 80);
 });
@@ -1343,7 +1422,7 @@ test_codex_lifecycle() {
     PASS=$((PASS + 1))
   else
     red "FAIL: $label (status=$status)"
-    echo "  Summary: ${summary:0:1000}"
+    echo "  Summary: ${summary:0:10000}"
     FAIL=$((FAIL + 1))
   fi
   rm -rf "$tmpdir"
@@ -1568,6 +1647,61 @@ test_codex_lifecycle "codex matching events extend idle and progress uses suppli
    ([.frames[] | select(.id == 3 and .result.structuredContent.content == "PROGRESS_3")] | length == 1) and
    ([.frames[] | select(.method == "notifications/progress")] as $p |
      (($p | length) >= 1) and ([$p[] | select(.params.progressToken != "progress-3")] | length == 0))'
+test_codex_lifecycle "codex progress accepts string/numeric tokens and rejects missing/invalid tokens" \
+  "tokens" "0.5" "2" "350" "80" "100" "20" \
+  '(.code == 0) and
+   ([.frames[] | select(.id >= 2 and .id <= 5 and has("result"))] | length == 4) and
+   ([.frames[] | select(.method == "notifications/progress") | .params.progressToken] | sort) == [42, "string-token"]'
+test_codex_lifecycle "codex progress allowlist exposes useful status and redacts hostile fields" \
+  "visibility" "1" "2" "750" "80" "100" "30" \
+  '(.code == 0) and (.parseErrors == 0) and
+   ([.frames[] | select(.method == "notifications/progress" and .params.progressToken == "visibility-2")] as $p |
+     ($p | length) >= 7 and
+     ([$p[].params.progress] as $seq | ($seq == ($seq | sort)) and (($seq | unique | length) == ($seq | length))) and
+     ([$p[].params.message] | all((length <= 200) and startswith("Codex: "))) and
+     (([$p[].params.message] | join(" ")) as $messages |
+       ($messages | contains("Working on tests 🚀")) and
+       ($messages | contains("working on: Verify bridge")) and
+       ($messages | contains("running a command")) and
+       ($messages | contains("command finished (exit 7)")) and
+       ($messages | contains("applying changes to 2 file(s)")) and
+       ($messages | contains("calling safe-server/safe-tool")) and
+       ($messages | contains("web search finished")) and
+       ($messages | contains("Completed commentary")) and
+       ($messages | contains("SENTINEL_") | not)))'
+test_codex_lifecycle "codex progress is immediate then coalesces latest distinct status" \
+  "coalesce" "0.5" "2" "350" "80" "100" "80" \
+  '(.code == 0) and
+   ([.frames[] | select(.method == "notifications/progress") | .params.message] ==
+     ["Codex: started", "Codex: working on: Latest status"])'
+test_codex_lifecycle "codex silence notices report event age without extending idle" \
+  "wait" "1.25" "3" "2400" "80" "100" "20,250" \
+  '(.code == 1) and (.elapsedMs >= 1700) and (.elapsedMs < 2300) and
+   ([.frames[] | select(.method == "notifications/progress") | .params.message] as $messages |
+     ($messages | any(contains("still running; last activity 0s ago"))) and
+     ($messages | any(contains("still running; last activity 1s ago")))) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")))] | length == 1)'
+test_codex_lifecycle "codex progress waits for a safe boundary and keeps only the latest frame" \
+  "partial" "0.5" "2" "600" "80" "100" "20,60" \
+  '(.code == 0) and (.parseErrors == 0) and
+   ([.frames[] | select(.method == "notifications/progress")] | length == 1) and
+   ([.frames[] | select(.method == "notifications/progress") | .params.message | contains("still running")] | all) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "PARTIAL")] | length == 1)'
+test_codex_lifecycle "codex permanent partial stall never splices progress and still idles out" \
+  "partialstall" "0.25" "2" "600" "80" "100" "20,60" \
+  '(.code == 1) and (.rawHasProgress == false) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")))] | length == 1)'
+test_codex_lifecycle "codex settlement clears progress and silence timers" \
+  "settled" "0.5" "2" "300" "80" "100" "20,60" \
+  '(.code == 0) and
+   ((.timerAudits | length) >= 1) and (.timerAudits | all(. == 0)) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "SETTLED")] | length == 1) and
+   ([.frames[] | select(.method == "notifications/progress")] | length == 1)'
+test_codex_lifecycle "codex terminal grace stops progress before fallback settlement" \
+  "terminalstop" "0.5" "2" "350" "150" "100" "20,60" \
+  '(.code == 0) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "DONE")] | length == 1) and
+   ([.frames[] | select(.method == "notifications/progress")] | length == 1)'
 test_codex_lifecycle "codex terminal event synthesizes result with early thread id" \
   "terminal" "0.3" "2" "350" "80" "100" "0" \
   '(.code == 0) and (.stubAlive == false) and

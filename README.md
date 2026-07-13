@@ -216,13 +216,30 @@ wall-clock tool timeout when the client must always receive the wrapper's
 explicit error before it gives up.
 
 When the incoming request supplies `_meta.progressToken`, the wrapper sends
-throttled standard MCP `notifications/progress` updates using that exact token.
-It never invents a progress token. These updates keep clients from mistaking an
-active Codex call for an idle one, but they extend neither the wrapper's hard
-deadline nor a client's separate hard wall-clock tool timeout. Configure the
-client timeout to exceed the longest expected Codex run plus response headroom;
-when it expires, the client cancels the call and the bounded cancellation path
-below takes over.
+standard MCP `notifications/progress` updates using that exact token. It never
+invents a progress token. The first useful status is immediate; later updates
+are coalesced to at most one per second, with the latest status winning. During
+otherwise silent work, a `Codex: still running` notice is sent every 10 seconds
+and includes the age of the last request-correlated Codex event.
+
+Status text is fail-closed. The bridge exposes explicitly attributed commentary,
+the active plan step, and generic lifecycle summaries for commands, patches,
+MCP tools, web/image work, and subagents. It does not expose final-answer text,
+reasoning, prompts, command strings or output, tool arguments, search queries,
+file paths, or token telemetry. Messages are whitespace-normalized and capped
+at 200 Unicode code points. Native `codex/event` frames remain byte-for-byte
+unchanged; progress is a parallel MCP channel and is normally UI status rather
+than additional tool-result/model context.
+
+These notices deliberately keep a progress-aware client's idle window alive,
+leaving liveness authority with the wrapper's idle and hard deadlines. They do
+not refresh `--codex_idle_timeout`, extend the wrapper's hard deadline, or
+extend a client's separate hard wall-clock tool timeout. A generated progress
+frame is inserted only at a native newline boundary; if Codex stalls halfway
+through a frame, the latest notice waits for a safe boundary and the real idle
+watchdog still terminates a permanent stall. Configure the client timeout to
+exceed the longest expected Codex run plus response headroom; when it expires,
+the client cancels the call and the bounded cancellation path below takes over.
 
 **Terminal-result recovery.** Codex announces the thread ID on an early,
 request-correlated session event, so the wrapper retains it before the build
@@ -365,6 +382,12 @@ npm run bench:mcp-startup
 
 This measures MCP launch through `initialize` and `tools/list`; it does not call
 the provider model/tool.
+
+For a manual end-to-end progress check, invoke `codex` from a Claude Code
+subagent and verify that commentary/lifecycle messages appear while the tool
+call remains blocking, followed by exactly one final tool result. This smoke
+check depends on the installed Claude Code UI and is intentionally not a
+deterministic test-suite gate.
 
 ## How it works
 

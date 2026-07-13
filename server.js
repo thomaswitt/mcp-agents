@@ -44,7 +44,9 @@ const DEFAULT_CODEX_APPROVAL_POLICY = "never";
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_CODEX_TERMINAL_GRACE_MS = 1_000;
 const DEFAULT_CODEX_CANCEL_GRACE_MS = 3_000;
-const DEFAULT_CODEX_PROGRESS_INTERVAL_MS = 15_000;
+const DEFAULT_CODEX_PROGRESS_INTERVAL_MS = 1_000;
+const DEFAULT_CODEX_WAIT_INTERVAL_MS = 10_000;
+const MAX_CODEX_PROGRESS_CODEPOINTS = 200;
 const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
@@ -938,6 +940,10 @@ function runCodexPassthrough({
     "MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS",
     DEFAULT_CODEX_PROGRESS_INTERVAL_MS,
   );
+  const waitIntervalMs = testTunableMs(
+    "MCP_AGENTS_CODEX_WAIT_INTERVAL_MS",
+    DEFAULT_CODEX_WAIT_INTERVAL_MS,
+  );
   // Server-wide default goal (string or undefined); per-call `goal` overrides it.
   const resolvedGoal = goal;
   let isolatedCodexHome;
@@ -1040,7 +1046,7 @@ function runCodexPassthrough({
   let flushGeneratedFrames = () => {};
 
   // ── In-flight request tracking ──────────────────────────────────────────
-  // Every request owns its own idle, hard, terminal, and cancellation timers.
+  // Every request owns its own lifecycle and progress timers.
   // JSON-RPC numeric `1` and string `"1"` remain distinct keys.
   const inFlight = new Map();
   const serverRequestParents = new Map();
@@ -1051,12 +1057,39 @@ function runCodexPassthrough({
     entry[name] = undefined;
   };
   const clearEntryTimers = (entry) => {
-    for (const name of ["idleTimer", "hardTimer", "terminalTimer", "cancelTimer"]) {
+    for (const name of [
+      "idleTimer",
+      "hardTimer",
+      "terminalTimer",
+      "cancelTimer",
+      "progressFlushTimer",
+      "waitTimer",
+    ]) {
       clearTimer(entry, name);
     }
   };
+  const dropQueuedProgress = (requestKey) => {
+    for (let index = generatedFrames.length - 1; index >= 0; index -= 1) {
+      const frame = generatedFrames[index];
+      if (frame.kind === "progress" && frame.requestKey === requestKey) {
+        generatedFrames.splice(index, 1);
+      }
+    }
+  };
+  const stopEntryProgress = (entry) => {
+    if (!entry) return;
+    clearTimer(entry, "progressFlushTimer");
+    clearTimer(entry, "waitTimer");
+    entry.pendingProgressMessage = undefined;
+    entry.commentaryItemIds?.clear();
+    entry.commentaryBuffers?.clear();
+    dropQueuedProgress(idKey(entry.id));
+  };
   const clearAllEntryTimers = () => {
     for (const entry of inFlight.values()) clearEntryTimers(entry);
+  };
+  const stopAllEntryProgress = () => {
+    for (const entry of inFlight.values()) stopEntryProgress(entry);
   };
   const settleInFlight = (id) => {
     if (id == null) return undefined;
@@ -1064,6 +1097,13 @@ function runCodexPassthrough({
     const entry = inFlight.get(key);
     if (!entry) return undefined;
     clearEntryTimers(entry);
+    stopEntryProgress(entry);
+    if (process.env.MCP_AGENTS_TEST_TIMER_AUDIT === "1") {
+      const liveTimerCount = Object.entries(entry).filter(
+        ([name, timer]) => name.endsWith("Timer") && timer != null,
+      ).length;
+      logErr(`[mcp-agents:test] settled timer count=${liveTimerCount}`);
+    }
     inFlight.delete(key);
     pendingToolsListIds.delete(key);
     for (const [serverRequestKey, parentKey] of serverRequestParents) {
@@ -1138,12 +1178,22 @@ function runCodexPassthrough({
       state: "open",
       lastAgentMessage: undefined,
       progressSequence: 0,
-      lastProgressAt: undefined,
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      lastProgressQueuedAt: undefined,
+      lastProgressDeliveredAt: undefined,
+      lastWaitAttemptAt: undefined,
+      lastProgressMessage: undefined,
+      pendingProgressMessage: undefined,
+      hasUsefulProgress: false,
+      commentaryItemIds: new Set(),
+      commentaryBuffers: new Map(),
       fallbackReady: false,
     };
     inFlight.set(key, entry);
     armEntryIdle(entry);
     armEntryHard(entry);
+    armProgressWait(entry);
     return true;
   };
   const hasEmittableInFlight = () => {
@@ -1156,30 +1206,59 @@ function runCodexPassthrough({
   const canInjectGeneratedFrame = () =>
     !stdoutPaused && canArmResponseSuppression();
   const queueGeneratedFrame = (frame, { requestKey, kind } = {}) => {
-    generatedFrames.push({
+    const queued = {
       buffer: Buffer.from(`${JSON.stringify(frame)}\n`, "utf8"),
       requestKey,
       kind,
-    });
+    };
+    if (kind === "progress") {
+      // Backpressure or a partial native frame can delay injection. Retain only
+      // the latest progress update for this request so silence cannot grow an
+      // unbounded side queue.
+      dropQueuedProgress(requestKey);
+    }
+    generatedFrames.push(queued);
     queueMicrotask(() => flushGeneratedFrames());
   };
   const generatedFrameIsLive = (frame) => {
     if (frame.kind !== "progress") return true;
     const entry = inFlight.get(frame.requestKey);
-    return entry != null && entry.state !== "canceled";
+    return !finalizing && entry != null && entry.state === "open";
   };
-  const emitProgress = (entry, eventType) => {
-    if (entry.progressToken == null || entry.state === "canceled") return;
-    const now = Date.now();
+  const normalizeProgressText = (value) => {
+    if (typeof value !== "string") return "";
+    return value
+      .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim();
+  };
+  const formatProgressMessage = (value) => {
+    const normalized = normalizeProgressText(value);
+    if (!normalized) return undefined;
+    return Array.from(`Codex: ${normalized}`)
+      .slice(0, MAX_CODEX_PROGRESS_CODEPOINTS)
+      .join("");
+  };
+  const markProgressDelivered = (frame) => {
+    if (frame.kind !== "progress") return;
+    const entry = inFlight.get(frame.requestKey);
+    if (!entry || entry.state !== "open") return;
+    entry.lastProgressDeliveredAt = Date.now();
+    entry.lastWaitAttemptAt = undefined;
+    clearTimer(entry, "waitTimer");
+    armProgressWait(entry);
+  };
+  const emitProgressMessage = (entry, message) => {
     if (
-      entry.lastProgressAt != null &&
-      now - entry.lastProgressAt < progressIntervalMs
+      finalizing || entry.progressToken == null || entry.state !== "open" ||
+      inFlight.get(idKey(entry.id)) !== entry
     ) return;
-    entry.lastProgressAt = now;
+    const formatted = formatProgressMessage(message);
+    if (!formatted || formatted === entry.lastProgressMessage) return;
+    const now = Date.now();
+    entry.lastProgressQueuedAt = now;
+    entry.lastProgressMessage = formatted;
     entry.progressSequence += 1;
-    const label = typeof eventType === "string"
-      ? eventType.replaceAll("_", " ")
-      : "working";
     queueGeneratedFrame(
       {
         jsonrpc: "2.0",
@@ -1187,11 +1266,193 @@ function runCodexPassthrough({
         params: {
           progressToken: entry.progressToken,
           progress: entry.progressSequence,
-          message: `Codex: ${label}`,
+          message: formatted,
         },
       },
       { requestKey: idKey(entry.id), kind: "progress" },
     );
+  };
+  const flushPendingProgress = (entry) => {
+    clearTimer(entry, "progressFlushTimer");
+    if (finalizing || entry.state !== "open") return;
+    const message = entry.pendingProgressMessage;
+    entry.pendingProgressMessage = undefined;
+    emitProgressMessage(entry, message);
+  };
+  const scheduleProgress = (entry, message, { useful = true } = {}) => {
+    if (finalizing || entry.progressToken == null || entry.state !== "open") return;
+    const formatted = formatProgressMessage(message);
+    if (!formatted) return;
+    if (
+      formatted === entry.lastProgressMessage ||
+      formatted === entry.pendingProgressMessage
+    ) return;
+
+    const firstUseful = useful && !entry.hasUsefulProgress;
+    if (useful) entry.hasUsefulProgress = true;
+    const elapsed = entry.lastProgressQueuedAt == null
+      ? Number.POSITIVE_INFINITY
+      : Date.now() - entry.lastProgressQueuedAt;
+    if (firstUseful || elapsed >= progressIntervalMs) {
+      clearTimer(entry, "progressFlushTimer");
+      entry.pendingProgressMessage = undefined;
+      emitProgressMessage(entry, formatted.slice("Codex: ".length));
+      return;
+    }
+
+    entry.pendingProgressMessage = formatted.slice("Codex: ".length);
+    if (entry.progressFlushTimer) return;
+    entry.progressFlushTimer = setTimeout(
+      () => flushPendingProgress(entry),
+      Math.max(1, progressIntervalMs - elapsed),
+    );
+  };
+  const armProgressWait = (entry) => {
+    clearTimer(entry, "waitTimer");
+    if (
+      finalizing || entry.progressToken == null || entry.state !== "open" ||
+      !(waitIntervalMs > 0)
+    ) return;
+    const visibleAt = Math.max(
+      entry.lastProgressDeliveredAt ?? entry.startedAt,
+      entry.lastWaitAttemptAt ?? entry.startedAt,
+    );
+    const delay = Math.max(1, waitIntervalMs - (Date.now() - visibleAt));
+    entry.waitTimer = setTimeout(() => {
+      entry.waitTimer = undefined;
+      if (
+        finalizing || entry.state !== "open" ||
+        inFlight.get(idKey(entry.id)) !== entry
+      ) return;
+      // A generated frame can only be injected at a native frame boundary. Try
+      // again on every silence tick; queueGeneratedFrame keeps only the latest
+      // status if Codex is currently stalled mid-frame.
+      flushGeneratedFrames();
+      const lastActivityAt = entry.lastActivityAt ?? entry.startedAt;
+      const seconds = Math.max(0, Math.floor((Date.now() - lastActivityAt) / 1_000));
+      entry.lastWaitAttemptAt = Date.now();
+      scheduleProgress(
+        entry,
+        `still running; last activity ${seconds}s ago`,
+        { useful: false },
+      );
+      armProgressWait(entry);
+    }, delay);
+  };
+  const progressMessageForEvent = (entry, event) => {
+    if (!event || typeof event !== "object") return undefined;
+    const type = event.type;
+
+    if (type === "item_started") {
+      const item = event.item;
+      if (
+        item?.type === "AgentMessage" && item.phase === "commentary" &&
+        typeof item.id === "string"
+      ) {
+        entry.commentaryItemIds.add(item.id);
+        entry.commentaryBuffers.set(item.id, "");
+      }
+      return undefined;
+    }
+    if (type === "agent_message_content_delta") {
+      const itemId = event.item_id;
+      if (
+        typeof itemId !== "string" || !entry.commentaryItemIds.has(itemId) ||
+        typeof event.delta !== "string"
+      ) return undefined;
+      const prior = entry.commentaryBuffers.get(itemId) ?? "";
+      const combined = Array.from(`${prior}${event.delta}`).slice(-400).join("");
+      entry.commentaryBuffers.set(itemId, combined);
+      return combined;
+    }
+    if (type === "item_completed") {
+      const item = event.item;
+      if (
+        item?.type !== "AgentMessage" || item.phase !== "commentary" ||
+        typeof item.id !== "string"
+      ) return undefined;
+      entry.commentaryItemIds.delete(item.id);
+      const buffered = entry.commentaryBuffers.get(item.id);
+      entry.commentaryBuffers.delete(item.id);
+      const completed = Array.isArray(item.content)
+        ? item.content
+          .filter((content) => content?.type === "Text" && typeof content.text === "string")
+          .map((content) => content.text)
+          .join("")
+        : undefined;
+      return completed || (typeof item.message === "string" ? item.message : buffered);
+    }
+    if (type === "agent_message") {
+      return event.phase === "commentary" && typeof event.message === "string"
+        ? event.message
+        : undefined;
+    }
+    if (type === "plan_update" && Array.isArray(event.plan)) {
+      const active = event.plan.find((step) =>
+        step?.status === "in_progress" && typeof step.step === "string"
+      );
+      return active ? `working on: ${active.step}` : undefined;
+    }
+
+    switch (type) {
+      case "task_started":
+        return "started";
+      case "exec_command_begin":
+        return "running a command";
+      case "exec_command_end":
+        return Number.isInteger(event.exit_code)
+          ? `command finished (exit ${event.exit_code})`
+          : "command finished";
+      case "patch_apply_begin": {
+        const count = event.changes && typeof event.changes === "object"
+          ? Object.keys(event.changes).length
+          : undefined;
+        return count == null ? "applying changes" : `applying changes to ${count} file(s)`;
+      }
+      case "patch_apply_end":
+        return event.success === false ? "change application failed" : "changes applied";
+      case "mcp_tool_call_begin":
+      case "mcp_tool_call_end": {
+        const invocation = event.invocation;
+        const server = normalizeProgressText(invocation?.server);
+        const tool = normalizeProgressText(invocation?.tool);
+        const identifier = [server, tool].filter(Boolean).join("/");
+        const action = type.endsWith("_begin") ? "calling" : "finished calling";
+        return identifier ? `${action} ${identifier}` : `${action} an MCP tool`;
+      }
+      case "web_search_begin":
+        return "searching the web";
+      case "web_search_end":
+        return "web search finished";
+      case "view_image_tool_call":
+        return "inspecting an image";
+      case "image_generation_begin":
+        return "generating an image";
+      case "image_generation_end":
+        return "image generation finished";
+      case "collab_agent_spawn_begin":
+        return "starting a subagent";
+      case "collab_agent_spawn_end":
+        return "subagent started";
+      case "collab_agent_interaction_begin":
+        return "coordinating with a subagent";
+      case "collab_agent_interaction_end":
+        return "subagent coordination finished";
+      case "collab_waiting_begin":
+        return "waiting for a subagent";
+      case "collab_waiting_end":
+        return "subagent wait finished";
+      case "collab_resume_begin":
+        return "resuming a subagent";
+      case "collab_resume_end":
+        return "resuming after subagent work";
+      case "collab_close_begin":
+        return "closing a subagent";
+      case "collab_close_end":
+        return "subagent closed";
+      default:
+        return undefined;
+    }
   };
   const terminalResultFrame = (entry) => {
     const text = entry.lastAgentMessage ?? "";
@@ -1242,6 +1503,7 @@ function runCodexPassthrough({
   const beginTerminalGrace = (entry, message) => {
     if (entry.state !== "open") return;
     entry.state = "terminal_grace";
+    stopEntryProgress(entry);
     entry.lastAgentMessage = typeof message === "string" ? message : "";
     clearTimer(entry, "idleTimer");
     entry.terminalTimer = setTimeout(
@@ -1253,6 +1515,7 @@ function runCodexPassthrough({
     const entry = id == null ? undefined : inFlight.get(idKey(id));
     if (!entry || entry.state === "canceled") return;
     entry.state = "canceled";
+    stopEntryProgress(entry);
     clearTimer(entry, "idleTimer");
     clearTimer(entry, "hardTimer");
     clearTimer(entry, "terminalTimer");
@@ -1316,14 +1579,17 @@ function runCodexPassthrough({
     if (msg?.method !== "codex/event") return;
     const requestId = msg.params?._meta?.requestId;
     const entry = requestId == null ? undefined : inFlight.get(idKey(requestId));
-    if (!entry || entry.state === "canceled") return;
+    if (!entry || entry.state !== "open") return;
     const threadId = msg.params?._meta?.threadId;
     if (typeof threadId === "string" && threadId) entry.threadId = threadId;
-    const eventType = msg.params?.msg?.type;
-    if (entry.state === "open") armEntryIdle(entry);
-    emitProgress(entry, eventType);
+    const event = msg.params?.msg;
+    const eventType = event?.type;
+    entry.lastActivityAt = Date.now();
+    armEntryIdle(entry);
+    const progressMessage = progressMessageForEvent(entry, event);
+    if (progressMessage) scheduleProgress(entry, progressMessage);
     if (eventType === "task_complete" || eventType === "turn_complete") {
-      beginTerminalGrace(entry, msg.params?.msg?.last_agent_message);
+      beginTerminalGrace(entry, event?.last_agent_message);
     }
   };
 
@@ -1456,6 +1722,7 @@ function runCodexPassthrough({
     if (finalizing) return;
     finalizing = true;
     clearAllEntryTimers();
+    stopAllEntryProgress();
     logErr(`[mcp-agents] codex passthrough finalize: ${reason}`);
 
     // Stop forwarding further codex stdout so a late real response cannot race
@@ -1635,6 +1902,7 @@ function runCodexPassthrough({
       const frame = generatedFrames.shift();
       if (!generatedFrameIsLive(frame)) continue;
       forwardChunk(frame.buffer);
+      markProgressDelivered(frame);
     }
   };
 

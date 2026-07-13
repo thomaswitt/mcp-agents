@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-07-13
+
+### Changed
+
+- Replace generic Codex event-name progress with fail-closed live status:
+  explicitly attributed commentary, active plan steps, and redacted lifecycle
+  summaries are emitted immediately and then coalesced to at most once per
+  second
+- Emit 10-second silence notices for progress-aware clients without refreshing
+  the wrapper's own idle or hard deadlines. Pending progress stays bounded to
+  the latest frame per request and waits for a safe native frame boundary
+- Clear queued progress, silence/coalescing timers, and commentary buffers on
+  every request settlement, terminal-grace, cancellation, timeout, and teardown
+  path
+
 ## [0.14.0] - 2026-07-12
 
 ### Added
