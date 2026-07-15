@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -50,39 +50,23 @@ const MAX_CODEX_PROGRESS_CODEPOINTS = 200;
 const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
-// tools/call argument keys stripped from the codex pass-through so callers
-// cannot override the pinned model or choose an arbitrary effort. sandbox/cwd/
-// approval-policy are intentionally left intact so callers can steer them per
-// call.
-//   - top-level: the dedicated `model` arg is always stripped. The wrapper-only
-//     `model_reasoning_effort` arg is handled separately: an initial `codex`
-//     call may select exactly xhigh or max; every other value/use is stripped.
-//   - inside the `config` override map: model/effort plus every other
-//     model-envelope vector — a `profile`/`profiles` can carry its own
-//     model/effort, provider/base-url keys re-point the same model name to a
-//     different backend, and the plan/review variants carry their own
-//     model/effort; all are stripped so the pin cannot be bypassed. Matched on
-//     each config key's HEAD segment so dotted overrides (codex accepts paths
-//     like `profiles.x.model`) are caught too, not just exact keys.
-const CODEX_STRIPPED_TOP_LEVEL_ARGS = ["model"];
-const CODEX_STRIPPED_CONFIG_KEYS = [
-  "model",
-  "model_reasoning_effort",
-  "profile",
-  "profiles",
-  "model_provider",
-  "model_providers",
-  "openai_base_url",
-  "chatgpt_base_url",
-  "model_catalog_json",
-  "plan_mode_reasoning_effort",
-  "review_model",
-];
 const CODEX_PER_SESSION_REASONING_EFFORT_ARG = "model_reasoning_effort";
 const CODEX_PER_SESSION_REASONING_EFFORTS = ["xhigh", "max"];
 const CODEX_PER_SESSION_REASONING_EFFORT_SET = new Set(
   CODEX_PER_SESSION_REASONING_EFFORTS,
 );
+const CODEX_SANDBOXES = ["read-only", "workspace-write", "danger-full-access"];
+const CODEX_SANDBOX_SET = new Set(CODEX_SANDBOXES);
+const CODEX_TOOL_CONTRACTS = {
+  codex: {
+    allowed: ["prompt", "cwd", "sandbox", CODEX_PER_SESSION_REASONING_EFFORT_ARG, "goal"],
+    required: ["prompt", "cwd", "sandbox", CODEX_PER_SESSION_REASONING_EFFORT_ARG],
+  },
+  "codex-reply": {
+    allowed: ["prompt", "threadId", "goal"],
+    required: ["prompt", "threadId"],
+  },
+};
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
@@ -620,19 +604,16 @@ function persistIsolatedCodexAuth(isolatedCodexHome) {
  * standing objective: it is higher-altitude than the user prompt and persists
  * across the thread. It is NOT codex's `/goal` subsystem — that is a TUI-only
  * slash command (parsed in codex-rs/tui, e.g. chatwidget/slash_dispatch.rs) and
- * is not reachable through the MCP `codex`/`codex-reply` tool surface. Any
- * caller-supplied developer instructions are preserved after the objective.
+ * is not reachable through the MCP `codex`/`codex-reply` tool surface.
  * @param {string} goal
- * @param {string} [existing] caller-supplied developer-instructions, if any
  * @returns {string}
  */
-function buildGoalDeveloperInstructions(goal, existing) {
-  const directive =
+function buildGoalDeveloperInstructions(goal) {
+  return (
     "Persistent objective for this Codex thread (a standing goal — keep " +
     "pursuing it across turns unless explicitly superseded):\n" +
-    goal.trim();
-  const prior = typeof existing === "string" ? existing.trim() : "";
-  return prior ? `${directive}\n\n---\n\n${prior}` : directive;
+    goal.trim()
+  );
 }
 
 /**
@@ -652,27 +633,19 @@ function applyGoalPreamble(prompt, goal) {
 }
 
 /**
- * Filter a single newline-delimited JSON-RPC message on its way to the codex
- * pass-through. Three transforms, all confined to `tools/call`:
- *   1. Strip arbitrary model/effort overrides — the top-level `model` arg and
- *      model-envelope keys inside a `config` override map — so the client cannot
- *      escape the pinned model or select an unapproved effort. sandbox/cwd/
- *      approval-policy (top-level and inside `config`) remain caller-steerable.
- *   2. Per-session effort selection — the wrapper-only top-level
- *      `model_reasoning_effort` arg is always stripped. On an initial `codex`
- *      call, exact `xhigh`/`max` values are reintroduced as the native
- *      `config.model_reasoning_effort`; replies and invalid values never reach
- *      codex. Invalid values are visibly logged and safely inherit the server
- *      default rather than silently enabling another effort.
- *   3. Goal injection — codex's native `/goal` is a TUI-only slash command, not
+ * Transform one already-validated newline-delimited `tools/call` frame before
+ * forwarding it to native Codex:
+ *   1. Translate the wrapper-only initial-session `model_reasoning_effort` into
+ *      native `config.model_reasoning_effort`.
+ *   2. Inject the wrapper-only goal — codex's native `/goal` is a TUI-only slash
+ *      command, not
  *      reachable via MCP, so a wrapper-only `goal` arg is always stripped and the
  *      objective is injected the MCP-correct way: into `developer-instructions`
  *      (a developer-role message) for the initial `codex` call, or as a concise
  *      prompt reminder for a `codex-reply` turn (which has no
  *      `developer-instructions` field). A per-call `goal` overrides the
- *      server-wide `--goal` default (`opts.serverGoal`); only a string per-call
- *      goal overrides (a blank one suppresses the default for that call), while a
- *      non-string `goal` is dropped without disturbing the default.
+ *      server-wide `--goal` default (`opts.serverGoal`); a blank per-call goal
+ *      suppresses the default for that call.
  * Non-`tools/call`, unparseable, and nothing-to-change lines are returned
  * byte-for-byte unchanged so the MCP framing is preserved; any actual mutation
  * re-serializes the message (the intended, framing-safe path for a changed
@@ -681,7 +654,7 @@ function applyGoalPreamble(prompt, goal) {
  * @param {{ serverGoal?: string }} [opts]
  * @returns {string}
  */
-function filterCodexToolCall(line, opts = {}) {
+function transformCodexToolCall(line, opts = {}) {
   const trimmed = line.trim();
   if (!trimmed) return line;
 
@@ -698,95 +671,22 @@ function filterCodexToolCall(line, opts = {}) {
       : null;
   if (!args || typeof args !== "object") return line;
 
-  const removed = [];
   const toolName = msg.params?.name;
-  let requestedSessionEffort;
+  if (!CODEX_TOOL_CONTRACTS[toolName]) return line;
+  let changed = false;
   let effortLog;
 
-  for (const key of CODEX_STRIPPED_TOP_LEVEL_ARGS) {
-    if (key in args) {
-      delete args[key];
-      removed.push(key);
-    }
-  }
-
-  // This is a wrapper-only argument: never forward it directly because native
-  // codex schemas may broaden independently. Only an initial session may select
-  // one of the wrapper's exact allowlisted values. Replies inherit the effort
-  // recorded by their thread and cannot change it.
-  if (CODEX_PER_SESSION_REASONING_EFFORT_ARG in args) {
-    const perSessionEffort = args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
+  if (toolName === "codex") {
+    const requestedSessionEffort = args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
     delete args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
-    if (toolName !== "codex") {
-      effortLog =
-        "ignored per-session reasoning effort outside an initial codex call; " +
-        "replies inherit their existing session effort";
-    } else if (
-      typeof perSessionEffort === "string" &&
-      CODEX_PER_SESSION_REASONING_EFFORT_SET.has(perSessionEffort)
-    ) {
-      requestedSessionEffort = perSessionEffort;
-    } else {
-      // Deliberately continue with the server default instead of forwarding an
-      // unapproved value or synthesizing a response inside the raw byte pump.
-      effortLog =
-        "ignored invalid per-session reasoning effort; allowed values are " +
-        `${CODEX_PER_SESSION_REASONING_EFFORTS.join(", ")}; using server default`;
-    }
-  }
-
-  // Per-call `config` overrides beat CODEX_HOME/config.toml, so the pinned
-  // model/effort must be stripped from here too; everything else (sandbox_mode,
-  // approval_policy, cwd, sandbox_workspace_write, …) is left untouched. codex
-  // config overrides also accept dotted paths (e.g. "profiles.x.model"), so
-  // match each key on its HEAD segment, not the exact key.
-  const cfg = args.config;
-  if (cfg && typeof cfg === "object" && !Array.isArray(cfg)) {
-    for (const key of Object.keys(cfg)) {
-      if (CODEX_STRIPPED_CONFIG_KEYS.includes(key.split(".")[0])) {
-        delete cfg[key];
-        removed.push(`config.${key}`);
-      }
-    }
-    // Drop a now-empty override map so codex never receives a bare `config: {}`.
-    if (Object.keys(cfg).length === 0) delete args.config;
-  }
-
-  // Reintroduce a validated selection only AFTER stripping every raw config
-  // effort/profile/provider vector, so an attacker cannot overwrite or combine
-  // it with `ultra` (or another model envelope) in the same call.
-  if (requestedSessionEffort) {
-    let targetConfig = args.config;
-    // JSON null means no caller config override; treat it like omission so it
-    // cannot silently suppress an otherwise valid wrapper selection.
-    if (!("config" in args) || targetConfig === null) {
-      targetConfig = {};
-      args.config = targetConfig;
-    }
-    if (
-      targetConfig &&
-      typeof targetConfig === "object" &&
-      !Array.isArray(targetConfig)
-    ) {
-      targetConfig.model_reasoning_effort = requestedSessionEffort;
-      effortLog = `applied per-session reasoning effort ${requestedSessionEffort}`;
-    } else {
-      // Preserve native validation of a malformed `config` rather than replacing
-      // caller data. The wrapper value is already stripped, so the safe fallback
-      // remains the configured server default if codex accepts the call at all.
-      effortLog =
-        "ignored per-session reasoning effort because config is malformed; " +
-        "using server default";
-    }
+    args.config = { model_reasoning_effort: requestedSessionEffort };
+    effortLog = `applied per-session reasoning effort ${requestedSessionEffort}`;
+    changed = true;
   }
 
   // ── Goal injection ────────────────────────────────────────────────────────
-  // A per-call `goal` (any value) is always stripped — codex's schema has no
-  // `goal`, so it must never be forwarded. Only a STRING per-call goal counts as
-  // an override: a string (including "") replaces the server default for this
-  // call, so "" suppresses it. A non-string `goal` is malformed and is dropped
-  // without disturbing the configured server default. A blank effective goal
-  // injects nothing.
+  // A validated per-call `goal` (including "") replaces the server default for
+  // this call. The wrapper field is never forwarded to native Codex.
   let goalLog;
   let goalSource = "server";
   let effectiveGoal = opts.serverGoal;
@@ -794,38 +694,27 @@ function filterCodexToolCall(line, opts = {}) {
     const perCallGoal = args.goal;
     delete args.goal;
     goalLog = "stripped per-call goal arg";
-    if (typeof perCallGoal === "string") {
-      effectiveGoal = perCallGoal;
-      goalSource = "per-call";
-    }
+    effectiveGoal = perCallGoal;
+    goalSource = "per-call";
+    changed = true;
   }
-  if (effectiveGoal && effectiveGoal.trim()) {
+  if (typeof effectiveGoal === "string" && effectiveGoal.trim()) {
     if (toolName === "codex") {
       // Initial `codex` call: the native developer-instructions field is the
       // correct, thread-persistent vehicle for a standing objective.
-      args["developer-instructions"] = buildGoalDeveloperInstructions(
-        effectiveGoal,
-        args["developer-instructions"],
-      );
+      args["developer-instructions"] = buildGoalDeveloperInstructions(effectiveGoal);
       goalLog = `injected ${goalSource} goal into developer-instructions`;
+      changed = true;
     } else if (toolName === "codex-reply" && typeof args.prompt === "string") {
       // codex-reply has no developer-instructions field, so restate the
-      // objective as a concise prompt reminder. Any other (unknown/future) tool
-      // is left untouched — only the wrapper-only `goal` arg stripped above is
-      // removed, never the prompt — so the byte-for-byte invariant holds for
-      // tools this wrapper does not explicitly support.
+      // objective as a concise prompt reminder.
       args.prompt = applyGoalPreamble(args.prompt, effectiveGoal);
       goalLog = `injected ${goalSource} goal into codex-reply prompt`;
+      changed = true;
     }
   }
 
-  if (removed.length === 0 && !effortLog && !goalLog) return line; // nothing changed — keep framing
-
-  if (removed.length > 0) {
-    logErr(
-      `[mcp-agents] codex passthrough: pinning model/effort, stripped: ${removed.join(", ")}`,
-    );
-  }
+  if (!changed) return line;
   if (effortLog) {
     logErr(`[mcp-agents] codex passthrough: ${effortLog}`);
   }
@@ -835,68 +724,188 @@ function filterCodexToolCall(line, opts = {}) {
   return JSON.stringify(msg);
 }
 
-// Tools whose advertised inputSchema gains a wrapper-only `goal` property so a
-// client's model knows it can pass one (the model only emits args declared in
-// the schema). The arg is stripped inbound by filterCodexToolCall before it
-// reaches codex; advertising it here is purely for discoverability.
-const CODEX_GOAL_TOOLS = new Set(["codex", "codex-reply"]);
 const CODEX_GOAL_PROPERTY_DESCRIPTION =
-  "Optional standing objective for this Codex session. mcp-agents injects it as " +
-  "`developer-instructions` (codex) or a prompt reminder (codex-reply); it is not a " +
-  "native Codex parameter. Overrides the server-wide --goal default for this call; " +
-  "pass an empty string to suppress that default.";
+  "Optional standing objective. mcp-agents injects it as developer instructions " +
+  "for a new session or a prompt reminder for a reply. An empty string suppresses " +
+  "the server-wide goal for this call.";
 const CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION =
-  "Reasoning effort for this new Codex session. Choose `xhigh` for hard, bounded " +
-  "tasks where latency matters, or `max` for extra-hard, quality-first tasks " +
-  "where deeper exploration and verification justify a longer runtime. Applies " +
-  "only to the initial `codex` call; " +
-  "`codex-reply` inherits the session effort and cannot change it. Omit to use " +
-  "the server-configured default.";
+  "Reasoning effort for this new session: xhigh for hard, bounded work or max " +
+  "for quality-first work requiring deeper exploration. Replies inherit it.";
+
+function codexToolPresentation(toolName) {
+  if (toolName === "codex") {
+    return {
+      description:
+        "Start a Codex session with an explicit workspace, sandbox, reasoning effort, " +
+        "and optional standing goal.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "Initial user prompt for the Codex session.",
+          },
+          cwd: {
+            type: "string",
+            description: "Absolute working directory for the session.",
+          },
+          sandbox: {
+            type: "string",
+            enum: [...CODEX_SANDBOXES],
+            description: "Sandbox mode for the session; it cannot change on replies.",
+          },
+          [CODEX_PER_SESSION_REASONING_EFFORT_ARG]: {
+            type: "string",
+            enum: [...CODEX_PER_SESSION_REASONING_EFFORTS],
+            description: CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION,
+          },
+          goal: {
+            type: "string",
+            description: CODEX_GOAL_PROPERTY_DESCRIPTION,
+          },
+        },
+        required: [...CODEX_TOOL_CONTRACTS.codex.required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-reply") {
+    return {
+      description:
+        "Continue a Codex session by thread ID. Sandbox and reasoning effort are inherited.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "Next user prompt for the Codex session.",
+          },
+          threadId: {
+            type: "string",
+            description: "Thread ID returned by the initial codex call.",
+          },
+          goal: {
+            type: "string",
+            description: CODEX_GOAL_PROPERTY_DESCRIPTION,
+          },
+        },
+        required: [...CODEX_TOOL_CONTRACTS["codex-reply"].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  return undefined;
+}
+
+function validateCodexToolCallMessage(msg) {
+  if (!msg || typeof msg !== "object" || msg.method !== "tools/call") return undefined;
+  const toolName = msg.params?.name;
+  const contract = CODEX_TOOL_CONTRACTS[toolName];
+  if (!contract) return undefined;
+  const args = msg.params?.arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return {
+      toolName,
+      allowedArguments: [...contract.allowed],
+      requiredArguments: [...contract.required],
+      issues: [{ argument: "arguments", problem: "must be an object" }],
+    };
+  }
+
+  const issues = [];
+  for (const argument of contract.required) {
+    if (!Object.hasOwn(args, argument)) {
+      issues.push({ argument, problem: "is required" });
+    }
+  }
+  const allowed = new Set(contract.allowed);
+  for (const argument of Object.keys(args).sort()) {
+    if (!allowed.has(argument)) {
+      issues.push({ argument, problem: "is not supported" });
+    }
+  }
+  if (Object.hasOwn(args, "prompt") && typeof args.prompt !== "string") {
+    issues.push({ argument: "prompt", problem: "must be a string" });
+  }
+  if (Object.hasOwn(args, "cwd")) {
+    if (typeof args.cwd !== "string") {
+      issues.push({ argument: "cwd", problem: "must be a string" });
+    } else if (!isAbsolute(args.cwd)) {
+      issues.push({ argument: "cwd", problem: "must be an absolute path" });
+    }
+  }
+  if (
+    Object.hasOwn(args, "sandbox") &&
+    (typeof args.sandbox !== "string" || !CODEX_SANDBOX_SET.has(args.sandbox))
+  ) {
+    issues.push({
+      argument: "sandbox",
+      problem: `must be one of: ${CODEX_SANDBOXES.join(", ")}`,
+    });
+  }
+  if (Object.hasOwn(args, CODEX_PER_SESSION_REASONING_EFFORT_ARG)) {
+    const effort = args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
+    if (typeof effort !== "string" || !CODEX_PER_SESSION_REASONING_EFFORT_SET.has(effort)) {
+      issues.push({
+        argument: CODEX_PER_SESSION_REASONING_EFFORT_ARG,
+        problem: `must be one of: ${CODEX_PER_SESSION_REASONING_EFFORTS.join(", ")}`,
+      });
+    }
+  }
+  if (Object.hasOwn(args, "goal") && typeof args.goal !== "string") {
+    issues.push({ argument: "goal", problem: "must be a string" });
+  }
+  if (Object.hasOwn(args, "threadId")) {
+    if (typeof args.threadId !== "string") {
+      issues.push({ argument: "threadId", problem: "must be a string" });
+    } else if (!args.threadId.trim()) {
+      issues.push({ argument: "threadId", problem: "must not be blank" });
+    }
+  }
+
+  return issues.length > 0
+    ? {
+      toolName,
+      allowedArguments: [...contract.allowed],
+      requiredArguments: [...contract.required],
+      issues,
+    }
+    : undefined;
+}
+
+function codexInvalidParamsFrame(id, validation) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: -32602,
+      message: `mcp-agents: invalid arguments for ${validation.toolName}`,
+      data: validation,
+    },
+  };
+}
 
 /**
- * Mutate a parsed `tools/list` RESPONSE in place, advertising wrapper-only
- * properties on the Codex tools. `goal` is added idempotently to `codex` and
- * `codex-reply`. `model_reasoning_effort` is forced to the exact xhigh/max enum
- * on `codex` and removed from `codex-reply`, preventing an upstream schema drift
- * from advertising `ultra` or implying that replies can change the session.
- * Only `properties` is touched — `required` and `additionalProperties` remain
- * intact. Best-effort per tool: a missing/malformed inputSchema.properties is
- * skipped while other valid targets are still augmented. Returns false (→ raw
- * byte-for-byte forwarding) for an error response, non-array `result.tools`, or
- * when no target needed a mutation.
+ * Mutate a parsed `tools/list` response in place, replacing native Codex's broad
+ * config-shaped inputs with the exact strict mcp-agents contract. Other tool
+ * fields and non-Codex tools remain untouched.
  * @param {any} msg
  * @returns {boolean}
  */
-function injectCodexPropertiesIntoToolsListMessage(msg) {
+function rewriteCodexToolsListMessage(msg) {
   const tools = msg?.result?.tools;
   if (!Array.isArray(tools)) return false;
   let changed = false;
   for (const tool of tools) {
-    if (!tool || typeof tool !== "object" || !CODEX_GOAL_TOOLS.has(tool.name)) continue;
-    const schema = tool.inputSchema;
-    if (!schema || typeof schema !== "object" || Array.isArray(schema)) continue;
-    const props = schema.properties;
-    if (!props || typeof props !== "object" || Array.isArray(props)) continue;
-    if (!("goal" in props)) {
-      props.goal = { type: "string", description: CODEX_GOAL_PROPERTY_DESCRIPTION };
+    if (!tool || typeof tool !== "object") continue;
+    const presentation = codexToolPresentation(tool.name);
+    if (!presentation) continue;
+    if (tool.description !== presentation.description) {
+      tool.description = presentation.description;
       changed = true;
     }
-
-    if (tool.name === "codex") {
-      const effortProperty = {
-        type: "string",
-        enum: [...CODEX_PER_SESSION_REASONING_EFFORTS],
-        description: CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION,
-      };
-      if (
-        JSON.stringify(props[CODEX_PER_SESSION_REASONING_EFFORT_ARG]) !==
-        JSON.stringify(effortProperty)
-      ) {
-        props[CODEX_PER_SESSION_REASONING_EFFORT_ARG] = effortProperty;
-        changed = true;
-      }
-    } else if (CODEX_PER_SESSION_REASONING_EFFORT_ARG in props) {
-      delete props[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
+    if (JSON.stringify(tool.inputSchema) !== JSON.stringify(presentation.inputSchema)) {
+      tool.inputSchema = presentation.inputSchema;
       changed = true;
     }
   }
@@ -906,7 +915,8 @@ function injectCodexPropertiesIntoToolsListMessage(msg) {
 /**
  * Spawn codex mcp-server as a pass-through. codex stdout is forwarded back to
  * the client byte-for-byte, but the client's stdin is intercepted line-by-line
- * so per-call model/config overrides are stripped before reaching codex. An
+ * so the curated call contract can be validated and transformed before reaching
+ * codex. Invalid calls are answered locally with JSON-RPC invalid-params errors.
  * Per-request idle and hard deadlines convert unbounded Codex stalls into
  * surfaced JSON-RPC errors. Correlated events also provide client-visible MCP
  * progress and enough terminal metadata to recover a missing final response.
@@ -1028,10 +1038,10 @@ function runCodexPassthrough({
   let droppedFrameResponseId; // partial oversized frame's classified id (cleared at its newline)
   let observationDropLogged = false; // log the first observation-cap drop only
 
-  // ── tools/list wrapper-property rewrite (contained latch) ────────────────
+  // ── tools/list curated-schema rewrite (contained latch) ─────────────────
   // While a `tools/list` request id is outstanding the forwarder switches from
-  // raw passthrough to buffer-and-rewrite, injecting the wrapper properties into
-  // the advertised Codex schemas of that one response, then returns to raw.
+  // raw passthrough to buffer-and-rewrite, replacing the advertised Codex inputs
+  // with the strict wrapper contract, then returns to raw.
   // Observation above stays the SOLE authority for inFlight/the watchdog; this
   // path only changes HOW bytes reach the wire.
   const pendingToolsListIds = new Set(); // idKey(id) of outstanding tools/list requests (the latch)
@@ -1043,6 +1053,7 @@ function runCodexPassthrough({
   let rewriteDropReleaseId;
   let oversizedToolsListLogged = false; // log the first rewrite-cap drop only
   const generatedFrames = [];
+  const locallyHandledResponseIds = new Set();
   let flushGeneratedFrames = () => {};
 
   // ── In-flight request tracking ──────────────────────────────────────────
@@ -1051,6 +1062,12 @@ function runCodexPassthrough({
   const inFlight = new Map();
   const serverRequestParents = new Map();
   const idKey = (id) => `${typeof id}:${id}`;
+  const rememberLocallyHandledResponse = (requestKey) => {
+    locallyHandledResponseIds.add(requestKey);
+    if (locallyHandledResponseIds.size > MAX_SUPPRESSED_CODEX_RESPONSES) {
+      locallyHandledResponseIds.delete(locallyHandledResponseIds.values().next().value);
+    }
+  };
   const clearTimer = (entry, name) => {
     if (!entry?.[name]) return;
     clearTimeout(entry[name]);
@@ -1068,14 +1085,18 @@ function runCodexPassthrough({
       clearTimer(entry, name);
     }
   };
-  const dropQueuedProgress = (requestKey) => {
+  const dropQueuedFrames = (requestKey, kind) => {
     for (let index = generatedFrames.length - 1; index >= 0; index -= 1) {
       const frame = generatedFrames[index];
-      if (frame.kind === "progress" && frame.requestKey === requestKey) {
+      if (frame.kind === kind && frame.requestKey === requestKey) {
         generatedFrames.splice(index, 1);
       }
     }
   };
+  const dropQueuedProgress = (requestKey) =>
+    dropQueuedFrames(requestKey, "progress");
+  const dropQueuedLocalResponse = (requestKey) =>
+    dropQueuedFrames(requestKey, "local_response");
   const stopEntryProgress = (entry) => {
     if (!entry) return;
     clearTimer(entry, "progressFlushTimer");
@@ -1144,6 +1165,9 @@ function runCodexPassthrough({
   const addInFlight = (msg) => {
     if (msg.id == null) return true;
     const key = idKey(msg.id);
+    // Once an id is legitimately reused, a later cancellation belongs to the
+    // new request rather than the earlier locally answered one.
+    locallyHandledResponseIds.delete(key);
     if (inFlight.has(key) || suppressedResponseIds.has(key)) {
       const entry = inFlight.get(key) ?? {
         id: msg.id,
@@ -1221,9 +1245,14 @@ function runCodexPassthrough({
     queueMicrotask(() => flushGeneratedFrames());
   };
   const generatedFrameIsLive = (frame) => {
-    if (frame.kind !== "progress") return true;
     const entry = inFlight.get(frame.requestKey);
-    return !finalizing && entry != null && entry.state === "open";
+    if (frame.kind === "progress") {
+      return !finalizing && entry != null && entry.state === "open";
+    }
+    if (frame.kind === "local_response") {
+      return entry != null && entry.state === "local_response";
+    }
+    return true;
   };
   const normalizeProgressText = (value) => {
     if (typeof value !== "string") return "";
@@ -1239,7 +1268,15 @@ function runCodexPassthrough({
       .slice(0, MAX_CODEX_PROGRESS_CODEPOINTS)
       .join("");
   };
-  const markProgressDelivered = (frame) => {
+  const markGeneratedFrameDelivered = (frame) => {
+    if (frame.kind === "local_response") {
+      const entry = inFlight.get(frame.requestKey);
+      if (entry?.state === "local_response") {
+        rememberLocallyHandledResponse(frame.requestKey);
+        settleInFlight(entry.id);
+      }
+      return;
+    }
     if (frame.kind !== "progress") return;
     const entry = inFlight.get(frame.requestKey);
     if (!entry || entry.state !== "open") return;
@@ -1513,7 +1550,13 @@ function runCodexPassthrough({
   };
   const cancelInFlight = (id) => {
     const entry = id == null ? undefined : inFlight.get(idKey(id));
-    if (!entry || entry.state === "canceled") return;
+    if (!entry || entry.state === "canceled") return false;
+    if (entry.state === "local_response") {
+      rememberLocallyHandledResponse(idKey(id));
+      dropQueuedLocalResponse(idKey(id));
+      settleInFlight(id);
+      return true;
+    }
     entry.state = "canceled";
     stopEntryProgress(entry);
     clearTimer(entry, "idleTimer");
@@ -1530,6 +1573,7 @@ function runCodexPassthrough({
         exitCode: 1,
       });
     }, cancelGraceMs);
+    return false;
   };
 
   const killGroup = (signal) => {
@@ -1782,7 +1826,7 @@ function runCodexPassthrough({
             m && typeof m === "object" && "id" in m &&
             ("result" in m || "error" in m) &&
             pendingToolsListIds.has(idKey(m.id)) &&
-            injectCodexPropertiesIntoToolsListMessage(m)
+            rewriteCodexToolsListMessage(m)
           ) {
             outStr = JSON.stringify(m);
           }
@@ -1810,7 +1854,10 @@ function runCodexPassthrough({
       while (generatedFrames.length > 0 && lastForwardedByteWasNewline) {
         const frame = generatedFrames.shift();
         if (!generatedFrameIsLive(frame)) continue;
-        try { process.stdout.write(frame.buffer); } catch {}
+        try {
+          process.stdout.write(frame.buffer);
+          markGeneratedFrameDelivered(frame);
+        } catch {}
       }
 
       for (const entry of [...inFlight.values()]) {
@@ -1827,7 +1874,7 @@ function runCodexPassthrough({
       }
 
       for (const entry of inFlight.values()) {
-        if (entry.state === "canceled") continue;
+        if (entry.state === "canceled" || entry.state === "local_response") continue;
         const frame = {
           jsonrpc: "2.0",
           id: entry.id,
@@ -1847,6 +1894,7 @@ function runCodexPassthrough({
     // Hygiene: drop the rewrite latch/skip state (forwarding has stopped).
     pendingToolsListIds.clear();
     suppressedResponseIds.clear();
+    locallyHandledResponseIds.clear();
     serverRequestParents.clear();
     rewriteSkipUntilNewline = false;
     rewriteSkipReleaseId = undefined;
@@ -1873,7 +1921,7 @@ function runCodexPassthrough({
     if (!oversizedToolsListLogged) {
       logErr(
         "[mcp-agents] codex passthrough: tools/list-window frame exceeded rewrite cap; " +
-          "forwarding raw (wrapper properties not advertised on this response)",
+          "forwarding raw (curated wrapper schema not advertised on this response)",
       );
       oversizedToolsListLogged = true;
     }
@@ -1902,7 +1950,7 @@ function runCodexPassthrough({
       const frame = generatedFrames.shift();
       if (!generatedFrameIsLive(frame)) continue;
       forwardChunk(frame.buffer);
-      markProgressDelivered(frame);
+      markGeneratedFrameDelivered(frame);
     }
   };
 
@@ -1996,7 +2044,7 @@ function runCodexPassthrough({
             outBuf = null;
           } else if (pendingToolsListIds.has(key)) {
             pendingToolsListIds.delete(key);
-            if (injectCodexPropertiesIntoToolsListMessage(msg)) {
+            if (rewriteCodexToolsListMessage(msg)) {
               outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
             }
           }
@@ -2037,7 +2085,7 @@ function runCodexPassthrough({
   // Forward codex stdout to the client. Steady state is a byte-for-byte raw
   // passthrough (forwardChunk); while a tools/list response is pending the
   // forwarder buffers and rewrites that one frame (bufferModeForward) to advertise
-  // wrapper properties. Observation runs on the ORIGINAL bytes and stays the sole
+  // the curated wrapper schemas. Observation runs on the ORIGINAL bytes and stays the sole
   // authority for clearing in-flight ids — by the time it runs, every complete
   // frame in this chunk was already forwarded/queued, so it never leads forwarding.
   child.stdout.on("data", (chunk) => {
@@ -2085,9 +2133,9 @@ function runCodexPassthrough({
   // read chunks, which would otherwise break the byte-for-byte passthrough.
   child.stdin.on("error", () => {}); // ignore EPIPE if codex exits early
 
-  // Read-only inbound tracking: record client requests (id + method) as
-  // in-flight and honor cancellations. Never mutates what is forwarded —
-  // filterCodexToolCall remains the sole authority on the forwarded bytes.
+  // Track client requests, enforce the strict Codex argument contract, and honor
+  // cancellations. Accepted tools/call frames are transformed only after this
+  // validation succeeds.
   const noteInbound = (line) => {
     const trimmed = line.trim();
     if (!trimmed) return true;
@@ -2096,7 +2144,8 @@ function runCodexPassthrough({
     if (!msg || typeof msg !== "object") return true;
     if (msg.method === "notifications/cancelled") {
       const rid = msg.params?.requestId;
-      cancelInFlight(rid);
+      if (rid != null && locallyHandledResponseIds.has(idKey(rid))) return false;
+      const canceledLocalResponse = cancelInFlight(rid);
       // A canceled/never-answered tools/list must not wedge buffer mode open. If
       // this cancel cleared the last pending tools/list id while a NON-tools/list
       // partial is withheld in rewriteBuf, flush it raw — otherwise a codex exit
@@ -2105,7 +2154,7 @@ function runCodexPassthrough({
         pendingToolsListIds.delete(idKey(rid));
         returnToRawIfLatchClear();
       }
-      return true;
+      return !canceledLocalResponse;
     }
     if (msg.id != null && typeof msg.method !== "string") {
       const parentKey = serverRequestParents.get(idKey(msg.id));
@@ -2114,13 +2163,38 @@ function runCodexPassthrough({
       if (entry?.state === "open") armEntryIdle(entry);
       return true;
     }
+    const validation = validateCodexToolCallMessage(msg);
+    if (validation && msg.id == null) {
+      const fields = validation.issues.map((issue) => issue.argument).join(", ");
+      logErr(
+        `[mcp-agents] dropped invalid ${validation.toolName} notification; fields: ${fields}`,
+      );
+      return false;
+    }
+
     // A client message awaits a response iff it carries BOTH an id and a method.
     // A bare id with no method is a *response* to a codex elicitation — skip it
     // for in-flight tracking.
     if (msg.id != null && typeof msg.method === "string") {
       if (!addInFlight(msg)) return false;
+      if (validation) {
+        const requestKey = idKey(msg.id);
+        const entry = inFlight.get(requestKey);
+        entry.state = "local_response";
+        stopEntryProgress(entry);
+        queueGeneratedFrame(
+          codexInvalidParamsFrame(msg.id, validation),
+          { requestKey, kind: "local_response" },
+        );
+        const fields = validation.issues.map((issue) => issue.argument).join(", ");
+        logErr(
+          `[mcp-agents] rejected invalid ${validation.toolName} call; fields: ${fields}`,
+        );
+        flushGeneratedFrames();
+        return false;
+      }
       if (msg.method === "tools/list") {
-        // Arm the wrapper-property rewrite latch for this tools/list response. If
+        // Arm the curated-schema rewrite latch for this tools/list response. If
         // buffer mode would START mid-frame (a pre-latch frame's head was already
         // raw-forwarded and its newline hasn't arrived), first align by raw-skipping
         // the orphan tail to its next newline — so the tail is forwarded
@@ -2148,7 +2222,7 @@ function runCodexPassthrough({
       const line = stdinBuf.subarray(0, nl).toString("utf8");
       stdinBuf = stdinBuf.subarray(nl + 1);
       if (noteInbound(line) && !finalizing) {
-        child.stdin.write(`${filterCodexToolCall(line, { serverGoal: resolvedGoal })}\n`);
+        child.stdin.write(`${transformCodexToolCall(line, { serverGoal: resolvedGoal })}\n`);
       }
     }
   });
@@ -2157,7 +2231,7 @@ function runCodexPassthrough({
     if (stdinBuf.length > 0) {
       const line = stdinBuf.toString("utf8");
       if (noteInbound(line) && !finalizing) {
-        child.stdin.write(filterCodexToolCall(line, { serverGoal: resolvedGoal }));
+        child.stdin.write(transformCodexToolCall(line, { serverGoal: resolvedGoal }));
       }
     }
     child.stdin.end();

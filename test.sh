@@ -330,7 +330,7 @@ test_codex_isolated_runtime() {
     sleep 0.3
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     sleep 0.3
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"Reply with ONLY OK","sandbox":"read-only","model_reasoning_effort":"max"}}}'
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"codex\",\"arguments\":{\"prompt\":\"Reply with ONLY OK\",\"cwd\":\"$(pwd)\",\"sandbox\":\"read-only\",\"model_reasoning_effort\":\"max\"}}}"
     sleep 8
   } | $TIMEOUT_CMD 45 $SERVER --provider codex >"$output_file" 2>/dev/null
   status=$?
@@ -633,7 +633,7 @@ run_codex_watchdog_case() {
     sleep 0.3
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     sleep 0.3
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"hi"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"hi","cwd":"/tmp","sandbox":"read-only","model_reasoning_effort":"xhigh"}}}'
     sleep 4
   } | PATH="$tmpdir:$PATH" MCP_STUB_MODE="$mode" MCP_AGENTS_TEST_PID_FILE="$pid_file" \
     $TIMEOUT_CMD 12 $SERVER --provider codex $extra >"$output_file" 2>/dev/null
@@ -678,55 +678,9 @@ run_codex_watchdog_case() {
   rm -rf "$tmpdir"
 }
 
-# ── Helper: codex passthrough strips model/effort (and the profile/provider ──
-# bypass vectors) while leaving sandbox/cwd/approval intact for per-call control.
-test_codex_strips_only_model_effort() {
-  local label="$1"
-  local tmpdir capture output_file status call_line ok bad good
-  echo "--- $label ---"
-
-  tmpdir=$(mktemp -d)
-  capture="$tmpdir/codex_stdin.txt"
-  output_file="$tmpdir/output.txt"
-  : >"$capture"
-  write_codex_capture_stub "$tmpdir"
-
-  # Every key that MUST be stripped carries an "evil" marker (in its value, or
-  # in the dotted key name), and every key that MUST survive does not — so a
-  # single "no evil leaked through" assertion covers the whole denylist incl.
-  # dotted-path overrides (profiles.*, model_providers.*).
-  set +e
-  {
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"hi","model":"evil-model","sandbox":"read-only","cwd":"/tmp/wsroot","approval-policy":"never","config":{"model":"evil-model","model_reasoning_effort":"evil-effort","profile":"evil-profile","profiles":{"p":{"model":"evil-x"}},"profiles.evil.model":"evil-y","model_provider":"evil-prov","model_providers":{"m":{"base_url":"http://evil"}},"model_providers.x.base_url":"http://evil2","openai_base_url":"http://evil3","chatgpt_base_url":"http://evil4","model_catalog_json":"evil-json","plan_mode_reasoning_effort":"evil-plan","review_model":"evil-review","sandbox_mode":"danger-full-access","approval_policy":"never","cwd":"/tmp/wsroot"}}}}'
-    sleep 0.5
-  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_CAPTURE="$capture" \
-    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
-  status=$?
-  set -e
-
-  call_line=$(grep '"method":"tools/call"' "$capture" 2>/dev/null | tail -1)
-  ok=1
-  # No stripped key (model/effort/profile/provider/base-url/plan/review, incl.
-  # dotted variants) may survive — none of the kept keys contains "evil".
-  printf '%s' "$call_line" | grep -q 'evil' && ok=0
-  for good in '"sandbox":"read-only"' '"sandbox_mode":"danger-full-access"' '"approval-policy":"never"' '"approval_policy":"never"' '"cwd":"/tmp/wsroot"'; do
-    printf '%s' "$call_line" | grep -q "$good" || ok=0
-  done
-
-  if [ "$status" -eq 0 ] && [ -n "$call_line" ] && [ "$ok" -eq 1 ]; then
-    green "PASS: $label"
-    PASS=$((PASS + 1))
-  else
-    red "FAIL: $label (status=$status)"
-    echo "  Forwarded: $call_line"
-    FAIL=$((FAIL + 1))
-  fi
-  rm -rf "$tmpdir"
-}
-
-# ── Helper: a tools/call with nothing to strip is forwarded byte-for-byte ──
+# ── Helper: an accepted codex-reply with no goal is forwarded byte-for-byte ──
 # (no JSON re-serialization), preserving MCP stdio framing exactly.
-test_codex_passes_through_unmodified() {
+test_codex_reply_passes_through_unmodified() {
   local label="$1"
   local tmpdir capture output_file status input captured
   echo "--- $label ---"
@@ -739,7 +693,7 @@ test_codex_passes_through_unmodified() {
 
   # Multibyte UTF-8 in the prompt: proves the raw-byte buffering forwards
   # non-ASCII content intact (the motivation for the Buffer rewrite).
-  input='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"höhö 日本語 🚀 — ünïcödé","sandbox":"workspace-write","cwd":"/tmp/x"}}}'
+  input='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex-reply","arguments":{"prompt":"höhö 日本語 🚀 — ünïcödé","threadId":"thread-123"}}}'
 
   set +e
   {
@@ -790,7 +744,7 @@ test_codex_call_transform() {
   status=$?
   set -e
 
-  call_line=$(grep '"method":"tools/call"' "$capture" 2>/dev/null | tail -1)
+  call_line=$(grep '"method":"tools/call"' "$capture" 2>/dev/null | tail -1 || true)
   if [ "$status" -eq 0 ] && [ -n "$call_line" ] && \
      echo "$call_line" | jq -e "$predicate" >/dev/null 2>&1; then
     green "PASS: $label"
@@ -798,6 +752,202 @@ test_codex_call_transform() {
   else
     red "FAIL: $label (status=$status)"
     echo "  Forwarded: $call_line"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: assert a strict-contract violation returns one redacted -32602 and ──
+# never reaches native Codex.
+#   $1 label, $2 arguments JSON, $3 jq predicate over the error frame,
+#   $4 tool name (optional, default "codex")
+test_codex_rejects_call() {
+  local label="$1" arguments_json="$2" predicate="$3"
+  local tool_name="${4:-codex}"
+  local tmpdir capture output_file status response call_line ok
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  capture="$tmpdir/codex_stdin.txt"
+  output_file="$tmpdir/output.txt"
+  : >"$capture"
+  write_codex_capture_stub "$tmpdir"
+
+  set +e
+  {
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool_name\",\"arguments\":$arguments_json}}"
+    sleep 0.5
+  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_CAPTURE="$capture" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  response=$(cat "$output_file")
+  call_line=$(grep '"method":"tools/call"' "$capture" 2>/dev/null | tail -1 || true)
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  [ -z "$call_line" ] || ok=0
+  echo "$response" | jq -e "select(.id == 2) | (.error.code == -32602) and ($predicate)" >/dev/null 2>&1 || ok=0
+  if [[ "$arguments_json" == *"STRICT_SECRET"* ]] && [[ "$response" == *"STRICT_SECRET"* ]]; then
+    ok=0
+  fi
+
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Forwarded: $call_line"
+    echo "  Response: $response"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: strict local errors share the generated-frame queue safely. ──
+# Exercises partial native stdout, concurrent valid work, cancellation before a
+# queued local response can flush, and invalid notifications (which get dropped).
+test_codex_local_response_lifecycle() {
+  local label="$1" tmpdir status out
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+
+  cat >"$tmpdir/codex" <<'EOF'
+#!/usr/bin/env node
+const fs = require("fs");
+const mode = process.env.MCP_STUB_LOCAL_MODE;
+const capture = process.env.MCP_STUB_LOCAL_CAPTURE;
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+
+const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  input += chunk;
+  let newline;
+  while ((newline = input.indexOf("\n")) !== -1) {
+    const line = input.slice(0, newline);
+    input = input.slice(newline + 1);
+    let message;
+    try { message = JSON.parse(line); } catch { continue; }
+    fs.appendFileSync(capture, `${JSON.stringify(message)}\n`);
+    if (message.method === "initialize") {
+      send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "local-stub", version: "0" } } });
+      if (mode === "partial" || mode === "cancel") {
+        setTimeout(() => process.stdout.write('{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"LOCAL_PART'), 25);
+        setTimeout(() => process.stdout.write('IAL"}}\n'), 250);
+      }
+    } else if (message.method === "tools/call") {
+      setTimeout(() => send({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "VALID" }] } }), 40);
+    }
+  }
+});
+process.stdin.on("end", () => setTimeout(() => process.exit(0), 350));
+setInterval(() => {}, 1 << 30);
+EOF
+  chmod +x "$tmpdir/codex"
+
+  cat >"$tmpdir/driver.mjs" <<'EOF'
+import { spawn } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+
+const [stubDir, serverDir] = process.argv.slice(2);
+const invalid = (id) => ({
+  jsonrpc: "2.0",
+  ...(id === undefined ? {} : { id }),
+  method: "tools/call",
+  params: { name: "codex", arguments: { prompt: "invalid" } },
+});
+const valid = {
+  jsonrpc: "2.0",
+  id: 3,
+  method: "tools/call",
+  params: { name: "codex", arguments: { prompt: "valid", cwd: serverDir, sandbox: "read-only", model_reasoning_effort: "xhigh" } },
+};
+
+const run = (mode) => new Promise((resolve) => {
+  const capture = `${stubDir}/${mode}.jsonl`;
+  writeFileSync(capture, "");
+  const child = spawn("node", ["server.js", "--provider", "codex"], {
+    cwd: serverDir,
+    env: { ...process.env, PATH: `${stubDir}:${process.env.PATH}`, MCP_STUB_LOCAL_MODE: mode, MCP_STUB_LOCAL_CAPTURE: capture },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let output = "";
+  let parseBuffer = "";
+  let started = false;
+  child.stdin.on("error", () => {});
+  child.stderr.resume();
+  const send = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
+  child.stdout.on("data", (chunk) => {
+    output += chunk.toString();
+    parseBuffer += chunk.toString();
+    let newline;
+    while ((newline = parseBuffer.indexOf("\n")) !== -1) {
+      const line = parseBuffer.slice(0, newline);
+      parseBuffer = parseBuffer.slice(newline + 1);
+      let frame;
+      try { frame = JSON.parse(line); } catch { continue; }
+      if (frame.id !== 1 || !frame.result || started) continue;
+      started = true;
+      if (mode === "partial" || mode === "cancel") {
+        setTimeout(() => send(invalid(2)), 75);
+        if (mode === "cancel") {
+          setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2 } }), 125);
+        }
+      } else if (mode === "concurrent") {
+        send(invalid(2));
+        send(valid);
+      } else if (mode === "delivered") {
+        send(invalid(2));
+        setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2 } }), 75);
+      } else {
+        send(invalid(undefined));
+        send(valid);
+      }
+      setTimeout(() => child.stdin.end(), 450);
+    }
+  });
+  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "local-test", version: "0" } } });
+  child.once("close", (code) => {
+    const lines = output.split("\n").filter(Boolean);
+    let parseErrors = 0;
+    const frames = lines.flatMap((line) => {
+      try { return [JSON.parse(line)]; } catch { parseErrors += 1; return []; }
+    });
+    const captured = readFileSync(capture, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    resolve({ mode, code, parseErrors, frames, captured });
+  });
+});
+
+const results = [];
+for (const mode of ["partial", "concurrent", "cancel", "delivered", "notification"]) results.push(await run(mode));
+const byMode = Object.fromEntries(results.map((result) => [result.mode, result]));
+const frames = (mode, predicate) => byMode[mode].frames.filter(predicate);
+const capturedCalls = (mode) => byMode[mode].captured.filter((message) => message.method === "tools/call");
+const capturedCancels = (mode) => byMode[mode].captured.filter((message) => message.method === "notifications/cancelled");
+const partialMarker = byMode.partial.frames.findIndex((frame) => frame.params?.marker === "LOCAL_PARTIAL");
+const partialError = byMode.partial.frames.findIndex((frame) => frame.id === 2 && frame.error?.code === -32602);
+const ok = results.every((result) => result.code === 0 && result.parseErrors === 0) &&
+  partialMarker >= 0 && partialError > partialMarker && frames("partial", (frame) => frame.id === 2).length === 1 && capturedCalls("partial").length === 0 &&
+  frames("concurrent", (frame) => frame.id === 2 && frame.error?.code === -32602).length === 1 && frames("concurrent", (frame) => frame.id === 3 && frame.result).length === 1 && capturedCalls("concurrent").map((message) => message.id).join(",") === "3" &&
+  frames("cancel", (frame) => frame.id === 2).length === 0 && capturedCalls("cancel").length === 0 && capturedCancels("cancel").length === 0 &&
+  frames("delivered", (frame) => frame.id === 2 && frame.error?.code === -32602).length === 1 && capturedCalls("delivered").length === 0 && capturedCancels("delivered").length === 0 &&
+  frames("notification", (frame) => frame.error?.code === -32602).length === 0 && frames("notification", (frame) => frame.id === 3 && frame.result).length === 1 && capturedCalls("notification").map((message) => message.id).join(",") === "3";
+process.stdout.write(`${ok ? "LOCAL_OK" : "LOCAL_FAIL"}\n${JSON.stringify(results)}\n`);
+process.exit(ok ? 0 : 1);
+EOF
+
+  set +e
+  out=$($TIMEOUT_CMD 20 node "$tmpdir/driver.mjs" "$tmpdir" "$(pwd)" 2>/dev/null)
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ] && printf '%s' "$out" | grep -Fq "LOCAL_OK"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Output: $out"
     FAIL=$((FAIL + 1))
   fi
   rm -rf "$tmpdir"
@@ -820,7 +970,7 @@ test_codex_percall_write() {
     sleep 0.3
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     sleep 0.3
-    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"codex\",\"arguments\":{\"prompt\":\"Create a file named mcp_agents_probe.txt containing exactly OK in your current working directory, then reply with only OK.\",\"sandbox\":\"workspace-write\",\"cwd\":\"$probe_dir\"}}}"
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"codex\",\"arguments\":{\"prompt\":\"Create a file named mcp_agents_probe.txt containing exactly OK in your current working directory, then reply with only OK.\",\"sandbox\":\"workspace-write\",\"cwd\":\"$probe_dir\",\"model_reasoning_effort\":\"xhigh\"}}}"
     sleep 30
   } | $TIMEOUT_CMD 50 $SERVER --provider codex >"$output_file" 2>/dev/null
   status=$?
@@ -864,9 +1014,45 @@ const STRADDLE = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"ST
 const STRADDLE_HEAD = STRADDLE.slice(0, 40);   // emitted on initialize, NO newline (orphan head)
 const STRADDLE_TAIL = STRADDLE.slice(40);      // emitted on tools/list, completes the frame
 function tools(withGoal, withEffort) {
-  const codex = { name: "codex", inputSchema: { type: "object", additionalProperties: false, required: ["prompt"], properties: { prompt: { type: "string" }, "developer-instructions": { type: "string" }, "base-instructions": { type: "string" } } } };
+  const codex = {
+    name: "codex",
+    title: "Native Codex title",
+    description: "Run a Codex session. Accepts configuration parameters matching the Codex Config struct.",
+    annotations: { readOnlyHint: false },
+    outputSchema: { type: "object", properties: { threadId: { type: "string" } } },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["prompt"],
+      properties: {
+        "approval-policy": { type: "string" },
+        "base-instructions": { type: "string" },
+        "compact-prompt": { type: "string" },
+        config: { type: "object" },
+        cwd: { type: "string" },
+        "developer-instructions": { type: "string" },
+        model: { type: "string" },
+        prompt: { type: "string" },
+        sandbox: { type: "string" },
+        future_upstream_setting: { type: "string" },
+      },
+    },
+  };
   if (withGoal) codex.inputSchema.properties.goal = { type: "string", description: "STUB_OWN_GOAL_DESC" };
-  const reply = { name: "codex-reply", inputSchema: { type: "object", required: ["prompt"], properties: { conversationId: { type: "string" }, threadId: { type: "string" }, prompt: { type: "string" } } } };
+  const reply = {
+    name: "codex-reply",
+    description: "Continue a Codex session.",
+    inputSchema: {
+      type: "object",
+      required: ["prompt"],
+      properties: {
+        conversationId: { type: "string" },
+        threadId: { type: "string" },
+        prompt: { type: "string" },
+        future_reply_setting: { type: "boolean" },
+      },
+    },
+  };
   if (withEffort) {
     const drifted = { type: "string", enum: ["low", "xhigh", "max", "ultra"], description: "STUB_DRIFTED_EFFORT_DESC" };
     codex.inputSchema.properties.model_reasoning_effort = { ...drifted };
@@ -1315,7 +1501,12 @@ const call = (id, token, prompt = `call ${id}`) => send({
   method: "tools/call",
   params: {
     name: "codex",
-    arguments: { prompt },
+    arguments: {
+      prompt,
+      cwd: serverDir,
+      sandbox: "read-only",
+      model_reasoning_effort: "xhigh",
+    },
     ...(token === undefined ? {} : { _meta: { progressToken: token } }),
   },
 });
@@ -1451,140 +1642,104 @@ test_no_registered_child_leaks() {
 
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 
-# Stub-based codex filtering tests (fast — no real codex needed)
+# Stub-based strict Codex contract tests (fast — no real Codex needed).
 test_codex_bridge_config_defaults "codex bridge writes lean isolated config"
 test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclusive temp"
-test_codex_strips_only_model_effort "codex strips model/effort, keeps sandbox/cwd/approval"
-test_codex_passes_through_unmodified "codex forwards no-strip tools/call byte-for-byte"
+test_codex_reply_passes_through_unmodified "codex-reply forwards an accepted no-goal call byte-for-byte"
 
-# Stub-based per-session effort tests (fast — no real Codex needed). The
-# wrapper-only top-level arg is accepted only on a new `codex` call, translated
-# into Codex's config map, and never forwarded in its wrapper form.
+# Accepted initial calls translate effort into native config and may inject goal.
 test_codex_call_transform "codex translates per-session xhigh effort" \
   "" \
-  '{"prompt":"hi","model_reasoning_effort":"xhigh"}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config == {"model_reasoning_effort":"xhigh"}))'
-test_codex_call_transform "codex translates per-session max effort and keeps config" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only","model_reasoning_effort":"xhigh"}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.cwd == "/tmp/work") and (.sandbox == "read-only") and (.config == {"model_reasoning_effort":"xhigh"}))'
+test_codex_call_transform "codex translates per-session max effort" \
   "" \
-  '{"prompt":"hi","model_reasoning_effort":"max","config":{"sandbox_mode":"workspace-write","cwd":"/tmp/work"}}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config.model_reasoning_effort == "max") and (.config.sandbox_mode == "workspace-write") and (.config.cwd == "/tmp/work"))'
-test_codex_call_transform "codex applies per-session effort when config is null" \
-  "" \
-  '{"prompt":"hi","model_reasoning_effort":"max","config":null}' \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"max"}' \
   '.params.arguments | ((has("model_reasoning_effort")|not) and (.config == {"model_reasoning_effort":"max"}))'
-# Sanitize every raw model-envelope bypass before applying the validated
-# wrapper value. A conflicting nested xhigh, dotted effort, profile, provider,
-# and alternate model must not beat the requested max.
-test_codex_call_transform "codex validated effort wins over raw config bypasses" \
-  "" \
-  '{"prompt":"hi","model":"evil-model","model_reasoning_effort":"max","config":{"model":"evil-model","model_reasoning_effort":"xhigh","model_reasoning_effort.level":"ultra","profile":"evil-profile","profiles":{"evil":{"model_reasoning_effort":"ultra"}},"model_provider":"evil-provider","model_providers":{"evil":{"base_url":"http://evil"}},"plan_mode_reasoning_effort":"ultra","review_model":"evil-review","sandbox_mode":"workspace-write"}}' \
-  '.params.arguments | ((has("model")|not) and (has("model_reasoning_effort")|not) and (.config == {"sandbox_mode":"workspace-write","model_reasoning_effort":"max"}))'
-
-# Unsupported and malformed wrapper values are stripped. The call still
-# forwards and inherits the server default; no invalid or raw nested effort is
-# allowed to reach Codex.
-test_codex_call_transform "codex strips unsupported ultra effort" \
-  "" \
-  '{"prompt":"hi","model_reasoning_effort":"ultra","config":{"model_reasoning_effort":"max","sandbox_mode":"read-only"}}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config == {"sandbox_mode":"read-only"}))'
-test_codex_call_transform "codex strips unsupported named effort" \
-  "" \
-  '{"prompt":"hi","model_reasoning_effort":"medium"}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("config")|not))'
-test_codex_call_transform "codex strips non-string effort" \
-  "" \
-  '{"prompt":"hi","model_reasoning_effort":false,"config":{"profiles":{"evil":{"model_reasoning_effort":"max"}}}}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("config")|not))'
-test_codex_call_transform "codex-reply cannot change session effort" \
-  "" \
-  '{"conversationId":"abc","prompt":"continue","model_reasoning_effort":"max","config":{"model_reasoning_effort":"xhigh"}}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("config")|not) and (.conversationId == "abc") and (.prompt == "continue"))' \
-  "codex-reply"
-
-# Goal and effort are independent wrapper features: both transformations must
-# compose on an initial call while preserving caller config/instructions.
 test_codex_call_transform "codex composes per-session max effort with goal" \
   "" \
-  '{"prompt":"hi","model_reasoning_effort":"max","goal":"SHIPSAFE","developer-instructions":"EXISTINGDEV","config":{"sandbox_mode":"workspace-write"}}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("goal")|not) and (.config.model_reasoning_effort == "max") and (.config.sandbox_mode == "workspace-write") and (.["developer-instructions"]|test("SHIPSAFE")) and (.["developer-instructions"]|test("EXISTINGDEV")) and ((.["developer-instructions"]|index("SHIPSAFE")) < (.["developer-instructions"]|index("EXISTINGDEV"))))'
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"max","goal":"SHIPSAFE"}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("goal")|not) and (.config == {"model_reasoning_effort":"max"}) and (.["developer-instructions"]|test("SHIPSAFE")))'
 
-# Stub-based codex goal injection tests (fast — no real codex needed).
-# For the initial `codex` tool the goal goes into developer-instructions (the
-# MCP-correct, thread-persistent vehicle) and the prompt is left untouched; for
-# `codex-reply` (no developer-instructions field) it is a concise prompt reminder.
 test_codex_call_transform "codex injects per-call goal into developer-instructions" \
   "" \
-  '{"prompt":"hi","goal":"SHIPSAFE"}' \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"xhigh","goal":"SHIPSAFE"}' \
   '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (.["developer-instructions"]|test("SHIPSAFE")))'
 test_codex_call_transform "codex injects server --goal into developer-instructions" \
   "--goal SERVERGOAL" \
-  '{"prompt":"hi"}' \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"xhigh"}' \
   '.params.arguments | ((.prompt == "hi") and (.["developer-instructions"]|test("SERVERGOAL")))'
 test_codex_call_transform "codex per-call goal overrides server --goal" \
   "--goal SERVERGOAL" \
-  '{"prompt":"hi","goal":"CALLGOAL"}' \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"xhigh","goal":"CALLGOAL"}' \
   '.params.arguments | ((has("goal")|not) and (.["developer-instructions"]|test("CALLGOAL")) and (.["developer-instructions"]|test("SERVERGOAL")|not))'
 test_codex_call_transform "codex blank per-call goal suppresses server --goal" \
   "--goal SERVERGOAL" \
-  '{"prompt":"hi","goal":""}' \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"xhigh","goal":""}' \
   '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (has("developer-instructions")|not))'
-# A malformed (non-string) per-call goal is dropped without disturbing the
-# configured server default (must NOT suppress it like an empty string does).
-test_codex_call_transform "codex non-string per-call goal keeps server --goal" \
-  "--goal SERVERGOAL" \
-  '{"prompt":"hi","goal":false}' \
-  '.params.arguments | ((has("goal")|not) and (.["developer-instructions"]|test("SERVERGOAL")))'
-# The objective is merged AHEAD of any caller-supplied developer-instructions
-# (order asserted via index), which are preserved.
-test_codex_call_transform "codex merges goal ahead of existing developer-instructions" \
-  "" \
-  '{"prompt":"hi","goal":"GOALX","developer-instructions":"EXISTINGDEV"}' \
-  '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (.["developer-instructions"]|startswith("Persistent objective")) and (.["developer-instructions"]|test("EXISTINGDEV")) and ((.["developer-instructions"]|index("GOALX")) < (.["developer-instructions"]|index("EXISTINGDEV"))))'
-# codex-reply has no developer-instructions field, so the goal is a concise
-# prompt reminder PREFIXED to the prompt (order asserted); conversationId kept.
 test_codex_call_transform "codex-reply injects per-call goal as prompt reminder" \
   "" \
-  '{"conversationId":"abc","prompt":"continue","goal":"STAYFOCUSED"}' \
-  '.params.arguments | ((has("goal")|not) and (.conversationId == "abc") and (has("developer-instructions")|not) and (.prompt|startswith("Reminder")) and (.prompt|test("continue")) and ((.prompt|index("STAYFOCUSED")) < (.prompt|index("continue"))))' \
+  '{"threadId":"abc","prompt":"continue","goal":"STAYFOCUSED"}' \
+  '.params.arguments | ((has("goal")|not) and (.threadId == "abc") and (has("developer-instructions")|not) and (.prompt|startswith("Reminder")) and (.prompt|test("continue")) and ((.prompt|index("STAYFOCUSED")) < (.prompt|index("continue"))))' \
   "codex-reply"
-# Multi-word goal text survives intact.
 test_codex_call_transform "codex injects multi-word per-call goal" \
   "" \
-  '{"prompt":"hi","goal":"keep the public API unchanged"}' \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"xhigh","goal":"keep the public API unchanged"}' \
   '.params.arguments | (.["developer-instructions"]|test("keep the public API unchanged"))'
-# An unknown/future tool name is NOT goal-injected: the wrapper-only `goal` arg
-# is still stripped (never leaked) but neither the prompt nor developer-
-# instructions is mutated, preserving byte-for-byte behavior for unsupported tools.
-test_codex_call_transform "codex unknown tool name is not goal-injected" \
-  "--goal SERVERGOAL" \
-  '{"prompt":"hi","goal":"X"}' \
-  '.params.arguments | ((has("goal")|not) and (.prompt == "hi") and (has("developer-instructions")|not))' \
-  "some-other-tool"
+
+# Forbidden, missing, malformed, and deprecated arguments fail before Codex runs.
+test_codex_rejects_call "codex rejects hidden native configuration" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only","model_reasoning_effort":"xhigh","model":"STRICT_SECRET_MODEL","config":{"secret":"STRICT_SECRET_CONFIG"},"approval-policy":"never","developer-instructions":"STRICT_SECRET_DEV","base-instructions":"STRICT_SECRET_BASE","compact-prompt":"STRICT_SECRET_COMPACT"}' \
+  '(.error.data.issues | map(.argument) | sort) == ["approval-policy","base-instructions","compact-prompt","config","developer-instructions","model"]'
+test_codex_rejects_call "codex rejects missing required arguments" \
+  '{"prompt":"hi"}' \
+  '(.error.data.issues | map(.argument) | sort) == ["cwd","model_reasoning_effort","sandbox"]'
+test_codex_rejects_call "codex rejects malformed operational arguments" \
+  '{"prompt":false,"cwd":"relative/path","sandbox":"escape","model_reasoning_effort":"ultra","goal":false}' \
+  '(.error.data.issues | map(.argument) | sort) == ["cwd","goal","model_reasoning_effort","prompt","sandbox"]'
+test_codex_rejects_call "codex rejects a non-object arguments value" \
+  'null' \
+  '(.error.data.issues == [{"argument":"arguments","problem":"must be an object"}])'
+test_codex_rejects_call "codex-reply requires threadId and rejects conversationId" \
+  '{"prompt":"continue","conversationId":"legacy"}' \
+  '(.error.data.issues | map(.argument) | sort) == ["conversationId","threadId"]' \
+  "codex-reply"
+test_codex_rejects_call "codex-reply rejects inherited session controls" \
+  '{"prompt":"continue","threadId":"abc","sandbox":"read-only","model_reasoning_effort":"max","cwd":"/tmp/work"}' \
+  '(.error.data.issues | map(.argument) | sort) == ["cwd","model_reasoning_effort","sandbox"]' \
+  "codex-reply"
+test_codex_local_response_lifecycle "codex local validation responses remain frame-safe and cancelable"
 
 # Stub-based Codex tools/list schema tests (fast — no real Codex needed).
-# The wrapper rewrites ONLY the tools/list RESPONSE to advertise its wrapper
-# fields; everything else stays byte-for-byte.
-test_codex_toolslist_rewrite "tools/list advertises goal on codex AND codex-reply" \
+# The wrapper rewrites ONLY the tools/list RESPONSE to advertise its curated
+# contract; everything else stays byte-for-byte.
+test_codex_toolslist_rewrite "tools/list advertises exact curated argument sets" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string") and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties.goal.type=="string"))'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties|keys) == ["cwd","goal","model_reasoning_effort","prompt","sandbox"] and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|keys) == ["goal","prompt","threadId"])'
 test_codex_toolslist_rewrite "tools/list advertises exact xhigh|max effort on codex only" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["xhigh","max"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
 test_codex_toolslist_rewrite "tools/list explains effort choice and reply inheritance" \
   "normal" \
-  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort.description|ascii_downcase) as $d | (($d|test("new codex session")) and ($d|test("xhigh.*hard")) and ($d|test("max.*extra-hard")) and ($d|test("repl.*inherit")) and ($d|test("cannot change")) and ($d|test("omit.*server.*default")))'
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort.description|ascii_downcase) as $d | (($d|test("new session")) and ($d|test("xhigh.*hard")) and ($d|test("max.*quality-first")) and ($d|test("repl.*inherit")))'
 # If upstream Codex starts declaring this property itself, mcp-agents still
 # owns the policy: constrain codex to the two allowed values and remove the
 # property from codex-reply rather than exposing upstream drift such as ultra.
 test_codex_toolslist_rewrite "tools/list constrains drifted upstream effort schema" \
   "haveeffort" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["xhigh","max"]) and (.description != "STUB_DRIFTED_EFFORT_DESC"))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
-test_codex_toolslist_rewrite "tools/list keeps additionalProperties:false on codex, none on codex-reply" \
+test_codex_toolslist_rewrite "tools/list makes both schemas closed and operational fields required" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.additionalProperties==false) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema|has("additionalProperties")|not))'
-test_codex_toolslist_rewrite "tools/list keeps wrapper fields optional and other props intact" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema | ((.additionalProperties == false) and ((.required|sort) == ["cwd","model_reasoning_effort","prompt","sandbox"]))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema | ((.additionalProperties == false) and ((.required|sort) == ["prompt","threadId"]))))'
+test_codex_toolslist_rewrite "tools/list advertises exact sandbox choices" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema|(.required|index("goal")|not) and (.required|index("model_reasoning_effort")|not) and (.properties["developer-instructions"]!=null) and (.properties.prompt!=null)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties.conversationId!=null))'
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.sandbox.enum == ["read-only","workspace-write","danger-full-access"])'
+test_codex_toolslist_rewrite "tools/list hides native config and future schema drift" \
+  "normal" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties | (has("approval-policy")|not) and (has("base-instructions")|not) and (has("compact-prompt")|not) and (has("config")|not) and (has("developer-instructions")|not) and (has("model")|not) and (has("future_upstream_setting")|not)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties | (has("conversationId")|not) and (has("future_reply_setting")|not)))'
+test_codex_toolslist_rewrite "tools/list preserves non-schema tool metadata" \
+  "normal" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0] | ((.title == "Native Codex title") and (.annotations.readOnlyHint == false) and (.outputSchema.type == "object") and (.description | test("Config struct") | not)))'
 test_codex_toolslist_rewrite "tools/list forwards interleaved notification byte-for-byte + rewrites result" \
   "interleaved" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")' \
@@ -1593,9 +1748,9 @@ test_codex_toolslist_rewrite "tools/list reassembles a split frame and rewrites 
   "split" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.type=="string")'
 test_codex_toolslist_reentry "tools/list latch re-entry: two calls both rewritten"
-test_codex_toolslist_rewrite "tools/list idempotent: existing goal preserved (not overwritten)" \
+test_codex_toolslist_rewrite "tools/list replaces drifted upstream goal schema" \
   "havegoal" \
-  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal.description=="STUB_OWN_GOAL_DESC")'
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.goal | ((.type == "string") and (.description != "STUB_OWN_GOAL_DESC")))'
 test_codex_toolslist_rewrite "tools/list with no codex tools forwarded byte-for-byte" \
   "noctools" \
   'select(.id==2) | ((.result.tools|length==1) and (.result.tools[0].name=="ping") and (.result.tools[0].inputSchema.properties|has("goal")|not) and (.result.tools[0].inputSchema.properties|has("model_reasoning_effort")|not))'

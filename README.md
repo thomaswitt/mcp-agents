@@ -90,96 +90,93 @@ or Gemini during bridge calls.
 | `--model_reasoning_effort` | `xhigh` | `model_reasoning_effort` |
 
 Other startup defaults: `sandbox_mode=workspace-write`, `approval_policy=never`
-(both configurable via `--sandbox_mode` / `--approval_policy`, and steerable per
-call), `web_search=cached`, `check_for_update_on_startup=false`,
-`allow_login_shell=false`, and `history.persistence=none`. Startup feature
-defaults (overridable per call via a `config` override, like sandbox/approval)
-are `features.multi_agent=false`, `features.apps=false`,
+(configurable for the whole server with `--sandbox_mode` / `--approval_policy`),
+`web_search=cached`, `check_for_update_on_startup=false`,
+`allow_login_shell=false`, and `history.persistence=none`. Fixed bridge feature
+defaults are `features.multi_agent=false`, `features.apps=false`,
 `features.plugins=false`, `features.hooks=false`, and
 `features.skill_mcp_dependency_install=false`; apps/plugins stay disabled to
 keep ChatGPT app/plugin skills — Figma, Gmail, Presentations, etc. — out of the
 bridged session context.
 
-Startup flags (`--model`, `--model_reasoning_effort`) set the model and default
-effort for the native Codex MCP server. The initial `codex` tool additionally
-advertises an optional top-level `model_reasoning_effort` argument with exactly
-two values:
+The bridge replaces Codex's broad config-shaped native schema with a deliberately
+small contract:
+
+| `codex` parameter | Type | Required | Description |
+|-------------------|------|----------|-------------|
+| `prompt` | `string` | yes | Initial user prompt |
+| `cwd` | `string` | yes | Absolute working directory |
+| `sandbox` | `string` | yes | `read-only`, `workspace-write`, or `danger-full-access` |
+| `model_reasoning_effort` | `string` | yes | `xhigh` or `max` |
+| `goal` | `string` | no | Standing objective; `""` suppresses a server-wide goal for this call |
+
+| `codex-reply` parameter | Type | Required | Description |
+|-------------------------|------|----------|-------------|
+| `prompt` | `string` | yes | Follow-up user prompt |
+| `threadId` | `string` | yes | Nonblank thread ID returned by `codex` |
+| `goal` | `string` | no | Optional prompt-level reminder of the standing objective |
+
+Both schemas set `additionalProperties: false`. Unsupported, missing, or invalid
+arguments are rejected locally with JSON-RPC `-32602` before Codex runs. That
+includes native escape hatches such as `model`, `config`, `approval-policy`,
+`developer-instructions`, `base-instructions`, and `compact-prompt`; future
+upstream schema additions stay hidden until mcp-agents intentionally adopts them.
+
+`approval_policy=never` is intentional for an MCP bridge: a detached tool call
+cannot reliably conduct an interactive approval conversation. Operators can pick
+`untrusted` or `on-request` for the whole server with `--approval_policy`, but
+callers cannot weaken or change that policy per request. Each new session must
+still state its sandbox explicitly, so write authority is visible at the call site.
+
+Startup flags (`--model`, `--model_reasoning_effort`) configure the isolated native
+Codex server. The model remains server-owned. Each initial `codex` call explicitly
+selects one of two allowed reasoning efforts:
 
 | Value | Use for |
 |-------|---------|
 | `xhigh` | Hard but bounded implementation work |
 | `max` | Extra-hard, quality-first work with high architectural, concurrency, data-integrity, or security risk |
 
-Any other value is stripped and the server-configured default is used.
+The selector applies only when creating a session. Every `codex-reply` inherits
+that choice and cannot change it. `ultra` is deliberately unavailable because it
+changes execution topology by enabling automatic delegation rather than merely
+increasing the session's reasoning effort.
 
-The selector applies only when creating a new Codex session. Omit it to inherit
-the server's `--model_reasoning_effort` setting (`xhigh` by default). Every
-`codex-reply` in that session inherits the selected effort; replies cannot
-change it and do not advertise the argument. `ultra` is deliberately unavailable
-through this selector because it changes execution topology by enabling automatic
-delegation, rather than merely increasing the reasoning effort of the session.
-
-Raw model and effort overrides remain blocked. Per-call `model` and the
-model/effort keys inside a `config` override are stripped from `tools/call`
-before they reach Codex, so callers cannot bypass the two-value selector
-(`sandbox`, `cwd`, and `approval-policy` — top-level and the matching `config`
-keys — are intentionally left steerable per call). For example, this request:
+For example, a read-only review starts with:
 
 ```json
 {
   "prompt": "Review this diff",
-  "model": "gpt-5.5-codex",
-  "config": { "model_reasoning_effort": "medium" }
+  "cwd": "/absolute/path/to/project",
+  "sandbox": "read-only",
+  "model_reasoning_effort": "max",
+  "goal": "Find correctness and security defects"
 }
 ```
 
-is forwarded to Codex as `{ "prompt": "Review this diff" }`. To select maximum
-reasoning for a new session, use the dedicated top-level argument instead:
-
-```json
-{
-  "prompt": "Implement the accepted specification",
-  "model_reasoning_effort": "max"
-}
-```
-
-**Goal injection.** You can give Codex a persistent objective. Set one at server
-startup with `--goal "<text>"`, or per call with a `goal` argument in `tools/call`:
-
-```json
-{ "prompt": "Refactor the parser", "goal": "Keep the public API unchanged" }
-```
-
-For the initial `codex` call the objective is injected into Codex's native
-`developer-instructions` field (a developer-role message), so this is forwarded
-to Codex as:
+**Goal injection.** Set a default objective at server startup with
+`--goal "<text>"`, or pass `goal` on a call. mcp-agents turns the initial goal into
+Codex's native `developer-instructions` internally:
 
 ```json
 {
   "prompt": "Refactor the parser",
-  "developer-instructions": "Persistent objective for this Codex thread (a standing goal — keep pursuing it across turns unless explicitly superseded):\nKeep the public API unchanged"
+  "cwd": "/absolute/path/to/project",
+  "sandbox": "workspace-write",
+  "model_reasoning_effort": "xhigh",
+  "goal": "Keep the public API unchanged"
 }
 ```
 
-A developer message persists for the whole thread, so `codex-reply` follow-ups
-inherit the objective automatically. Because `codex-reply` has no
-`developer-instructions` field, a per-call `goal` on a reply is instead added as
-a concise `Reminder — standing objective for this thread: …` preamble on the
-prompt. Any caller-supplied `developer-instructions` are preserved, with the
-objective merged ahead of them.
+A developer message persists for the thread, so replies inherit it. A per-call
+`goal` on `codex-reply` becomes a concise prompt reminder because the native reply
+tool has no developer-instructions field. Direct developer instructions are not
+exposed: `goal` is the narrow, auditable standing-objective interface. A per-call
+goal overrides the server default; `""` suppresses that default for one call.
 
-The wrapper-only `goal` argument is always stripped before it reaches Codex (it
-is never a native Codex parameter). A per-call `goal` overrides the `--goal`
-default for that call; a per-call empty `goal` (`""`) suppresses the default for
-that one call; a non-string `goal` is ignored (the `--goal` default still
-applies).
-
-So a client's model knows it can pass `goal`, the pass-through advertises it: it
-rewrites its own `tools/list` response to declare an optional `goal` property on
-the `codex` and `codex-reply` tool schemas (models only generate arguments
-declared in a tool's `inputSchema`). Only `properties` is augmented — `required`
-and `additionalProperties` are left intact — and the rewrite touches only the
-`tools/list` response; every other frame is forwarded byte-for-byte.
+The bridge rewrites only `tools/list` responses to advertise these curated
+schemas. Normal native frames remain byte-for-byte pass-through; locally generated
+validation errors use the same frame-safe queue as progress and recovery messages.
 
 **Precedence within a thread.** The objective set on the initial `codex` call is
 a developer-role message and persists for the whole thread, so it takes
@@ -297,22 +294,18 @@ Override codex defaults at server startup:
   "mcpServers": {
     "codex": {
       "command": "mcp-agents",
-      "args": ["--provider", "codex", "--model", "gpt-5.6-sol", "--model_reasoning_effort", "medium"],
+      "args": ["--provider", "codex", "--model", "gpt-5.6-sol", "--model_reasoning_effort", "xhigh"],
       "timeout": 7500000
     }
   }
 }
 ```
 
-The model is fixed at server startup, while startup effort is the default for new
-sessions. An initial `codex` call may select `xhigh` or `max` with the dedicated
-top-level `model_reasoning_effort` argument; omission inherits the startup
-default, and `codex-reply` calls inherit the session's choice without being able
-to change it. Per-call `model` and model/effort keys inside a raw `config`
-override are still stripped before reaching Codex, so they cannot bypass these
-constraints (`sandbox`/`cwd`/`approval-policy` remain steerable per call). Add
-`"--goal", "<text>"` to `args` to inject a persistent objective into every Codex
-call (see [Goal injection](#codex-pass-through) above).
+The model is fixed at server startup. Every initial `codex` call must select
+`xhigh` or `max`; replies inherit the selection. Raw `model`, `config`, and
+per-call approval-policy arguments are rejected before Codex runs. Add
+`"--goal", "<text>"` to `args` to provide a default objective (see
+[Goal injection](#codex-pass-through) above).
 
 Claude interprets the per-server `timeout` in milliseconds as a hard wall-clock
 cap; progress does not extend it. Keep it above the wrapper's `--timeout`

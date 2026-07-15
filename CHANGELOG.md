@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-07-15
+
+### Changed
+
+- **Migration:** Replace Codex's broad config-shaped tool schemas with closed,
+  curated contracts. New `codex` calls require `prompt`, an absolute `cwd`, an
+  explicit `sandbox`, and `model_reasoning_effort` (`xhigh` or `max`), with
+  optional `goal`; replies require `prompt` and nonblank `threadId`, with
+  optional `goal`
+- Reject unsupported, missing, and malformed Codex arguments locally with a
+  redacted JSON-RPC `-32602` response instead of silently stripping fields or
+  forwarding them to native Codex. Raw model/config/instruction fields and
+  per-call approval-policy overrides are no longer accepted
+- Keep approval policy server-owned with the non-interactive `never` default;
+  operators can still change it at startup with `--approval_policy`
+
+### Fixed
+
+- Queue local validation errors at safe native frame boundaries, reserve their
+  request IDs until delivery, and let cancellation remove an undelivered local
+  response without forwarding the invalid call or cancellation to Codex
+
 ## [0.15.0] - 2026-07-13
 
 ### Changed
