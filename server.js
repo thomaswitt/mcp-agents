@@ -46,7 +46,13 @@ const DEFAULT_CODEX_TERMINAL_GRACE_MS = 1_000;
 const DEFAULT_CODEX_CANCEL_GRACE_MS = 3_000;
 const DEFAULT_CODEX_PROGRESS_INTERVAL_MS = 1_000;
 const DEFAULT_CODEX_WAIT_INTERVAL_MS = 10_000;
+const MAX_CODEX_STATUS_WAIT_MS = 60_000;
 const MAX_CODEX_PROGRESS_CODEPOINTS = 200;
+const MAX_CODEX_PAGE_CODEPOINTS = 32_768;
+const MAX_CODEX_COMMENTARY_BYTES = 1024 * 1024;
+const MAX_ACTIVE_CODEX_JOBS = 8;
+const MAX_RETAINED_CODEX_JOBS = 32;
+const CODEX_JOB_RETENTION_MS = 60 * 60 * 1_000;
 const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
@@ -67,6 +73,34 @@ const CODEX_TOOL_CONTRACTS = {
     required: ["prompt", "threadId"],
   },
 };
+const CODEX_JOB_TOOL_CONTRACTS = {
+  "codex-start": {
+    allowed: [...CODEX_TOOL_CONTRACTS.codex.allowed],
+    required: [...CODEX_TOOL_CONTRACTS.codex.required],
+  },
+  "codex-reply-start": {
+    allowed: [...CODEX_TOOL_CONTRACTS["codex-reply"].allowed],
+    required: [...CODEX_TOOL_CONTRACTS["codex-reply"].required],
+  },
+  "codex-status": {
+    allowed: ["jobId", "cursor", "wait_ms"],
+    required: ["jobId", "cursor"],
+  },
+  "codex-commentary": {
+    allowed: ["jobId", "offset"],
+    required: ["jobId"],
+  },
+  "codex-result": {
+    allowed: ["jobId", "offset"],
+    required: ["jobId"],
+  },
+  "codex-cancel": {
+    allowed: ["jobId"],
+    required: ["jobId"],
+  },
+};
+const CODEX_JOB_TOOL_NAMES = Object.keys(CODEX_JOB_TOOL_CONTRACTS);
+const TERMINAL_CODEX_JOB_STATES = new Set(["completed", "failed", "canceled"]);
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const SIGNAL_CODES = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
@@ -794,13 +828,109 @@ function codexToolPresentation(toolName) {
       },
     };
   }
+  if (toolName === "codex-start") {
+    const presentation = codexToolPresentation("codex");
+    return {
+      ...presentation,
+      description:
+        "Start an optional background Codex job. This returns immediately; call " +
+        "codex-status with the returned job ID and cursor until the job is terminal.",
+    };
+  }
+  if (toolName === "codex-reply-start") {
+    const presentation = codexToolPresentation("codex-reply");
+    return {
+      ...presentation,
+      description:
+        "Start an optional background reply on an existing Codex thread. This returns " +
+        "immediately; call codex-status until the job is terminal.",
+    };
+  }
+  if (toolName === "codex-status") {
+    return {
+      description:
+        "Poll a background Codex job. At the current cursor this waits for new status " +
+        "or a heartbeat, producing an ordinary transcript-visible tool result.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Opaque job ID returned by a start tool." },
+          cursor: {
+            type: "integer",
+            minimum: 0,
+            description: "Status cursor returned by the previous start or status result.",
+          },
+          wait_ms: {
+            type: "integer",
+            minimum: 0,
+            maximum: MAX_CODEX_STATUS_WAIT_MS,
+            description: "Long-poll duration in milliseconds; defaults to 10000.",
+          },
+        },
+        required: [...CODEX_JOB_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-commentary") {
+    return {
+      description:
+        "Read retained, explicit user-visible commentary from a background Codex job. " +
+        "This never exposes hidden reasoning and does not wait for new content.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Opaque job ID returned by a start tool." },
+          offset: {
+            type: "integer",
+            minimum: 0,
+            description: "Absolute Unicode code-point offset; defaults to 0.",
+          },
+        },
+        required: [...CODEX_JOB_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-result") {
+    return {
+      description:
+        "Read the final output of a completed background Codex job in bounded pages.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Opaque job ID returned by a start tool." },
+          offset: {
+            type: "integer",
+            minimum: 0,
+            description: "Absolute Unicode code-point result offset; defaults to 0.",
+          },
+        },
+        required: [...CODEX_JOB_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-cancel") {
+    return {
+      description: "Idempotently cancel a background Codex job.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Opaque job ID returned by a start tool." },
+        },
+        required: [...CODEX_JOB_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
   return undefined;
 }
 
 function validateCodexToolCallMessage(msg) {
   if (!msg || typeof msg !== "object" || msg.method !== "tools/call") return undefined;
   const toolName = msg.params?.name;
-  const contract = CODEX_TOOL_CONTRACTS[toolName];
+  const contract = CODEX_TOOL_CONTRACTS[toolName] ?? CODEX_JOB_TOOL_CONTRACTS[toolName];
   if (!contract) return undefined;
   const args = msg.params?.arguments;
   if (!args || typeof args !== "object" || Array.isArray(args)) {
@@ -862,6 +992,35 @@ function validateCodexToolCallMessage(msg) {
       issues.push({ argument: "threadId", problem: "must not be blank" });
     }
   }
+  if (Object.hasOwn(args, "jobId")) {
+    if (typeof args.jobId !== "string") {
+      issues.push({ argument: "jobId", problem: "must be a string" });
+    } else if (!args.jobId.trim()) {
+      issues.push({ argument: "jobId", problem: "must not be blank" });
+    }
+  }
+  if (
+    Object.hasOwn(args, "cursor") &&
+    (!Number.isInteger(args.cursor) || args.cursor < 0)
+  ) {
+    issues.push({ argument: "cursor", problem: "must be a nonnegative integer" });
+  }
+  if (
+    Object.hasOwn(args, "wait_ms") &&
+    (!Number.isInteger(args.wait_ms) || args.wait_ms < 0 ||
+      args.wait_ms > MAX_CODEX_STATUS_WAIT_MS)
+  ) {
+    issues.push({
+      argument: "wait_ms",
+      problem: `must be an integer from 0 to ${MAX_CODEX_STATUS_WAIT_MS}`,
+    });
+  }
+  if (
+    Object.hasOwn(args, "offset") &&
+    (!Number.isInteger(args.offset) || args.offset < 0)
+  ) {
+    issues.push({ argument: "offset", problem: "must be a nonnegative integer" });
+  }
 
   return issues.length > 0
     ? {
@@ -909,6 +1068,33 @@ function rewriteCodexToolsListMessage(msg) {
       changed = true;
     }
   }
+  const existingNames = new Set(
+    tools.filter((tool) => tool && typeof tool.name === "string").map((tool) => tool.name),
+  );
+  const hasCodex = existingNames.has("codex");
+  const hasCodexReply = existingNames.has("codex-reply");
+  const availableJobTools = CODEX_JOB_TOOL_NAMES.filter((toolName) => {
+    if (toolName === "codex-start") return hasCodex;
+    if (toolName === "codex-reply-start") return hasCodexReply;
+    return hasCodex || hasCodexReply;
+  });
+  for (const toolName of availableJobTools) {
+    const presentation = codexToolPresentation(toolName);
+    const existing = tools.find((tool) => tool?.name === toolName);
+    if (existing) {
+      if (existing.description !== presentation.description) {
+        existing.description = presentation.description;
+        changed = true;
+      }
+      if (JSON.stringify(existing.inputSchema) !== JSON.stringify(presentation.inputSchema)) {
+        existing.inputSchema = presentation.inputSchema;
+        changed = true;
+      }
+      continue;
+    }
+    tools.push({ name: toolName, ...presentation });
+    changed = true;
+  }
   return changed;
 }
 
@@ -953,6 +1139,10 @@ function runCodexPassthrough({
   const waitIntervalMs = testTunableMs(
     "MCP_AGENTS_CODEX_WAIT_INTERVAL_MS",
     DEFAULT_CODEX_WAIT_INTERVAL_MS,
+  );
+  const commentaryByteLimit = testTunableMs(
+    "MCP_AGENTS_TEST_COMMENTARY_BYTES",
+    MAX_CODEX_COMMENTARY_BYTES,
   );
   // Server-wide default goal (string or undefined); per-call `goal` overrides it.
   const resolvedGoal = goal;
@@ -1038,10 +1228,11 @@ function runCodexPassthrough({
   let droppedFrameResponseId; // partial oversized frame's classified id (cleared at its newline)
   let observationDropLogged = false; // log the first observation-cap drop only
 
-  // ── tools/list curated-schema rewrite (contained latch) ─────────────────
-  // While a `tools/list` request id is outstanding the forwarder switches from
-  // raw passthrough to buffer-and-rewrite, replacing the advertised Codex inputs
-  // with the strict wrapper contract, then returns to raw.
+  // ── Curated-schema rewrite and private-job frame filter ──────────────────
+  // While a `tools/list` request id or private job is outstanding the forwarder
+  // switches from raw passthrough to bounded frame buffering. It rewrites the
+  // advertised Codex inputs and suppresses private job responses/events, then
+  // returns to raw when no latch remains.
   // Observation above stays the SOLE authority for inFlight/the watchdog; this
   // path only changes HOW bytes reach the wire.
   const pendingToolsListIds = new Set(); // idKey(id) of outstanding tools/list requests (the latch)
@@ -1054,6 +1245,7 @@ function runCodexPassthrough({
   let oversizedToolsListLogged = false; // log the first rewrite-cap drop only
   const generatedFrames = [];
   const locallyHandledResponseIds = new Set();
+  const privateJobRequestIds = new Set();
   let flushGeneratedFrames = () => {};
 
   // ── In-flight request tracking ──────────────────────────────────────────
@@ -1061,6 +1253,11 @@ function runCodexPassthrough({
   // JSON-RPC numeric `1` and string `"1"` remain distinct keys.
   const inFlight = new Map();
   const serverRequestParents = new Map();
+  const jobs = new Map();
+  const jobsByNativeRequest = new Map();
+  const privateRequestPrefix = process.env.MCP_AGENTS_TEST_PRIVATE_PREFIX ??
+    `mcp-agents/job/${randomUUID()}/`;
+  let privateRequestSequence = 0;
   const idKey = (id) => `${typeof id}:${id}`;
   const rememberLocallyHandledResponse = (requestKey) => {
     locallyHandledResponseIds.add(requestKey);
@@ -1081,6 +1278,7 @@ function runCodexPassthrough({
       "cancelTimer",
       "progressFlushTimer",
       "waitTimer",
+      "localWaitTimer",
     ]) {
       clearTimer(entry, name);
     }
@@ -1221,7 +1419,9 @@ function runCodexPassthrough({
     return true;
   };
   const hasEmittableInFlight = () => {
-    for (const entry of inFlight.values()) if (entry.state !== "canceled") return true;
+    for (const entry of inFlight.values()) {
+      if (!entry.internalJob && entry.state !== "canceled") return true;
+    }
     return false;
   };
   const canArmResponseSuppression = () =>
@@ -1272,6 +1472,10 @@ function runCodexPassthrough({
     if (frame.kind === "local_response") {
       const entry = inFlight.get(frame.requestKey);
       if (entry?.state === "local_response") {
+        if (entry.startJobId) {
+          const job = jobs.get(entry.startJobId);
+          if (job?.startRequestKey === frame.requestKey) job.startRequestKey = undefined;
+        }
         rememberLocallyHandledResponse(frame.requestKey);
         settleInFlight(entry.id);
       }
@@ -1284,6 +1488,639 @@ function runCodexPassthrough({
     entry.lastWaitAttemptAt = undefined;
     clearTimer(entry, "waitTimer");
     armProgressWait(entry);
+  };
+  const codePointLength = (value) => Array.from(value ?? "").length;
+  const sanitizeCommentaryText = (value) => {
+    if (typeof value !== "string") return "";
+    return value
+      .replace(/\r/gu, "")
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, "")
+      .replace(/[\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu, "");
+  };
+  const localToolResult = (text, structuredContent, { isError = false } = {}) => ({
+    content: [{ type: "text", text }],
+    structuredContent,
+    ...(isError ? { isError: true } : {}),
+  });
+  const prepareLocalEntry = (entry, state = "local_response") => {
+    clearEntryTimers(entry);
+    stopEntryProgress(entry);
+    entry.state = state;
+  };
+  const detachLocalWaiter = (entry) => {
+    if (!entry?.waitJobId) return;
+    jobs.get(entry.waitJobId)?.waiters.delete(idKey(entry.id));
+    entry.waitJobId = undefined;
+    clearTimer(entry, "localWaitTimer");
+  };
+  const queueLocalToolResponse = (entry, result) => {
+    detachLocalWaiter(entry);
+    prepareLocalEntry(entry);
+    queueGeneratedFrame(
+      { jsonrpc: "2.0", id: entry.id, result },
+      { requestKey: idKey(entry.id), kind: "local_response" },
+    );
+    flushGeneratedFrames();
+  };
+  const isTerminalJob = (job) => TERMINAL_CODEX_JOB_STATES.has(job?.state);
+  const jobStatusStructuredContent = (job) => ({
+    jobId: job.jobId,
+    state: job.state,
+    cursor: job.statusCursor,
+    message: job.statusMessage,
+    elapsedSeconds: Math.max(0, Math.floor((Date.now() - job.createdAt) / 1_000)),
+    lastActivitySeconds: Math.max(
+      0,
+      Math.floor((Date.now() - job.lastActivityAt) / 1_000),
+    ),
+    ...(job.threadId ? { threadId: job.threadId } : {}),
+    resultAvailable: job.state === "completed",
+    resultTruncated: false,
+    commentaryStartOffset: job.commentaryStartOffset,
+    commentaryEndOffset: job.commentaryEndOffset,
+    commentaryTruncated: job.commentaryStartOffset > 0,
+  });
+  const jobStatusResult = (job, { heartbeat = false } = {}) => {
+    const structuredContent = jobStatusStructuredContent(job);
+    const visibleMessage = heartbeat && !isTerminalJob(job)
+      ? `Codex: still running; last activity ${structuredContent.lastActivitySeconds}s ago`
+      : job.statusMessage;
+    structuredContent.message = visibleMessage;
+    let instruction;
+    if (job.state === "completed") {
+      instruction = `Call codex-result with jobId ${job.jobId} to read the final answer.`;
+    } else if (job.state === "failed" || job.state === "canceled") {
+      instruction = "The Codex job is terminal.";
+    } else {
+      instruction =
+        `Call codex-status again with jobId ${job.jobId} and cursor ` +
+        `${job.statusCursor}. If commentaryEndOffset advanced, call codex-commentary.`;
+    }
+    return localToolResult(
+      `Codex job ${job.jobId} is ${job.state}: ${visibleMessage}\n\n${instruction}`,
+      structuredContent,
+    );
+  };
+  const queueJobStatusResponse = (entry, job, options) => {
+    queueLocalToolResponse(entry, jobStatusResult(job, options));
+  };
+  const wakeJobWaiters = (job) => {
+    for (const requestKey of [...job.waiters]) {
+      const entry = inFlight.get(requestKey);
+      if (!entry || entry.state !== "local_wait") {
+        job.waiters.delete(requestKey);
+        continue;
+      }
+      if (job.statusCursor > entry.waitCursor || isTerminalJob(job)) {
+        queueJobStatusResponse(entry, job);
+      }
+    }
+  };
+  const setJobStatusNow = (job, message, { state } = {}) => {
+    if (!job || isTerminalJob(job)) return;
+    const formatted = formatProgressMessage(message) ?? job.statusMessage;
+    const stateChanged = state && state !== job.state;
+    if (!stateChanged && formatted === job.statusMessage) return;
+    if (state) job.state = state;
+    job.statusMessage = formatted;
+    job.statusCursor += 1;
+    job.lastStatusAt = Date.now();
+    job.pendingStatusMessage = undefined;
+    if (job.statusTimer) {
+      clearTimeout(job.statusTimer);
+      job.statusTimer = undefined;
+    }
+    wakeJobWaiters(job);
+  };
+  const flushPendingJobStatus = (job) => {
+    job.statusTimer = undefined;
+    const message = job.pendingStatusMessage;
+    job.pendingStatusMessage = undefined;
+    if (message) setJobStatusNow(job, message, { state: "running" });
+  };
+  const scheduleJobStatus = (job, message) => {
+    if (!job || isTerminalJob(job)) return;
+    const formatted = formatProgressMessage(message);
+    if (
+      !formatted || formatted === job.statusMessage ||
+      formatted === formatProgressMessage(job.pendingStatusMessage)
+    ) {
+      return;
+    }
+    const elapsed = job.lastStatusAt == null
+      ? Number.POSITIVE_INFINITY
+      : Date.now() - job.lastStatusAt;
+    if (elapsed >= progressIntervalMs) {
+      setJobStatusNow(job, formatted.slice("Codex: ".length), { state: "running" });
+      return;
+    }
+    job.pendingStatusMessage = formatted.slice("Codex: ".length);
+    if (!job.statusTimer) {
+      job.statusTimer = setTimeout(
+        () => flushPendingJobStatus(job),
+        Math.max(1, progressIntervalMs - elapsed),
+      );
+    }
+  };
+  const appendJobCommentary = (job, value) => {
+    const text = sanitizeCommentaryText(value);
+    if (!text) return "";
+    job.commentary += text;
+    job.commentaryEndOffset += codePointLength(text);
+    let byteLength = Buffer.byteLength(job.commentary, "utf8");
+    if (byteLength > commentaryByteLimit) {
+      const codePoints = Array.from(job.commentary);
+      let dropped = 0;
+      while (byteLength > commentaryByteLimit && dropped < codePoints.length) {
+        byteLength -= Buffer.byteLength(codePoints[dropped], "utf8");
+        dropped += 1;
+      }
+      job.commentary = codePoints.slice(dropped).join("");
+      job.commentaryStartOffset += dropped;
+      if (!job.commentaryTruncationLogged) {
+        logErr(
+          `[mcp-agents] Codex job ${job.jobId} commentary exceeded ` +
+            `${commentaryByteLimit} bytes; retaining tail`,
+        );
+        job.commentaryTruncationLogged = true;
+      }
+    }
+    return text;
+  };
+  const appendJobCommentarySeparator = (job) => {
+    if (job.commentary.endsWith("\n\n")) return;
+    appendJobCommentary(job, job.commentary.endsWith("\n") ? "\n" : "\n\n");
+  };
+  const closeActiveCommentaryItem = (job) => {
+    const itemId = job.activeCommentaryItemId;
+    if (!itemId) return;
+    const item = job.commentaryItems.get(itemId);
+    if (item?.hasText) appendJobCommentarySeparator(job);
+    if (item) item.closed = true;
+    job.activeCommentaryItemId = undefined;
+  };
+  const captureJobCommentary = (job, event) => {
+    if (!job || !event || typeof event !== "object" || job.commentaryComplete) return;
+    if (event.type === "item_started") {
+      const item = event.item;
+      if (
+        item?.type !== "AgentMessage" || item.phase !== "commentary" ||
+        typeof item.id !== "string"
+      ) return;
+      job.streamedCommentarySeen = true;
+      if (job.activeCommentaryItemId && job.activeCommentaryItemId !== item.id) {
+        closeActiveCommentaryItem(job);
+      }
+      job.commentaryItems.set(item.id, {
+        observed: "",
+        observedOverflow: false,
+        sawDelta: false,
+        hasText: false,
+        closed: false,
+      });
+      job.activeCommentaryItemId = item.id;
+      return;
+    }
+    if (event.type === "agent_message_content_delta") {
+      const item = job.commentaryItems.get(event.item_id);
+      if (
+        !item || item.closed || job.activeCommentaryItemId !== event.item_id ||
+        typeof event.delta !== "string"
+      ) return;
+      const text = appendJobCommentary(job, event.delta);
+      if (!text) return;
+      item.sawDelta = true;
+      item.hasText = true;
+      if (!item.observedOverflow) {
+        const combined = `${item.observed}${text}`;
+        if (Buffer.byteLength(combined, "utf8") <= commentaryByteLimit) {
+          item.observed = combined;
+        } else {
+          item.observed = "";
+          item.observedOverflow = true;
+        }
+      }
+      return;
+    }
+    if (event.type === "item_completed") {
+      const completed = event.item;
+      if (
+        completed?.type !== "AgentMessage" || completed.phase !== "commentary" ||
+        typeof completed.id !== "string"
+      ) return;
+      const item = job.commentaryItems.get(completed.id);
+      if (!item || item.closed || job.activeCommentaryItemId !== completed.id) return;
+      const completedText = sanitizeCommentaryText(
+        Array.isArray(completed.content)
+          ? completed.content
+            .filter((part) => part?.type === "Text" && typeof part.text === "string")
+            .map((part) => part.text)
+            .join("")
+          : completed.message,
+      );
+      if (!item.sawDelta) {
+        if (appendJobCommentary(job, completedText)) item.hasText = true;
+      } else if (!item.observedOverflow && completedText.startsWith(item.observed)) {
+        if (appendJobCommentary(job, completedText.slice(item.observed.length))) {
+          item.hasText = true;
+        }
+      }
+      closeActiveCommentaryItem(job);
+      return;
+    }
+    if (
+      event.type === "agent_message" && event.phase === "commentary" &&
+      typeof event.message === "string" && !job.streamedCommentarySeen
+    ) {
+      if (appendJobCommentary(job, event.message)) appendJobCommentarySeparator(job);
+    }
+  };
+  const finishJobCommentary = (job) => {
+    if (!job || job.commentaryComplete) return;
+    closeActiveCommentaryItem(job);
+    job.commentaryComplete = true;
+  };
+  const removeJob = (job) => {
+    if (!job) return;
+    if (job.statusTimer) clearTimeout(job.statusTimer);
+    for (const requestKey of job.waiters) {
+      const entry = inFlight.get(requestKey);
+      if (entry) {
+        clearTimer(entry, "localWaitTimer");
+        settleInFlight(entry.id);
+      }
+    }
+    jobs.delete(job.jobId);
+    jobsByNativeRequest.delete(job.nativeRequestKey);
+  };
+  const pruneJobs = () => {
+    const now = Date.now();
+    for (const job of [...jobs.values()]) {
+      if (isTerminalJob(job) && job.expiresAt <= now) removeJob(job);
+    }
+    if (jobs.size < MAX_RETAINED_CODEX_JOBS) return;
+    const evictable = [...jobs.values()]
+      .filter((job) =>
+        isTerminalJob(job) &&
+        (job.resultRead || (job.state !== "completed" && job.terminalRead))
+      )
+      .sort((a, b) => a.terminalAt - b.terminalAt);
+    while (jobs.size >= MAX_RETAINED_CODEX_JOBS && evictable.length > 0) {
+      removeJob(evictable.shift());
+    }
+  };
+  const activeJobCount = () =>
+    [...jobs.values()].filter((job) => !isTerminalJob(job)).length;
+  const transitionJobTerminal = (job, state, message, { resultText, threadId } = {}) => {
+    if (!job || isTerminalJob(job)) return;
+    if (job.statusTimer) clearTimeout(job.statusTimer);
+    job.statusTimer = undefined;
+    job.pendingStatusMessage = undefined;
+    finishJobCommentary(job);
+    job.state = state;
+    job.statusMessage = formatProgressMessage(message) ?? `Codex: ${state}`;
+    job.statusCursor += 1;
+    job.terminalAt = Date.now();
+    job.expiresAt = job.terminalAt + CODEX_JOB_RETENTION_MS;
+    if (typeof threadId === "string" && threadId) job.threadId = threadId;
+    if (state === "completed") {
+      job.resultText = typeof resultText === "string" ? resultText : "";
+      job.resultEndOffset = codePointLength(job.resultText);
+    }
+    wakeJobWaiters(job);
+  };
+  const resultTextFromNative = (result) => {
+    if (typeof result?.structuredContent?.content === "string") {
+      return result.structuredContent.content;
+    }
+    if (!Array.isArray(result?.content)) return "";
+    return result.content
+      .filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("\n");
+  };
+  const handlePrivateResponse = (entry, msg) => {
+    const job = jobs.get(entry.jobId);
+    if (!job || isTerminalJob(job)) return;
+    const nativeThreadId = msg.result?.structuredContent?.threadId ?? entry.threadId ?? job.threadId;
+    if (job.state === "canceling" || entry.state === "canceled") {
+      transitionJobTerminal(job, "canceled", "canceled", { threadId: nativeThreadId });
+      return;
+    }
+    if (msg.error) {
+      const message = normalizeProgressText(msg.error.message) || "native Codex request failed";
+      transitionJobTerminal(job, "failed", message, { threadId: nativeThreadId });
+      return;
+    }
+    if (msg.result?.isError === true) {
+      transitionJobTerminal(
+        job,
+        "failed",
+        resultTextFromNative(msg.result) || "native Codex tool returned an error",
+        { threadId: nativeThreadId },
+      );
+      return;
+    }
+    transitionJobTerminal(job, "completed", "completed", {
+      resultText: resultTextFromNative(msg.result),
+      threadId: nativeThreadId,
+    });
+  };
+  const jobNotFoundResult = (jobId) => localToolResult(
+    `Codex job ${jobId} was not found. Jobs are local to this MCP connection and expire.`,
+    { code: "job_not_found", jobId },
+    { isError: true },
+  );
+  const pageByCodePoint = (text, offset) => {
+    const codePoints = Array.from(text ?? "");
+    const page = codePoints.slice(offset, offset + MAX_CODEX_PAGE_CODEPOINTS);
+    return {
+      text: page.join(""),
+      nextOffset: offset + page.length,
+      endOffset: codePoints.length,
+    };
+  };
+  const commentaryResult = (job, requestedOffset) => {
+    if (requestedOffset > job.commentaryEndOffset) {
+      return localToolResult(
+        `Commentary offset ${requestedOffset} is beyond the available range ` +
+          `${job.commentaryStartOffset}..${job.commentaryEndOffset}.`,
+        {
+          code: "commentary_offset_out_of_range",
+          jobId: job.jobId,
+          requestedOffset,
+          startOffset: job.commentaryStartOffset,
+          endOffset: job.commentaryEndOffset,
+        },
+        { isError: true },
+      );
+    }
+    const startOffset = Math.max(requestedOffset, job.commentaryStartOffset);
+    const relativeOffset = startOffset - job.commentaryStartOffset;
+    const page = pageByCodePoint(job.commentary, relativeOffset);
+    const nextOffset = startOffset + codePointLength(page.text);
+    const structuredContent = {
+      jobId: job.jobId,
+      state: job.state,
+      latestStatus: job.statusMessage,
+      requestedOffset,
+      startOffset,
+      nextOffset,
+      endOffset: job.commentaryEndOffset,
+      caughtUp: nextOffset === job.commentaryEndOffset,
+      commentaryComplete: job.commentaryComplete,
+      truncatedBefore: requestedOffset < job.commentaryStartOffset,
+      text: page.text,
+    };
+    const visible = page.text || "(No new Codex commentary.)";
+    return localToolResult(visible, structuredContent);
+  };
+  const resultPageResult = (job, offset) => {
+    if (!isTerminalJob(job)) {
+      return localToolResult(
+        `Codex job ${job.jobId} is still ${job.state}. Continue with codex-status.`,
+        {
+          jobId: job.jobId,
+          state: job.state,
+          resultAvailable: false,
+          next: { tool: "codex-status", arguments: { jobId: job.jobId, cursor: job.statusCursor } },
+        },
+      );
+    }
+    if (job.state !== "completed") {
+      job.terminalRead = true;
+      return localToolResult(
+        `Codex job ${job.jobId} ${job.state}: ${job.statusMessage}`,
+        { jobId: job.jobId, state: job.state, resultAvailable: false },
+        { isError: true },
+      );
+    }
+    if (offset > job.resultEndOffset) {
+      return localToolResult(
+        `Result offset ${offset} is beyond the available range 0..${job.resultEndOffset}.`,
+        { code: "result_offset_out_of_range", jobId: job.jobId, offset },
+        { isError: true },
+      );
+    }
+    const page = pageByCodePoint(job.resultText, offset);
+    const done = page.nextOffset === page.endOffset;
+    if (done) job.resultRead = true;
+    return localToolResult(
+      page.text || "(Codex returned an empty result.)",
+      {
+        jobId: job.jobId,
+        state: job.state,
+        ...(job.threadId ? { threadId: job.threadId } : {}),
+        offset,
+        nextOffset: page.nextOffset,
+        endOffset: page.endOffset,
+        done,
+        resultTruncated: false,
+        text: page.text,
+      },
+    );
+  };
+  const createJob = ({ nativeId, nativeToolName, startRequestKey }) => {
+    const now = Date.now();
+    return {
+      jobId: randomUUID(),
+      nativeId,
+      nativeRequestKey: idKey(nativeId),
+      nativeToolName,
+      startRequestKey,
+      state: "starting",
+      statusCursor: 0,
+      statusMessage: "Codex: starting",
+      createdAt: now,
+      lastActivityAt: now,
+      lastStatusAt: undefined,
+      pendingStatusMessage: undefined,
+      statusTimer: undefined,
+      threadId: undefined,
+      waiters: new Set(),
+      commentary: "",
+      commentaryStartOffset: 0,
+      commentaryEndOffset: 0,
+      commentaryComplete: false,
+      commentaryTruncationLogged: false,
+      commentaryItems: new Map(),
+      activeCommentaryItemId: undefined,
+      streamedCommentarySeen: false,
+      resultText: "",
+      resultEndOffset: 0,
+      resultRead: false,
+      terminalRead: false,
+      terminalAt: undefined,
+      expiresAt: Number.POSITIVE_INFINITY,
+    };
+  };
+  const startResult = (job) => localToolResult(
+    `Codex job ${job.jobId} started. Call codex-status with cursor 0 until terminal.`,
+    {
+      jobId: job.jobId,
+      state: job.state,
+      cursor: job.statusCursor,
+      message: job.statusMessage,
+      commentaryStartOffset: 0,
+      commentaryEndOffset: 0,
+      next: { tool: "codex-status", arguments: { jobId: job.jobId, cursor: 0 } },
+    },
+  );
+  const requestJobCancellation = (job, reason = "canceled by caller") => {
+    if (!job || isTerminalJob(job) || job.state === "canceling") return;
+    setJobStatusNow(job, "canceling", { state: "canceling" });
+    const nativeEntry = inFlight.get(job.nativeRequestKey);
+    if (!nativeEntry) {
+      transitionJobTerminal(job, "canceled", "canceled");
+      return;
+    }
+    cancelInFlight(job.nativeId);
+    try {
+      child.stdin.write(`${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: job.nativeId, reason },
+      })}\n`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      transitionJobTerminal(job, "failed", `cancellation failed: ${message}`);
+    }
+  };
+  const dispatchJob = (msg, clientEntry, nativeToolName) => {
+    pruneJobs();
+    if (
+      activeJobCount() >= MAX_ACTIVE_CODEX_JOBS ||
+      jobs.size >= MAX_RETAINED_CODEX_JOBS
+    ) {
+      queueLocalToolResponse(
+        clientEntry,
+        localToolResult(
+          "Codex background-job capacity is full; collect retained results or wait for expiry.",
+          {
+            code: "capacity_exceeded",
+            activeJobs: activeJobCount(),
+            retainedJobs: jobs.size,
+            maxActiveJobs: MAX_ACTIVE_CODEX_JOBS,
+            maxRetainedJobs: MAX_RETAINED_CODEX_JOBS,
+          },
+          { isError: true },
+        ),
+      );
+      return;
+    }
+
+    const nativeId = `${privateRequestPrefix}${++privateRequestSequence}`;
+    const requestKey = idKey(msg.id);
+    const job = createJob({ nativeId, nativeToolName, startRequestKey: requestKey });
+    const nativeMsg = {
+      jsonrpc: "2.0",
+      id: nativeId,
+      method: "tools/call",
+      params: {
+        name: nativeToolName,
+        arguments: { ...msg.params.arguments },
+      },
+    };
+    jobs.set(job.jobId, job);
+    jobsByNativeRequest.set(job.nativeRequestKey, job);
+    privateJobRequestIds.add(job.nativeRequestKey);
+    if (!addInFlight(nativeMsg)) {
+      privateJobRequestIds.delete(job.nativeRequestKey);
+      removeJob(job);
+      queueLocalToolResponse(
+        clientEntry,
+        localToolResult(
+          "Could not reserve a private Codex request ID.",
+          { code: "private_request_id_collision" },
+          { isError: true },
+        ),
+      );
+      return;
+    }
+    const nativeEntry = inFlight.get(job.nativeRequestKey);
+    nativeEntry.internalJob = true;
+    nativeEntry.jobId = job.jobId;
+    prepareLocalEntry(clientEntry);
+    clientEntry.startJobId = job.jobId;
+    try {
+      const transformed = transformCodexToolCall(
+        JSON.stringify(nativeMsg),
+        { serverGoal: resolvedGoal },
+      );
+      child.stdin.write(`${transformed}\n`);
+    } catch (err) {
+      privateJobRequestIds.delete(job.nativeRequestKey);
+      settleInFlight(nativeId);
+      jobsByNativeRequest.delete(job.nativeRequestKey);
+      const message = err instanceof Error ? err.message : String(err);
+      transitionJobTerminal(job, "failed", `dispatch failed: ${message}`);
+    }
+    queueLocalToolResponse(clientEntry, startResult(job));
+  };
+  const handleJobToolCall = (msg, entry) => {
+    const toolName = msg.params?.name;
+    const args = msg.params?.arguments ?? {};
+    if (toolName === "codex-start" || toolName === "codex-reply-start") {
+      dispatchJob(msg, entry, toolName === "codex-start" ? "codex" : "codex-reply");
+      return true;
+    }
+    if (!CODEX_JOB_TOOL_CONTRACTS[toolName]) return false;
+    pruneJobs();
+    const job = jobs.get(args.jobId);
+    if (!job) {
+      queueLocalToolResponse(entry, jobNotFoundResult(args.jobId));
+      return true;
+    }
+    if (toolName === "codex-status") {
+      if (args.cursor > job.statusCursor) {
+        queueLocalToolResponse(
+          entry,
+          localToolResult(
+            `Status cursor ${args.cursor} is ahead of current cursor ${job.statusCursor}.`,
+            { code: "status_cursor_ahead", jobId: job.jobId, cursor: job.statusCursor },
+            { isError: true },
+          ),
+        );
+        return true;
+      }
+      if (isTerminalJob(job)) {
+        if (job.state !== "completed") job.terminalRead = true;
+        queueJobStatusResponse(entry, job);
+        return true;
+      }
+      const waitMs = args.wait_ms ?? DEFAULT_CODEX_WAIT_INTERVAL_MS;
+      if (args.cursor < job.statusCursor || waitMs === 0) {
+        queueJobStatusResponse(entry, job);
+        return true;
+      }
+      prepareLocalEntry(entry, "local_wait");
+      entry.waitJobId = job.jobId;
+      entry.waitCursor = args.cursor;
+      job.waiters.add(idKey(entry.id));
+      entry.localWaitTimer = setTimeout(() => {
+        if (inFlight.get(idKey(entry.id)) === entry && entry.state === "local_wait") {
+          queueJobStatusResponse(entry, job, { heartbeat: true });
+        }
+      }, waitMs);
+      if (job.statusCursor > args.cursor || isTerminalJob(job)) {
+        queueJobStatusResponse(entry, job);
+      }
+      return true;
+    }
+    if (toolName === "codex-commentary") {
+      queueLocalToolResponse(entry, commentaryResult(job, args.offset ?? 0));
+      return true;
+    }
+    if (toolName === "codex-result") {
+      queueLocalToolResponse(entry, resultPageResult(job, args.offset ?? 0));
+      return true;
+    }
+    if (toolName === "codex-cancel") {
+      requestJobCancellation(job);
+      queueLocalToolResponse(entry, jobStatusResult(job));
+      return true;
+    }
+    return false;
   };
   const emitProgressMessage = (entry, message) => {
     if (
@@ -1507,6 +2344,29 @@ function runCodexPassthrough({
       finalizing || inFlight.get(idKey(entry.id)) !== entry ||
       entry.state !== "terminal_grace"
     ) return;
+    if (entry.internalJob) {
+      const key = idKey(entry.id);
+      const job = jobs.get(entry.jobId);
+      privateJobRequestIds.delete(key);
+      suppressedResponseIds.add(key);
+      if (job?.state === "canceling") {
+        transitionJobTerminal(job, "canceled", "canceled", { threadId: entry.threadId });
+      } else if (job) {
+        transitionJobTerminal(job, "completed", "completed", {
+          resultText: entry.lastAgentMessage ?? "",
+          threadId: entry.threadId,
+        });
+      }
+      settleInFlight(entry.id);
+      if (suppressedResponseIds.size >= MAX_SUPPRESSED_CODEX_RESPONSES) {
+        setImmediate(() => finalize({
+          reason: "late-response suppression limit reached",
+          emit: true,
+          exitCode: 1,
+        }));
+      }
+      return;
+    }
     if (!canInjectGeneratedFrame()) {
       entry.fallbackReady = true;
       return;
@@ -1539,6 +2399,7 @@ function runCodexPassthrough({
   };
   const beginTerminalGrace = (entry, message) => {
     if (entry.state !== "open") return;
+    if (entry.internalJob) finishJobCommentary(jobs.get(entry.jobId));
     entry.state = "terminal_grace";
     stopEntryProgress(entry);
     entry.lastAgentMessage = typeof message === "string" ? message : "";
@@ -1552,8 +2413,15 @@ function runCodexPassthrough({
     const entry = id == null ? undefined : inFlight.get(idKey(id));
     if (!entry || entry.state === "canceled") return false;
     if (entry.state === "local_response") {
+      if (entry.startJobId) requestJobCancellation(jobs.get(entry.startJobId), "start canceled");
       rememberLocallyHandledResponse(idKey(id));
       dropQueuedLocalResponse(idKey(id));
+      settleInFlight(id);
+      return true;
+    }
+    if (entry.state === "local_wait") {
+      detachLocalWaiter(entry);
+      rememberLocallyHandledResponse(idKey(id));
       settleInFlight(id);
       return true;
     }
@@ -1597,7 +2465,11 @@ function runCodexPassthrough({
       msg && typeof msg === "object" && "id" in msg &&
       ("result" in msg || "error" in msg)
     ) {
+      const entry = inFlight.get(idKey(msg.id));
+      if (entry?.internalJob) handlePrivateResponse(entry, msg);
+      const privateJob = jobsByNativeRequest.get(idKey(msg.id));
       settleInFlight(msg.id);
+      if (privateJob) jobsByNativeRequest.delete(idKey(msg.id));
       return;
     }
     if (msg?.id != null && typeof msg.method === "string") {
@@ -1615,6 +2487,26 @@ function runCodexPassthrough({
         }
       }
       if (entry) {
+        if (entry.internalJob) {
+          try {
+            child.stdin.write(`${JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              error: {
+                code: -32601,
+                message: "mcp-agents: interactive server requests are unavailable for background jobs",
+              },
+            })}\n`);
+          } catch {}
+          const job = jobs.get(entry.jobId);
+          requestJobCancellation(job, "unsupported interactive request");
+          transitionJobTerminal(
+            job,
+            "failed",
+            "background job required unsupported interactive input",
+          );
+          return;
+        }
         serverRequestParents.set(idKey(msg.id), idKey(entry.id));
         clearTimer(entry, "idleTimer");
       }
@@ -1624,15 +2516,29 @@ function runCodexPassthrough({
     const requestId = msg.params?._meta?.requestId;
     const entry = requestId == null ? undefined : inFlight.get(idKey(requestId));
     if (!entry || entry.state !== "open") return;
+    const job = entry.internalJob ? jobs.get(entry.jobId) : undefined;
     const threadId = msg.params?._meta?.threadId;
     if (typeof threadId === "string" && threadId) entry.threadId = threadId;
+    if (job && typeof threadId === "string" && threadId) job.threadId = threadId;
     const event = msg.params?.msg;
     const eventType = event?.type;
     entry.lastActivityAt = Date.now();
+    if (job) {
+      job.lastActivityAt = entry.lastActivityAt;
+      captureJobCommentary(job, event);
+    }
     armEntryIdle(entry);
     const progressMessage = progressMessageForEvent(entry, event);
+    if (job) {
+      if (job.state === "starting" && !progressMessage) {
+        setJobStatusNow(job, "running", { state: "running" });
+      } else if (progressMessage) {
+        scheduleJobStatus(job, progressMessage);
+      }
+    }
     if (progressMessage) scheduleProgress(entry, progressMessage);
     if (eventType === "task_complete" || eventType === "turn_complete") {
+      if (job) finishJobCommentary(job);
       beginTerminalGrace(entry, event?.last_agent_message);
     }
   };
@@ -1662,6 +2568,16 @@ function runCodexPassthrough({
       .match(/"id"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|"(?:[^"\\]|\\.)*")/);
     if (!idMatch) return undefined;
     try { return JSON.parse(idMatch[1]); } catch { return undefined; }
+  };
+  const peekCorrelatedRequestId = (prefix) => {
+    const s = prefix
+      .subarray(0, Math.min(prefix.length, FRAME_HEADER_SCAN))
+      .toString("utf8");
+    const match = s.match(
+      /"requestId"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|"(?:[^"\\]|\\.)*")/,
+    );
+    if (!match) return undefined;
+    try { return JSON.parse(match[1]); } catch { return undefined; }
   };
 
   const logObservationDropOnce = () => {
@@ -1815,7 +2731,19 @@ function runCodexPassthrough({
         try {
           const m = JSON.parse(frameStr);
           outStr = frameStr;
+          const privateEntry = m && typeof m === "object" && "id" in m
+            ? inFlight.get(idKey(m.id))
+            : undefined;
           if (
+            privateEntry?.internalJob && ("result" in m || "error" in m)
+          ) {
+            handlePrivateResponse(privateEntry, m);
+            settleInFlight(m.id);
+            jobsByNativeRequest.delete(idKey(m.id));
+            privateJobRequestIds.delete(idKey(m.id));
+            suppressedResponseIds.delete(idKey(m.id));
+            outStr = null;
+          } else if (
             m && typeof m === "object" && "id" in m &&
             ("result" in m || "error" in m) &&
             suppressedResponseIds.has(idKey(m.id))
@@ -1873,8 +2801,17 @@ function runCodexPassthrough({
         );
       }
 
+      for (const job of jobs.values()) {
+        if (!isTerminalJob(job)) {
+          transitionJobTerminal(job, "failed", `bridge stopped: ${reason}`);
+        }
+      }
+
       for (const entry of inFlight.values()) {
-        if (entry.state === "canceled" || entry.state === "local_response") continue;
+        if (
+          entry.internalJob || entry.state === "canceled" ||
+          entry.state === "local_response"
+        ) continue;
         const frame = {
           jsonrpc: "2.0",
           id: entry.id,
@@ -1894,6 +2831,7 @@ function runCodexPassthrough({
     // Hygiene: drop the rewrite latch/skip state (forwarding has stopped).
     pendingToolsListIds.clear();
     suppressedResponseIds.clear();
+    privateJobRequestIds.clear();
     locallyHandledResponseIds.clear();
     serverRequestParents.clear();
     rewriteSkipUntilNewline = false;
@@ -1964,7 +2902,8 @@ function runCodexPassthrough({
   const returnToRawIfLatchClear = () => {
     if (
       !finalizing && pendingToolsListIds.size === 0 &&
-      suppressedResponseIds.size === 0 && !rewriteSkipUntilNewline &&
+      suppressedResponseIds.size === 0 && privateJobRequestIds.size === 0 &&
+      !rewriteSkipUntilNewline &&
       !rewriteDropUntilNewline && rewriteBuf.length > 0
     ) {
       forwardChunk(rewriteBuf);
@@ -2014,11 +2953,30 @@ function runCodexPassthrough({
       const frameBytes = rewriteBuf.subarray(0, nl + 1); // original bytes incl. delimiter
       rewriteBuf = rewriteBuf.subarray(nl + 1); // consume-first: never re-forward, never wedge
       if (nl > MAX_BUFFER_BYTES) {
-        // Complete frame larger than the cap: forward raw without parsing (mirrors
-        // observeOutgoing's oversized branch), releasing only a matching pending id.
+        // Complete frame larger than the cap: classify it from a bounded prefix.
+        // Private job frames are suppressed; unrelated public frames stay raw.
         logRewriteDropOnce();
         const pid = peekResponseId(frameBytes);
         const key = pid === undefined ? undefined : idKey(pid);
+        const privateJob = key === undefined ? undefined : jobsByNativeRequest.get(key);
+        if (privateJob) {
+          privateJobRequestIds.delete(key);
+          suppressedResponseIds.delete(key);
+          jobsByNativeRequest.delete(key);
+          transitionJobTerminal(
+            privateJob,
+            "failed",
+            "native result exceeded the 10 MiB background-job capture limit",
+          );
+          continue;
+        }
+        const correlatedId = peekCorrelatedRequestId(frameBytes);
+        if (
+          correlatedId !== undefined &&
+          jobsByNativeRequest.has(idKey(correlatedId))
+        ) {
+          continue;
+        }
         if (key !== undefined && suppressedResponseIds.has(key)) {
           suppressedResponseIds.delete(key);
           continue;
@@ -2034,12 +2992,22 @@ function runCodexPassthrough({
         const msg = JSON.parse(
           frameBytes.subarray(0, frameBytes.length - 1).toString("utf8"),
         );
-        if (
+        const correlatedId = msg?.params?._meta?.requestId;
+        const privateCorrelatedJob = correlatedId == null
+          ? undefined
+          : jobsByNativeRequest.get(idKey(correlatedId));
+        if (privateCorrelatedJob && typeof msg.method === "string") {
+          outBuf = null;
+        } else if (
           msg && typeof msg === "object" && "id" in msg &&
           ("result" in msg || "error" in msg)
         ) {
           const key = idKey(msg.id);
-          if (suppressedResponseIds.has(key)) {
+          if (jobsByNativeRequest.has(key)) {
+            privateJobRequestIds.delete(key);
+            suppressedResponseIds.delete(key);
+            outBuf = null;
+          } else if (suppressedResponseIds.has(key)) {
             suppressedResponseIds.delete(key);
             outBuf = null;
           } else if (pendingToolsListIds.has(key)) {
@@ -2061,7 +3029,28 @@ function runCodexPassthrough({
       logRewriteDropOnce();
       const pid = peekResponseId(rewriteBuf);
       const key = pid === undefined ? undefined : idKey(pid);
-      if (key !== undefined && suppressedResponseIds.has(key)) {
+      const privateJob = key === undefined ? undefined : jobsByNativeRequest.get(key);
+      const correlatedId = peekCorrelatedRequestId(rewriteBuf);
+      const privateCorrelated = correlatedId === undefined
+        ? undefined
+        : jobsByNativeRequest.get(idKey(correlatedId));
+      if (privateJob || privateCorrelated) {
+        if (privateJob) {
+          transitionJobTerminal(
+            privateJob,
+            "failed",
+            "native result exceeded the 10 MiB background-job capture limit",
+          );
+          privateJobRequestIds.delete(key);
+          suppressedResponseIds.delete(key);
+          jobsByNativeRequest.delete(key);
+          rewriteDropReleaseId = key;
+        } else {
+          rewriteDropReleaseId = undefined;
+        }
+        rewriteBuf = Buffer.alloc(0);
+        rewriteDropUntilNewline = true;
+      } else if (key !== undefined && suppressedResponseIds.has(key)) {
         rewriteDropReleaseId = key;
         rewriteBuf = Buffer.alloc(0);
         rewriteDropUntilNewline = true;
@@ -2083,17 +3072,18 @@ function runCodexPassthrough({
   };
 
   // Forward codex stdout to the client. Steady state is a byte-for-byte raw
-  // passthrough (forwardChunk); while a tools/list response is pending the
-  // forwarder buffers and rewrites that one frame (bufferModeForward) to advertise
-  // the curated wrapper schemas. Observation runs on the ORIGINAL bytes and stays the sole
-  // authority for clearing in-flight ids — by the time it runs, every complete
-  // frame in this chunk was already forwarded/queued, so it never leads forwarding.
+  // passthrough (forwardChunk). A tools/list response or private background job
+  // activates bounded frame mode for schema rewriting or private-frame filtering.
+  // Observation runs on the ORIGINAL bytes and stays the sole authority for
+  // clearing in-flight ids — by the time it runs, every complete frame in this
+  // chunk was already forwarded/queued, so it never leads forwarding.
   child.stdout.on("data", (chunk) => {
     if (finalizing) return; // stream ownership has been taken over
 
     if (
       pendingToolsListIds.size > 0 || suppressedResponseIds.size > 0 ||
-      rewriteBuf.length > 0 || rewriteSkipUntilNewline || rewriteDropUntilNewline
+      privateJobRequestIds.size > 0 || rewriteBuf.length > 0 ||
+      rewriteSkipUntilNewline || rewriteDropUntilNewline
     ) {
       bufferModeForward(chunk);
     } else {
@@ -2142,6 +3132,28 @@ function runCodexPassthrough({
     let msg;
     try { msg = JSON.parse(trimmed); } catch { return true; }
     if (!msg || typeof msg !== "object") return true;
+    if (
+      msg.id != null && typeof msg.method === "string" &&
+      typeof msg.id === "string" && msg.id.startsWith(privateRequestPrefix)
+    ) {
+      if (!addInFlight(msg)) return false;
+      const requestKey = idKey(msg.id);
+      const entry = inFlight.get(requestKey);
+      prepareLocalEntry(entry);
+      queueGeneratedFrame(
+        {
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: {
+            code: -32600,
+            message: "mcp-agents: request id uses the reserved private-job namespace",
+          },
+        },
+        { requestKey, kind: "local_response" },
+      );
+      flushGeneratedFrames();
+      return false;
+    }
     if (msg.method === "notifications/cancelled") {
       const rid = msg.params?.requestId;
       if (rid != null && locallyHandledResponseIds.has(idKey(rid))) return false;
@@ -2191,6 +3203,9 @@ function runCodexPassthrough({
           `[mcp-agents] rejected invalid ${validation.toolName} call; fields: ${fields}`,
         );
         flushGeneratedFrames();
+        return false;
+      }
+      if (msg.method === "tools/call" && handleJobToolCall(msg, inFlight.get(idKey(msg.id)))) {
         return false;
       }
       if (msg.method === "tools/list") {

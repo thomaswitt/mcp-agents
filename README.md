@@ -228,6 +228,51 @@ at 200 Unicode code points. Native `codex/event` frames remain byte-for-byte
 unchanged; progress is a parallel MCP channel and is normally UI status rather
 than additional tool-result/model context.
 
+**Optional background jobs.** Existing `codex` and `codex-reply` calls remain
+blocking and keep their current behavior. Clients that need transcript-visible
+updates can instead use the six wrapper-owned job tools advertised by the Codex
+bridge:
+
+| Tool | Purpose |
+| --- | --- |
+| `codex-start` | Start a job with the same arguments as `codex` |
+| `codex-reply-start` | Start a reply with the same arguments as `codex-reply` |
+| `codex-status` | Long-poll status using the returned `jobId` and `cursor` |
+| `codex-commentary` | Read retained commentary from an absolute offset |
+| `codex-result` | Read the terminal answer in bounded pages |
+| `codex-cancel` | Idempotently request cancellation |
+
+The start result returns immediately with an opaque `jobId`, status `cursor`,
+and the next suggested call. Repeated `codex-status` calls produce ordinary MCP
+tool results, so an outer agent or subagent can relay what Codex is doing even
+when its UI does not render `notifications/progress`. At the current cursor a
+status call waits up to 10 seconds by default for a change, then returns a
+heartbeat; `wait_ms` may be set from `0` to `60000`.
+
+When `commentaryEndOffset` advances, call `codex-commentary` with the last
+`nextOffset`. Commentary contains only Codex messages explicitly marked with
+the `commentary` phase. Hidden reasoning, prompts, final-answer drafts, command
+strings and output, tool arguments, paths, search queries, and raw response
+items are excluded. Unsafe terminal controls are stripped, but the remaining
+text is model-authored and must still be treated as untrusted. Offsets count
+Unicode code points. Each read returns at most 32,768 code points; the bridge
+retains a one-MiB UTF-8 tail and reports absolute truncation boundaries when
+older commentary has fallen out of the buffer.
+
+Once status is terminal, use `codex-result` and continue from `nextOffset` until
+`done` is true. Each page returns its payload as both ordinary MCP text content
+and `structuredContent.text` for clients that prioritize structured results.
+Result pages are also capped at 32,768 code points. A native
+result frame larger than the bridge's 10 MiB capture limit fails the job
+atomically instead of leaking its private response onto the MCP transport.
+
+Jobs are deliberately connection-local: restarting or reconnecting the MCP
+server loses them. At most eight jobs may be active and 32 records retained;
+terminal records expire after one hour. Cancellation has the same bounded
+settlement semantics as a blocking call, so inspect the working tree before
+retrying a canceled write-capable job. The job API is a call-level opt-in and
+does not require MCP Tasks support from the client.
+
 These notices deliberately keep a progress-aware client's idle window alive,
 leaving liveness authority with the wrapper's idle and hard deadlines. They do
 not refresh `--codex_idle_timeout`, extend the wrapper's hard deadline, or
@@ -376,17 +421,19 @@ npm run bench:mcp-startup
 This measures MCP launch through `initialize` and `tools/list`; it does not call
 the provider model/tool.
 
-For a manual end-to-end progress check, invoke `codex` from a Claude Code
-subagent and verify that commentary/lifecycle messages appear while the tool
-call remains blocking, followed by exactly one final tool result. This smoke
-check depends on the installed Claude Code UI and is intentionally not a
-deterministic test-suite gate.
+For a manual end-to-end background check, have Claude Code call `codex-start`,
+poll `codex-status` at least twice, read advancing commentary offsets, and then
+read the literal final token with `codex-result`. Repeat inside a Claude
+subagent to confirm both contexts share the MCP connection and receive ordinary
+tool results. This smoke check uses real model calls and remains separate from
+the deterministic test-suite gate.
 
 ## How it works
 
 1. An MCP client connects over stdio
 2. The server reads `--provider <name>` from its argv (defaults to `codex`)
-3. It registers a single tool matching that provider's CLI
+3. Claude and Gemini register one CLI tool; Codex forwards its native tools and
+   adds the optional background-job tools described above
 4. Client calls `tools/call` with the tool name and a `prompt`
 5. The server runs the CLI as a child process and returns tool text (Claude JSON `result`, or stdout/stderr for other providers)
 

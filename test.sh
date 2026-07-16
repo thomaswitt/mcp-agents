@@ -851,7 +851,7 @@ EOF
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 
-const [stubDir, serverDir] = process.argv.slice(2);
+const [stubDir, serverDir, mode = "async"] = process.argv.slice(2);
 const invalid = (id) => ({
   jsonrpc: "2.0",
   ...(id === undefined ? {} : { id }),
@@ -1302,7 +1302,9 @@ fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`
 fs.writeFileSync(process.env.MCP_AGENTS_TEST_PID_FILE, String(process.pid));
 
 const timers = [];
-const threadId = (id) => `00000000-0000-4000-8000-${String(id).padStart(12, "0")}`;
+const threadId = (id) => typeof id === "number"
+  ? `00000000-0000-4000-8000-${String(id).padStart(12, "0")}`
+  : "00000000-0000-4000-8000-999999999999";
 const send = (message, callback) => process.stdout.write(`${JSON.stringify(message)}\n`, callback);
 const eventMessage = (requestId, type, extra = {}) => ({
   jsonrpc: "2.0",
@@ -1327,7 +1329,9 @@ const later = (delay, fn) => timers.push(setTimeout(fn, delay));
 const every = (delay, fn) => timers.push(setInterval(fn, delay));
 
 function startCall(id) {
-  event(id, "session_configured", { thread_id: threadId(id) });
+  if (mode !== "asyncwaitcancel") {
+    event(id, "session_configured", { thread_id: threadId(id) });
+  }
   switch (mode) {
     case "stderr":
       every(30, () => process.stderr.write("still noisy\n"));
@@ -1376,6 +1380,61 @@ function startCall(id) {
       later(30, () => event(id, "plan_update", { plan: [{ step: "Latest status", status: "in_progress" }] }));
       later(40, () => event(id, "plan_update", { plan: [{ step: "Latest status", status: "in_progress" }] }));
       later(140, () => result(id, "COALESCED"));
+      break;
+    case "async":
+      event(id, "item_started", { item: { type: "AgentMessage", id: `async-commentary-${id}`, phase: "commentary" } });
+      later(30, () => event(id, "agent_message_content_delta", { item_id: `async-commentary-${id}`, delta: "Inspecting the " }));
+      later(80, () => event(id, "agent_message_content_delta", { item_id: `async-commentary-${id}`, delta: "bridge 🚀\n" }));
+      later(120, () => event(id, "item_completed", { item: { type: "AgentMessage", id: `async-commentary-${id}`, phase: "commentary", content: [{ type: "Text", text: "Inspecting the bridge 🚀\n" }] } }));
+      later(150, () => event(id, "plan_update", { plan: [{ step: "Finish async verification", status: "in_progress" }] }));
+      later(260, () => result(id, "ASYNC_RESULT"));
+      break;
+    case "asyncfallback":
+      event(id, "agent_message", { phase: "commentary", message: "Fallback commentary" });
+      later(80, () => event(id, "task_complete", { last_agent_message: "FALLBACK_RESULT" }));
+      later(260, () => result(id, "LATE_PRIVATE_RESULT"));
+      break;
+    case "asynccancel":
+      event(id, "task_started");
+      later(30, () => event(id, "agent_message", { phase: "commentary", message: "Waiting for cancellation" }));
+      break;
+    case "asyncprivacy":
+      event(id, "item_started", { item: { type: "AgentMessage", id: `private-safe-${id}`, phase: "commentary" } });
+      later(30, () => event(id, "agent_message_content_delta", { item_id: `private-safe-${id}`, delta: "Safe\u0000\ncommentary\u202e" }));
+      later(60, () => event(id, "item_started", { item: { type: "AgentMessage", id: `private-final-${id}`, phase: "final_answer" } }));
+      later(70, () => event(id, "agent_message_content_delta", { item_id: `private-final-${id}`, delta: "SENTINEL_FINAL" }));
+      later(80, () => event(id, "raw_response_item", { prompt: "SENTINEL_PROMPT", reasoning: "SENTINEL_REASONING" }));
+      later(90, () => event(id, "exec_command_end", { output: "SENTINEL_OUTPUT", exit_code: 0 }));
+      later(100, () => event(id, "item_completed", { item: { type: "AgentMessage", id: `private-safe-${id}`, phase: "commentary", content: [{ type: "Text", text: "Safe\ncommentary" }] } }));
+      later(110, () => event(id, "agent_message", { phase: "commentary", message: "SENTINEL_DUPLICATE_CHANNEL" }));
+      later(220, () => result(id, "PRIVACY_RESULT"));
+      break;
+    case "asynctruncate":
+      event(id, "item_started", { item: { type: "AgentMessage", id: `truncate-${id}`, phase: "commentary" } });
+      later(30, () => event(id, "agent_message_content_delta", { item_id: `truncate-${id}`, delta: "0123456789".repeat(20) }));
+      later(100, () => event(id, "item_completed", { item: { type: "AgentMessage", id: `truncate-${id}`, phase: "commentary", content: [{ type: "Text", text: "0123456789".repeat(20) }] } }));
+      later(220, () => result(id, "TRUNCATE_RESULT"));
+      break;
+    case "asyncpage":
+      event(id, "task_started");
+      later(120, () => result(id, "R".repeat(32780)));
+      break;
+    case "asyncoversize":
+      event(id, "task_started");
+      later(120, () => result(id, "O".repeat((10 * 1024 * 1024) + 1024)));
+      break;
+    case "asyncconcurrent":
+      if (typeof id === "string") {
+        event(id, "agent_message", { phase: "commentary", message: "Background is active" });
+        later(300, () => result(id, "BACKGROUND_RESULT"));
+      } else {
+        event(id, "task_started");
+        later(80, () => result(id, "BLOCKING_RESULT"));
+      }
+      break;
+    case "asyncwaitcancel":
+      later(180, () => event(id, "task_started"));
+      later(320, () => result(id, "WAIT_CANCEL_RESULT"));
       break;
     case "wait":
       later(650, () => event(id, "unknown_activity", { secret: "SENTINEL_WAIT" }));
@@ -1593,6 +1652,262 @@ process.once("SIGTERM", () => {
 EOF
 }
 
+# Drives the wrapper-owned background-job tools against the lifecycle stub.
+write_codex_job_driver() {
+  cat >"$1/job-driver.mjs" <<'EOF'
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+const [stubDir, serverDir, mode = "async"] = process.argv.slice(2);
+const pidFile = `${stubDir}/codex.pid`;
+const callFile = `${stubDir}/calls.jsonl`;
+const child = spawn(
+  "node",
+  ["server.js", "--provider", "codex", "--codex_idle_timeout", "2", "--timeout", "4"],
+  {
+    cwd: serverDir,
+    env: {
+      ...process.env,
+      PATH: `${stubDir}:${process.env.PATH}`,
+      MCP_STUB_LIFECYCLE_MODE: mode,
+      MCP_AGENTS_TEST_PID_FILE: pidFile,
+      MCP_AGENTS_TEST_CALL_CAPTURE: callFile,
+      MCP_AGENTS_CODEX_TERMINAL_GRACE_MS: "80",
+      MCP_AGENTS_CODEX_CANCEL_GRACE_MS: "100",
+      MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS: "20",
+      MCP_AGENTS_CODEX_WAIT_INTERVAL_MS: "100",
+      MCP_AGENTS_TEST_PRIVATE_PREFIX: "mcp-agents/job/test/",
+      ...(mode === "asynctruncate" ? { MCP_AGENTS_TEST_COMMENTARY_BYTES: "64" } : {}),
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  },
+);
+let out = "";
+let err = "";
+let parseBuf = "";
+let nextId = 2;
+let jobId;
+let commentaryOffset = 0;
+let commentaryInFlight = false;
+let resultRequested = false;
+let resultOffset = 0;
+let resultComplete = false;
+let canceledWaitId;
+let done = false;
+const requestNames = new Map();
+const statusResults = [];
+const commentaryResults = [];
+const resultResults = [];
+const cancelResults = [];
+const blockingResults = [];
+child.stdin.on("error", () => {});
+child.stderr.on("data", (data) => { err += data.toString(); });
+const send = (message) => {
+  if (child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
+};
+const callTool = (name, args) => {
+  const id = nextId++;
+  requestNames.set(id, name);
+  send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+  return id;
+};
+const poll = (cursor) => callTool("codex-status", { jobId, cursor, wait_ms: 200 });
+const maybeFinish = () => {
+  if (!resultComplete) return;
+  if (mode === "asyncconcurrent" && blockingResults.length === 0) return;
+  finish();
+};
+const finish = () => {
+  if (done) return;
+  done = true;
+  setTimeout(() => { try { child.stdin.end(); } catch {} }, mode === "asyncfallback" ? 400 : 100);
+};
+const onFrame = (frame) => {
+  if (frame.id === 1 && frame.result) {
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    send({ jsonrpc: "2.0", id: "mcp-agents/job/test/client", method: "ping", params: {} });
+    callTool("codex-start", {
+      prompt: "exercise async bridge",
+      cwd: serverDir,
+      sandbox: "read-only",
+      model_reasoning_effort: "xhigh",
+    });
+    return;
+  }
+  const requestName = requestNames.get(frame.id);
+  if (!requestName || !frame.result) return;
+  const structured = frame.result.structuredContent ?? {};
+  if (requestName === "codex-start") {
+    jobId = structured.jobId;
+    if (mode === "asynccancel") {
+      callTool("codex-cancel", { jobId });
+    } else if (mode === "asyncwaitcancel") {
+      canceledWaitId = callTool("codex-status", {
+        jobId,
+        cursor: structured.cursor,
+        wait_ms: 1_000,
+      });
+      setTimeout(() => send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: canceledWaitId, reason: "test waiter cancellation" },
+      }), 20);
+      setTimeout(() => poll(structured.cursor), 50);
+    } else {
+      if (mode === "asyncconcurrent") {
+        callTool("codex", {
+          prompt: "blocking call during background job",
+          cwd: serverDir,
+          sandbox: "read-only",
+          model_reasoning_effort: "xhigh",
+        });
+      }
+      poll(structured.cursor);
+    }
+    return;
+  }
+  if (requestName === "codex-status") {
+    statusResults.push({ ...structured, text: frame.result.content?.[0]?.text });
+    if (
+      structured.commentaryEndOffset > commentaryOffset &&
+      !commentaryInFlight
+    ) {
+      commentaryInFlight = true;
+      callTool("codex-commentary", { jobId, offset: commentaryOffset });
+    }
+    if (["completed", "failed", "canceled"].includes(structured.state)) {
+      if (!resultRequested) {
+        resultRequested = true;
+        callTool("codex-result", { jobId, offset: 0 });
+      }
+    } else {
+      poll(structured.cursor);
+    }
+    return;
+  }
+  if (requestName === "codex-commentary") {
+    commentaryResults.push({ ...structured, text: frame.result.content?.[0]?.text });
+    commentaryOffset = structured.nextOffset;
+    commentaryInFlight = false;
+    return;
+  }
+  if (requestName === "codex-result") {
+    resultResults.push({
+      ...structured,
+      structuredText: structured.text,
+      text: frame.result.content?.[0]?.text,
+    });
+    if (structured.state !== "completed") {
+      resultComplete = true;
+      maybeFinish();
+      return;
+    }
+    resultOffset = structured.nextOffset;
+    if (structured.done) {
+      resultComplete = true;
+      maybeFinish();
+    } else {
+      callTool("codex-result", { jobId, offset: resultOffset });
+    }
+    return;
+  }
+  if (requestName === "codex-cancel") {
+    cancelResults.push({ ...structured, text: frame.result.content?.[0]?.text });
+    return;
+  }
+  if (requestName === "codex") {
+    blockingResults.push({ ...structured, text: frame.result.content?.[0]?.text });
+    maybeFinish();
+  }
+};
+child.stdout.on("data", (data) => {
+  const chunk = data.toString();
+  out += chunk;
+  parseBuf += chunk;
+  let newline;
+  while ((newline = parseBuf.indexOf("\n")) !== -1) {
+    const line = parseBuf.slice(0, newline); parseBuf = parseBuf.slice(newline + 1);
+    let frame; try { frame = JSON.parse(line); } catch { continue; }
+    onFrame(frame);
+  }
+});
+const bootTimer = setInterval(() => {
+  try { readFileSync(pidFile, "utf8"); } catch { return; }
+  clearInterval(bootTimer);
+  send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "job-test", version: "0" },
+    },
+  });
+}, 10);
+const timeout = setTimeout(() => {
+  try { child.kill("SIGTERM"); } catch {}
+}, 4_000);
+child.once("close", (code, signal) => {
+  clearInterval(bootTimer);
+  clearTimeout(timeout);
+  let frames = [];
+  let parseErrors = 0;
+  for (const line of out.split("\n").filter(Boolean)) {
+    try { frames.push(JSON.parse(line)); } catch { parseErrors += 1; }
+  }
+  let calls = [];
+  try {
+    calls = readFileSync(callFile, "utf8")
+      .split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch {}
+  const privateIds = calls.map((call) => call.id).filter((id) => typeof id === "string");
+  const rawFrames = JSON.stringify(frames);
+  process.stdout.write(`${JSON.stringify({
+    code,
+    signal,
+    jobId,
+    statusResults,
+    commentaryResults,
+    resultResults,
+    cancelResults,
+    blockingResults,
+    canceledWaitId,
+    frames,
+    calls,
+    parseErrors,
+    privateIds,
+    privateIdLeaked: privateIds.some((id) => rawFrames.includes(id)),
+    stderr: err,
+  })}\n`);
+});
+EOF
+}
+
+test_codex_job_lifecycle() {
+  local label="$1" predicate="$2" mode="${3:-async}" tmpdir status summary ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  write_codex_lifecycle_stub "$tmpdir"
+  write_codex_job_driver "$tmpdir"
+  set +e
+  summary=$($TIMEOUT_CMD 8 node "$tmpdir/job-driver.mjs" "$tmpdir" "$(pwd)" "$mode" 2>/dev/null)
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  printf '%s' "$summary" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Summary: ${summary:0:10000}"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 test_codex_lifecycle() {
   local label="$1" mode="$2" idle="$3" hard="$4" settle="$5"
   local terminal="$6" cancel="$7" progress="$8" predicate="$9"
@@ -1708,6 +2023,14 @@ test_codex_rejects_call "codex-reply rejects inherited session controls" \
   '{"prompt":"continue","threadId":"abc","sandbox":"read-only","model_reasoning_effort":"max","cwd":"/tmp/work"}' \
   '(.error.data.issues | map(.argument) | sort) == ["cwd","model_reasoning_effort","sandbox"]' \
   "codex-reply"
+test_codex_rejects_call "codex-status rejects missing cursor and invalid wait" \
+  '{"jobId":"job","wait_ms":60001}' \
+  '(.error.data.issues | map(.argument) | sort) == ["cursor","wait_ms"]' \
+  "codex-status"
+test_codex_rejects_call "codex-commentary rejects malformed job and offset" \
+  '{"jobId":"","offset":-1}' \
+  '(.error.data.issues | map(.argument) | sort) == ["jobId","offset"]' \
+  "codex-commentary"
 test_codex_local_response_lifecycle "codex local validation responses remain frame-safe and cancelable"
 
 # Stub-based Codex tools/list schema tests (fast — no real Codex needed).
@@ -1716,6 +2039,18 @@ test_codex_local_response_lifecycle "codex local validation responses remain fra
 test_codex_toolslist_rewrite "tools/list advertises exact curated argument sets" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties|keys) == ["cwd","goal","model_reasoning_effort","prompt","sandbox"] and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|keys) == ["goal","prompt","threadId"])'
+test_codex_toolslist_rewrite "tools/list advertises all optional Codex job tools" \
+  "normal" \
+  'select(.id==2) | ([.result.tools[].name | select(startswith("codex-"))] | sort) == ["codex-cancel","codex-commentary","codex-reply","codex-reply-start","codex-result","codex-start","codex-status"]'
+test_codex_toolslist_rewrite "Codex job tools use exact closed schemas" \
+  "normal" \
+  'select(.id==2) | (.result.tools | map({key:.name,value:.}) | from_entries) as $t |
+   (($t["codex-start"].inputSchema == $t.codex.inputSchema) and
+    ($t["codex-reply-start"].inputSchema == $t["codex-reply"].inputSchema) and
+    ($t["codex-status"].inputSchema | (.additionalProperties == false) and (.required == ["jobId","cursor"]) and (.properties.wait_ms.maximum == 60000)) and
+    ($t["codex-commentary"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])) and
+    ($t["codex-result"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])) and
+    ($t["codex-cancel"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])))'
 test_codex_toolslist_rewrite "tools/list advertises exact xhigh|max effort on codex only" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["xhigh","max"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
@@ -1899,6 +2234,101 @@ test_codex_lifecycle "codex cancellation tears wrapper down after bounded grace"
   '(.code == 1) and (.elapsedMs < 1000) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and (has("result") or has("error")))] | length == 0) and
    ([.frames[] | select(.id == 3 and .error.code == -32001)] | length == 1)'
+
+test_codex_job_lifecycle "Codex background job exposes status, commentary, and result without private-id leakage" \
+  '(.code == 0) and (.parseErrors == 0) and
+   (.jobId | type == "string") and
+   (.calls | length == 1) and (.calls[0].id | startswith("mcp-agents/job/test/")) and
+   (.privateIdLeaked == false) and
+   ([.frames[] | select(.id == "mcp-agents/job/test/client" and .error.code == -32600)] | length == 1) and
+   ([.frames[] | select(.method == "codex/event")] | length == 0) and
+   ([.statusResults[] | select(.state == "running")] | length >= 1) and
+   ([.statusResults[] | select(.state == "completed" and .resultAvailable == true)] | length == 1) and
+   ([.commentaryResults[] | select((.text | contains("Inspecting the")) and .state == "running")] | length >= 1) and
+   ((.commentaryResults | map(.text) | join("")) == "Inspecting the bridge 🚀\n\n") and
+   (.resultResults | length == 1) and
+   (.resultResults[0] | (.state == "completed") and (.offset == 0) and
+    (.nextOffset == 12) and (.endOffset == 12) and (.done == true) and
+    (.resultTruncated == false) and (.text == "ASYNC_RESULT") and
+    (.structuredText == "ASYNC_RESULT"))'
+test_codex_job_lifecycle "Codex background job terminal fallback suppresses its late native response" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   ([.frames[] | select(.method == "codex/event")] | length == 0) and
+   ([.statusResults[] | select(.state == "completed")] | length == 1) and
+   (.resultResults | length == 1) and (.resultResults[0].text == "FALLBACK_RESULT") and
+   ([.frames[] | select(.result.structuredContent.content == "LATE_PRIVATE_RESULT")] | length == 0)' \
+  "asyncfallback"
+test_codex_job_lifecycle "Codex background job cancellation is visible and never emits a private-id error" \
+  '(.code == 1) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   (.cancelResults | length == 1) and (.cancelResults[0].state == "canceling") and
+   ([.frames[] | select(.method == "codex/event")] | length == 0) and
+   ([.frames[] | select((.error.message? // "") | contains("request was still open"))] | length == 0)' \
+  "asynccancel"
+test_codex_job_lifecycle "Codex commentary exposes only explicit commentary and strips unsafe controls" \
+  '(.code == 0) and (.parseErrors == 0) and
+   ((.commentaryResults | map(.text) | join("")) == "Safe\ncommentary\n\n") and
+   ((.commentaryResults | map(.text) | join("")) | contains("SENTINEL_") | not) and
+   (.resultResults[0].text == "PRIVACY_RESULT")' \
+  "asyncprivacy"
+test_codex_job_lifecycle "Codex commentary reports absolute offsets after tail truncation" \
+  '(.code == 0) and (.parseErrors == 0) and
+   ([.commentaryResults[] | select(
+      .requestedOffset == 0 and .startOffset > 0 and
+      .truncatedBefore == true and .endOffset > .startOffset
+    )] | length == 1) and
+   ([.statusResults[] | select(
+      .state == "completed" and .commentaryTruncated == true and
+      .commentaryStartOffset > 0 and .commentaryEndOffset == 202
+    )] | length == 1) and
+   ((.commentaryResults | map(.text) | join("")) | endswith("\n\n")) and
+   (.resultResults[0].text == "TRUNCATE_RESULT")' \
+  "asynctruncate"
+test_codex_job_lifecycle "Codex background results page without truncation" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   (.resultResults | length == 2) and
+   (.resultResults[0] | (.offset == 0) and (.nextOffset == 32768) and
+    (.endOffset == 32780) and (.done == false) and (.resultTruncated == false) and
+    ((.text | length) == 32768) and (.structuredText == .text)) and
+   (.resultResults[1] | (.offset == 32768) and (.nextOffset == 32780) and
+    (.endOffset == 32780) and (.done == true) and ((.text | length) == 12) and
+    (.structuredText == .text)) and
+   ((.resultResults | map(.text) | join("") | length) == 32780)' \
+  "asyncpage"
+test_codex_job_lifecycle "Oversized Codex background results fail atomically without leaking" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   ([.statusResults[] | select(
+      .state == "failed" and (.message | contains("10 MiB"))
+    )] | length == 1) and
+   (.resultResults | length == 1) and
+   (.resultResults[0].state == "failed") and
+   (.resultResults[0].resultAvailable == false) and
+   ([.frames[] | select(.method == "codex/event")] | length == 0) and
+   ([.frames[] | select(
+      (.result.structuredContent.content? // "" | length) > 10485760
+    )] | length == 0)' \
+  "asyncoversize"
+test_codex_job_lifecycle "Codex blocking calls remain isolated while a background job runs" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   (.calls | length == 2) and
+   ([.calls[] | select(.id | type == "string")] | length == 1) and
+   ([.calls[] | select(.id | type == "number")] | length == 1) and
+   (.blockingResults | length == 1) and
+   (.blockingResults[0].text == "BLOCKING_RESULT") and
+   (.resultResults | length == 1) and
+   (.resultResults[0].text == "BACKGROUND_RESULT") and
+   ([.frames[] | select(
+      .method == "codex/event" and (.params._meta.requestId | type == "number")
+    )] | length >= 1)' \
+  "asyncconcurrent"
+test_codex_job_lifecycle "Canceling a status wait leaves its Codex job running" \
+  '.canceledWaitId as $wait |
+   (.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   (.canceledWaitId | type == "number") and
+   ([.frames[] | select(.id == $wait)] | length == 0) and
+   ([.statusResults[] | select(.state == "completed")] | length == 1) and
+   (.resultResults | length == 1) and
+   (.resultResults[0].text == "WAIT_CANCEL_RESULT")' \
+  "asyncwaitcancel"
 
 # Stub-based codex watchdog/child-death tests (fast — no real codex needed)
 run_codex_watchdog_case "codex idle watchdog synthesizes error for stalled call" \

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Add optional `codex-start` and `codex-reply-start` background calls with
+  connection-local status, commentary, paged result, and cancellation tools
+- Make background progress available as ordinary MCP tool results so parent
+  agents can poll and relay Codex work without depending on UI rendering of
+  progress notifications
+
+### Security
+
+- Keep native background request IDs and correlated event frames private while
+  allowing blocking Codex calls to continue on the same transport
+- Expose only explicitly attributed commentary, strip unsafe terminal controls,
+  and bound retained commentary, result capture, pagination, active jobs, and
+  record lifetime
+
 ## [0.16.0] - 2026-07-15
 
 ### Changed
