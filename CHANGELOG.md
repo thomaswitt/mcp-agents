@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Let new Codex sessions select `gpt-5.6-sol` or the faster
+  `gpt-5.6-terra`, plus `medium`, `high`, `xhigh`, or `max` reasoning;
+  keep `gpt-5.6-sol` at `xhigh` as the server default and make replies inherit
+  both choices
 - Add optional `codex-start` and `codex-reply-start` background calls with
   connection-local status, commentary, paged result, and cancellation tools
 - Make background progress available as ordinary MCP tool results so parent

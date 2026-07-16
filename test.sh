@@ -678,10 +678,13 @@ run_codex_watchdog_case() {
   rm -rf "$tmpdir"
 }
 
-# ── Helper: an accepted codex-reply with no goal is forwarded byte-for-byte ──
-# (no JSON re-serialization), preserving MCP stdio framing exactly.
-test_codex_reply_passes_through_unmodified() {
+# ── Helper: an accepted Codex call requiring no wrapper transformation is ──
+# forwarded byte-for-byte (no JSON re-serialization), preserving MCP stdio
+# framing exactly.
+test_codex_call_passes_through_unmodified() {
   local label="$1"
+  local tool_name="$2"
+  local arguments_json="$3"
   local tmpdir capture output_file status input captured
   echo "--- $label ---"
 
@@ -691,9 +694,7 @@ test_codex_reply_passes_through_unmodified() {
   : >"$capture"
   write_codex_capture_stub "$tmpdir"
 
-  # Multibyte UTF-8 in the prompt: proves the raw-byte buffering forwards
-  # non-ASCII content intact (the motivation for the Buffer rewrite).
-  input='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex-reply","arguments":{"prompt":"höhö 日本語 🚀 — ünïcödé","threadId":"thread-123"}}}'
+  input="{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool_name\",\"arguments\":$arguments_json}}"
 
   set +e
   {
@@ -1960,17 +1961,33 @@ test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 # Stub-based strict Codex contract tests (fast — no real Codex needed).
 test_codex_bridge_config_defaults "codex bridge writes lean isolated config"
 test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclusive temp"
-test_codex_reply_passes_through_unmodified "codex-reply forwards an accepted no-goal call byte-for-byte"
+test_codex_call_passes_through_unmodified \
+  "codex-reply forwards an accepted no-goal call byte-for-byte" \
+  "codex-reply" \
+  '{"prompt":"höhö 日本語 🚀 — ünïcödé","threadId":"thread-123"}'
+test_codex_call_passes_through_unmodified \
+  "codex forwards omitted selectors byte-for-byte" \
+  "codex" \
+  '{"prompt":"höhö 日本語 🚀 — ünïcödé","cwd":"/tmp/work","sandbox":"read-only"}'
 
-# Accepted initial calls translate effort into native config and may inject goal.
-test_codex_call_transform "codex translates per-session xhigh effort" \
+# Accepted initial calls preserve a curated model, translate effort into native
+# config, and may inject goal.
+test_codex_call_transform "codex forwards per-session Sol model with medium effort" \
   "" \
-  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only","model_reasoning_effort":"xhigh"}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (.cwd == "/tmp/work") and (.sandbox == "read-only") and (.config == {"model_reasoning_effort":"xhigh"}))'
-test_codex_call_transform "codex translates per-session max effort" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only","model":"gpt-5.6-sol","model_reasoning_effort":"medium"}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.model == "gpt-5.6-sol") and (.cwd == "/tmp/work") and (.sandbox == "read-only") and (.config == {"model_reasoning_effort":"medium"}))'
+test_codex_call_transform "codex forwards per-session Terra model with high effort" \
+  "" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model":"gpt-5.6-terra","model_reasoning_effort":"high"}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.model == "gpt-5.6-terra") and (.config == {"model_reasoning_effort":"high"}))'
+test_codex_call_transform "codex translates per-session max effort without model override" \
   "" \
   '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"max"}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (.config == {"model_reasoning_effort":"max"}))'
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (has("model")|not) and (.config == {"model_reasoning_effort":"max"}))'
+test_codex_call_transform "codex preserves omitted selectors for native defaults" \
+  "" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only"}' \
+  '.params.arguments | ((has("model")|not) and (has("model_reasoning_effort")|not) and (has("config")|not))'
 test_codex_call_transform "codex composes per-session max effort with goal" \
   "" \
   '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"max","goal":"SHIPSAFE"}' \
@@ -2008,10 +2025,10 @@ test_codex_rejects_call "codex rejects hidden native configuration" \
   '(.error.data.issues | map(.argument) | sort) == ["approval-policy","base-instructions","compact-prompt","config","developer-instructions","model"]'
 test_codex_rejects_call "codex rejects missing required arguments" \
   '{"prompt":"hi"}' \
-  '(.error.data.issues | map(.argument) | sort) == ["cwd","model_reasoning_effort","sandbox"]'
+  '(.error.data.issues | map(.argument) | sort) == ["cwd","sandbox"]'
 test_codex_rejects_call "codex rejects malformed operational arguments" \
-  '{"prompt":false,"cwd":"relative/path","sandbox":"escape","model_reasoning_effort":"ultra","goal":false}' \
-  '(.error.data.issues | map(.argument) | sort) == ["cwd","goal","model_reasoning_effort","prompt","sandbox"]'
+  '{"prompt":false,"cwd":"relative/path","sandbox":"escape","model":"gpt-5.6-luna","model_reasoning_effort":"ultra","goal":false}' \
+  '(.error.data.issues | map(.argument) | sort) == ["cwd","goal","model","model_reasoning_effort","prompt","sandbox"]'
 test_codex_rejects_call "codex rejects a non-object arguments value" \
   'null' \
   '(.error.data.issues == [{"argument":"arguments","problem":"must be an object"}])'
@@ -2020,8 +2037,8 @@ test_codex_rejects_call "codex-reply requires threadId and rejects conversationI
   '(.error.data.issues | map(.argument) | sort) == ["conversationId","threadId"]' \
   "codex-reply"
 test_codex_rejects_call "codex-reply rejects inherited session controls" \
-  '{"prompt":"continue","threadId":"abc","sandbox":"read-only","model_reasoning_effort":"max","cwd":"/tmp/work"}' \
-  '(.error.data.issues | map(.argument) | sort) == ["cwd","model_reasoning_effort","sandbox"]' \
+  '{"prompt":"continue","threadId":"abc","sandbox":"read-only","model":"gpt-5.6-terra","model_reasoning_effort":"max","cwd":"/tmp/work"}' \
+  '(.error.data.issues | map(.argument) | sort) == ["cwd","model","model_reasoning_effort","sandbox"]' \
   "codex-reply"
 test_codex_rejects_call "codex-status rejects missing cursor and invalid wait" \
   '{"jobId":"job","wait_ms":60001}' \
@@ -2038,7 +2055,7 @@ test_codex_local_response_lifecycle "codex local validation responses remain fra
 # contract; everything else stays byte-for-byte.
 test_codex_toolslist_rewrite "tools/list advertises exact curated argument sets" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties|keys) == ["cwd","goal","model_reasoning_effort","prompt","sandbox"] and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|keys) == ["goal","prompt","threadId"])'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties|keys) == ["cwd","goal","model","model_reasoning_effort","prompt","sandbox"] and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|keys) == ["goal","prompt","threadId"])'
 test_codex_toolslist_rewrite "tools/list advertises all optional Codex job tools" \
   "normal" \
   'select(.id==2) | ([.result.tools[].name | select(startswith("codex-"))] | sort) == ["codex-cancel","codex-commentary","codex-reply","codex-reply-start","codex-result","codex-start","codex-status"]'
@@ -2051,27 +2068,30 @@ test_codex_toolslist_rewrite "Codex job tools use exact closed schemas" \
     ($t["codex-commentary"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])) and
     ($t["codex-result"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])) and
     ($t["codex-cancel"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])))'
-test_codex_toolslist_rewrite "tools/list advertises exact xhigh|max effort on codex only" \
+test_codex_toolslist_rewrite "tools/list advertises exact Sol|Terra model on codex only" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["xhigh","max"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
-test_codex_toolslist_rewrite "tools/list explains effort choice and reply inheritance" \
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model | ((.type == "string") and (.enum == ["gpt-5.6-sol","gpt-5.6-terra"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model")|not))'
+test_codex_toolslist_rewrite "tools/list advertises exact medium|high|xhigh|max effort on codex only" \
   "normal" \
-  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort.description|ascii_downcase) as $d | (($d|test("new session")) and ($d|test("xhigh.*hard")) and ($d|test("max.*quality-first")) and ($d|test("repl.*inherit")))'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["medium","high","xhigh","max"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
+test_codex_toolslist_rewrite "tools/list explains model, effort, and reply inheritance" \
+  "normal" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties) as $p | (($p.model.description|test("gpt-5.6-sol.*demanding")) and ($p.model.description|test("gpt-5.6-terra.*faster")) and ($p.model.description|test("repl.*inherit")) and ($p.model_reasoning_effort.description|ascii_downcase|test("medium.*balanced.*high.*complex.*xhigh.*hard.*max.*quality-first.*repl.*inherit")))'
 # If upstream Codex starts declaring this property itself, mcp-agents still
-# owns the policy: constrain codex to the two allowed values and remove the
+# owns the policy: constrain codex to the four allowed values and remove the
 # property from codex-reply rather than exposing upstream drift such as ultra.
 test_codex_toolslist_rewrite "tools/list constrains drifted upstream effort schema" \
   "haveeffort" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["xhigh","max"]) and (.description != "STUB_DRIFTED_EFFORT_DESC"))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["medium","high","xhigh","max"]) and (.description != "STUB_DRIFTED_EFFORT_DESC"))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
 test_codex_toolslist_rewrite "tools/list makes both schemas closed and operational fields required" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema | ((.additionalProperties == false) and ((.required|sort) == ["cwd","model_reasoning_effort","prompt","sandbox"]))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema | ((.additionalProperties == false) and ((.required|sort) == ["prompt","threadId"]))))'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema | ((.additionalProperties == false) and ((.required|sort) == ["cwd","prompt","sandbox"]))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema | ((.additionalProperties == false) and ((.required|sort) == ["prompt","threadId"]))))'
 test_codex_toolslist_rewrite "tools/list advertises exact sandbox choices" \
   "normal" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.sandbox.enum == ["read-only","workspace-write","danger-full-access"])'
-test_codex_toolslist_rewrite "tools/list hides native config and future schema drift" \
+test_codex_toolslist_rewrite "tools/list curates model and hides native config and future drift" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties | (has("approval-policy")|not) and (has("base-instructions")|not) and (has("compact-prompt")|not) and (has("config")|not) and (has("developer-instructions")|not) and (has("model")|not) and (has("future_upstream_setting")|not)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties | (has("conversationId")|not) and (has("future_reply_setting")|not)))'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties | (.model.enum == ["gpt-5.6-sol","gpt-5.6-terra"]) and (has("approval-policy")|not) and (has("base-instructions")|not) and (has("compact-prompt")|not) and (has("config")|not) and (has("developer-instructions")|not) and (has("future_upstream_setting")|not)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties | (has("conversationId")|not) and (has("future_reply_setting")|not)))'
 test_codex_toolslist_rewrite "tools/list preserves non-schema tool metadata" \
   "normal" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0] | ((.title == "Native Codex title") and (.annotations.readOnlyHint == false) and (.outputSchema.type == "object") and (.description | test("Config struct") | not)))'

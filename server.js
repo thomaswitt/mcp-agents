@@ -56,8 +56,11 @@ const CODEX_JOB_RETENTION_MS = 60 * 60 * 1_000;
 const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
+const CODEX_PER_SESSION_MODEL_ARG = "model";
+const CODEX_PER_SESSION_MODELS = [DEFAULT_CODEX_MODEL, "gpt-5.6-terra"];
+const CODEX_PER_SESSION_MODEL_SET = new Set(CODEX_PER_SESSION_MODELS);
 const CODEX_PER_SESSION_REASONING_EFFORT_ARG = "model_reasoning_effort";
-const CODEX_PER_SESSION_REASONING_EFFORTS = ["xhigh", "max"];
+const CODEX_PER_SESSION_REASONING_EFFORTS = ["medium", "high", "xhigh", "max"];
 const CODEX_PER_SESSION_REASONING_EFFORT_SET = new Set(
   CODEX_PER_SESSION_REASONING_EFFORTS,
 );
@@ -65,8 +68,15 @@ const CODEX_SANDBOXES = ["read-only", "workspace-write", "danger-full-access"];
 const CODEX_SANDBOX_SET = new Set(CODEX_SANDBOXES);
 const CODEX_TOOL_CONTRACTS = {
   codex: {
-    allowed: ["prompt", "cwd", "sandbox", CODEX_PER_SESSION_REASONING_EFFORT_ARG, "goal"],
-    required: ["prompt", "cwd", "sandbox", CODEX_PER_SESSION_REASONING_EFFORT_ARG],
+    allowed: [
+      "prompt",
+      "cwd",
+      "sandbox",
+      CODEX_PER_SESSION_MODEL_ARG,
+      CODEX_PER_SESSION_REASONING_EFFORT_ARG,
+      "goal",
+    ],
+    required: ["prompt", "cwd", "sandbox"],
   },
   "codex-reply": {
     allowed: ["prompt", "threadId", "goal"],
@@ -710,7 +720,10 @@ function transformCodexToolCall(line, opts = {}) {
   let changed = false;
   let effortLog;
 
-  if (toolName === "codex") {
+  if (
+    toolName === "codex" &&
+    Object.hasOwn(args, CODEX_PER_SESSION_REASONING_EFFORT_ARG)
+  ) {
     const requestedSessionEffort = args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
     delete args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
     args.config = { model_reasoning_effort: requestedSessionEffort };
@@ -762,16 +775,22 @@ const CODEX_GOAL_PROPERTY_DESCRIPTION =
   "Optional standing objective. mcp-agents injects it as developer instructions " +
   "for a new session or a prompt reminder for a reply. An empty string suppresses " +
   "the server-wide goal for this call.";
+const CODEX_PER_SESSION_MODEL_PROPERTY_DESCRIPTION =
+  `Optional model for this new session: ${DEFAULT_CODEX_MODEL} for demanding work ` +
+  "or gpt-5.6-terra for faster, easier jobs. Defaults to the server-configured " +
+  `${DEFAULT_CODEX_MODEL}; replies inherit it.`;
 const CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION =
-  "Reasoning effort for this new session: xhigh for hard, bounded work or max " +
-  "for quality-first work requiring deeper exploration. Replies inherit it.";
+  "Optional reasoning effort for this new session: medium for balanced speed, " +
+  "high for complex work, xhigh for hard work, or max for quality-first work " +
+  "requiring deeper exploration. Defaults to the server-configured xhigh; replies " +
+  "inherit it.";
 
 function codexToolPresentation(toolName) {
   if (toolName === "codex") {
     return {
       description:
-        "Start a Codex session with an explicit workspace, sandbox, reasoning effort, " +
-        "and optional standing goal.",
+        "Start a Codex session with an explicit workspace and sandbox, optional model " +
+        "and reasoning effort, and optional standing goal.",
       inputSchema: {
         type: "object",
         properties: {
@@ -787,6 +806,11 @@ function codexToolPresentation(toolName) {
             type: "string",
             enum: [...CODEX_SANDBOXES],
             description: "Sandbox mode for the session; it cannot change on replies.",
+          },
+          [CODEX_PER_SESSION_MODEL_ARG]: {
+            type: "string",
+            enum: [...CODEX_PER_SESSION_MODELS],
+            description: CODEX_PER_SESSION_MODEL_PROPERTY_DESCRIPTION,
           },
           [CODEX_PER_SESSION_REASONING_EFFORT_ARG]: {
             type: "string",
@@ -806,7 +830,7 @@ function codexToolPresentation(toolName) {
   if (toolName === "codex-reply") {
     return {
       description:
-        "Continue a Codex session by thread ID. Sandbox and reasoning effort are inherited.",
+        "Continue a Codex session by thread ID. Model, sandbox, and reasoning effort are inherited.",
       inputSchema: {
         type: "object",
         properties: {
@@ -972,6 +996,15 @@ function validateCodexToolCallMessage(msg) {
       argument: "sandbox",
       problem: `must be one of: ${CODEX_SANDBOXES.join(", ")}`,
     });
+  }
+  if (Object.hasOwn(args, CODEX_PER_SESSION_MODEL_ARG)) {
+    const model = args[CODEX_PER_SESSION_MODEL_ARG];
+    if (typeof model !== "string" || !CODEX_PER_SESSION_MODEL_SET.has(model)) {
+      issues.push({
+        argument: CODEX_PER_SESSION_MODEL_ARG,
+        problem: `must be one of: ${CODEX_PER_SESSION_MODELS.join(", ")}`,
+      });
+    }
   }
   if (Object.hasOwn(args, CODEX_PER_SESSION_REASONING_EFFORT_ARG)) {
     const effort = args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];

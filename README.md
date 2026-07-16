@@ -107,7 +107,8 @@ small contract:
 | `prompt` | `string` | yes | Initial user prompt |
 | `cwd` | `string` | yes | Absolute working directory |
 | `sandbox` | `string` | yes | `read-only`, `workspace-write`, or `danger-full-access` |
-| `model_reasoning_effort` | `string` | yes | `xhigh` or `max` |
+| `model` | `string` | no | `gpt-5.6-sol` or `gpt-5.6-terra`; defaults to the server model |
+| `model_reasoning_effort` | `string` | no | `medium`, `high`, `xhigh`, or `max`; defaults to the server effort |
 | `goal` | `string` | no | Standing objective; `""` suppresses a server-wide goal for this call |
 
 | `codex-reply` parameter | Type | Required | Description |
@@ -118,9 +119,10 @@ small contract:
 
 Both schemas set `additionalProperties: false`. Unsupported, missing, or invalid
 arguments are rejected locally with JSON-RPC `-32602` before Codex runs. That
-includes native escape hatches such as `model`, `config`, `approval-policy`,
+includes native escape hatches such as `config`, `approval-policy`,
 `developer-instructions`, `base-instructions`, and `compact-prompt`; future
 upstream schema additions stay hidden until mcp-agents intentionally adopts them.
+Model values outside the two curated choices are rejected the same way.
 
 `approval_policy=never` is intentional for an MCP bridge: a detached tool call
 cannot reliably conduct an interactive approval conversation. Operators can pick
@@ -129,18 +131,26 @@ callers cannot weaken or change that policy per request. Each new session must
 still state its sandbox explicitly, so write authority is visible at the call site.
 
 Startup flags (`--model`, `--model_reasoning_effort`) configure the isolated native
-Codex server. The model remains server-owned. Each initial `codex` call explicitly
-selects one of two allowed reasoning efforts:
+Codex server defaults (`gpt-5.6-sol` and `xhigh` unless overridden). Each initial
+`codex` call may select one of two models and one of four allowed reasoning
+efforts:
+
+| Model | Use for |
+|-------|---------|
+| `gpt-5.6-sol` | Demanding, open-ended, or high-value work; the default |
+| `gpt-5.6-terra` | Faster everyday work and easier jobs |
 
 | Value | Use for |
 |-------|---------|
+| `medium` | Balanced speed and depth |
+| `high` | Complex work that needs more analysis and checking |
 | `xhigh` | Hard but bounded implementation work |
 | `max` | Extra-hard, quality-first work with high architectural, concurrency, data-integrity, or security risk |
 
-The selector applies only when creating a session. Every `codex-reply` inherits
-that choice and cannot change it. `ultra` is deliberately unavailable because it
-changes execution topology by enabling automatic delegation rather than merely
-increasing the session's reasoning effort.
+The selectors apply only when creating a session. Omitting either one uses its
+server-configured default. Every `codex-reply` inherits both choices and cannot
+change them. Other models and effort levels are deliberately unavailable through
+the closed wrapper contract.
 
 For example, a read-only review starts with:
 
@@ -149,7 +159,8 @@ For example, a read-only review starts with:
   "prompt": "Review this diff",
   "cwd": "/absolute/path/to/project",
   "sandbox": "read-only",
-  "model_reasoning_effort": "max",
+  "model": "gpt-5.6-terra",
+  "model_reasoning_effort": "high",
   "goal": "Find correctness and security defects"
 }
 ```
@@ -346,9 +357,10 @@ Override codex defaults at server startup:
 }
 ```
 
-The model is fixed at server startup. Every initial `codex` call must select
-`xhigh` or `max`; replies inherit the selection. Raw `model`, `config`, and
-per-call approval-policy arguments are rejected before Codex runs. Add
+Every initial `codex` call may select `gpt-5.6-sol` or `gpt-5.6-terra` and
+`medium`, `high`, `xhigh`, or `max`; omitted selectors use the server defaults,
+and replies inherit both choices. Other models, raw `config`, and per-call
+approval-policy arguments are rejected before Codex runs. Add
 `"--goal", "<text>"` to `args` to provide a default objective (see
 [Goal injection](#codex-pass-through) above).
 
