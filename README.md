@@ -88,6 +88,7 @@ or Gemini during bridge calls.
 |----------|---------|-----------------|
 | `--model` | `gpt-5.6-sol` | `model` |
 | `--model_reasoning_effort` | `xhigh` | `model_reasoning_effort` |
+| `--codex-workspace-network=true\|false` | `true` | `sandbox_workspace_write.network_access` |
 
 Other startup defaults: `sandbox_mode=workspace-write`, `approval_policy=never`
 (configurable for the whole server with `--sandbox_mode` / `--approval_policy`),
@@ -98,6 +99,20 @@ defaults are `features.multi_agent=false`, `features.apps=false`,
 `features.skill_mcp_dependency_install=false`; apps/plugins stay disabled to
 keep ChatGPT app/plugin skills — Figma, Gmail, Presentations, etc. — out of the
 bridged session context.
+
+Workspace-write sessions have network access enabled by default so sandboxed
+commands can reach local services such as DynamoDB, Redis, OpenSearch, and MinIO.
+Set `--codex-workspace-network=false` or
+`MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS=false` to disable it for the whole
+server; the CLI flag takes precedence over the environment variable. This is a
+server-owned sandbox setting and is intentionally absent from the per-call tool
+schemas.
+
+Codex does not provide localhost-only scoping for this setting. Enabling it
+allows general outbound network access from commands in workspace-write
+sessions. Filesystem writes remain restricted to the workspace and other
+configured writable roots; read-only and danger-full-access sessions do not use
+the `sandbox_workspace_write` setting.
 
 The bridge replaces Codex's broad config-shaped native schema with a deliberately
 small contract:
@@ -350,7 +365,7 @@ Override codex defaults at server startup:
   "mcpServers": {
     "codex": {
       "command": "mcp-agents",
-      "args": ["--provider", "codex", "--model", "gpt-5.6-sol", "--model_reasoning_effort", "xhigh"],
+      "args": ["--provider", "codex", "--model", "gpt-5.6-sol", "--model_reasoning_effort", "xhigh", "--codex-workspace-network=false"],
       "timeout": 7500000
     }
   }

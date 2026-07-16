@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.18.0] - 2026-07-16
+
+### Added
+
+- Enable network access by default for workspace-write Codex bridge sessions so
+  sandboxed commands can reach local development services
+- Add the server-owned `--codex-workspace-network=true|false` option and
+  `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` environment variable; keep the
+  setting out of per-call tool schemas
+
+### Security
+
+- Document that workspace-write network access permits general outbound egress,
+  while filesystem writes remain restricted to the workspace
+
 ## [0.17.0] - 2026-07-16
 
 ### Added

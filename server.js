@@ -38,6 +38,9 @@ const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
 const DEFAULT_CODEX_APPROVAL_POLICY = "never";
+const DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS = true;
+const CODEX_WORKSPACE_NETWORK_ACCESS_ENV =
+  "MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS";
 // Correlated watchdogs for the codex pass-through. Only a codex/event carrying
 // the matching MCP request id extends a call's idle window; stderr, pings, and
 // unrelated calls cannot keep a wedged request alive. 0 disables the idle cap.
@@ -247,6 +250,9 @@ Options:
                                  danger-full-access [default: ${DEFAULT_CODEX_SANDBOX_MODE}]
   --approval_policy <policy>     Codex approval policy: untrusted, on-failure,
                                  on-request, never [default: ${DEFAULT_CODEX_APPROVAL_POLICY}]
+  --codex-workspace-network=<b> Enable network access in workspace-write Codex
+                                 sessions: true or false [default: ${DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS};
+                                 env: ${CODEX_WORKSPACE_NETWORK_ACCESS_ENV}]
   --goal <text>                  Persistent objective injected into every Codex
                                  call (as developer-instructions, or a prompt
                                  reminder on codex-reply); per-call \`goal\` arg
@@ -262,9 +268,9 @@ Options:
 /**
  * Parse CLI flags from process.argv.
  * Handles --help, --version, --provider, --model, --model_reasoning_effort,
- * --sandbox_mode, --approval_policy, --goal, --codex_idle_timeout, and unknown
- * flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, goal?: string, codexIdleTimeoutMs?: number, defaultTimeoutMs?: number }}
+ * --sandbox_mode, --approval_policy, --codex-workspace-network, --goal,
+ * --codex_idle_timeout, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -273,12 +279,21 @@ function parseArgs() {
   let modelReasoningEffort;
   let sandboxMode;
   let approvalPolicy;
+  let codexWorkspaceNetworkAccess;
   let goal;
   let codexIdleTimeoutMs;
   let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
+    const arg = args[i];
+    if (arg.startsWith("--codex-workspace-network=")) {
+      codexWorkspaceNetworkAccess = parseBooleanSetting(
+        arg.slice("--codex-workspace-network=".length),
+        "--codex-workspace-network",
+      );
+      continue;
+    }
+    switch (arg) {
       case "--help":
       case "-h":
         printHelp();
@@ -325,6 +340,18 @@ function parseArgs() {
           process.exit(1);
         }
         approvalPolicy = args[++i];
+        break;
+      case "--codex-workspace-network":
+        if (i + 1 >= args.length) {
+          process.stderr.write(
+            "error: --codex-workspace-network requires a value\n",
+          );
+          process.exit(1);
+        }
+        codexWorkspaceNetworkAccess = parseBooleanSetting(
+          args[++i],
+          "--codex-workspace-network",
+        );
         break;
       case "--goal":
         if (i + 1 >= args.length) {
@@ -373,10 +400,37 @@ function parseArgs() {
     modelReasoningEffort,
     sandboxMode,
     approvalPolicy,
+    codexWorkspaceNetworkAccess,
     goal,
     codexIdleTimeoutMs,
     defaultTimeoutMs,
   };
+}
+
+/**
+ * Parse a strict true/false setting or terminate with a configuration error.
+ * @param {string} value
+ * @param {string} source
+ * @returns {boolean}
+ */
+function parseBooleanSetting(value, source) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  process.stderr.write(`error: ${source} must be true or false\n`);
+  process.exit(1);
+}
+
+/**
+ * Resolve the server-owned workspace-write network posture. A CLI value wins
+ * over the environment variable, and an omitted setting defaults to enabled.
+ * @param {boolean | undefined} cliValue
+ * @returns {boolean}
+ */
+function resolveCodexWorkspaceNetworkAccess(cliValue) {
+  if (cliValue !== undefined) return cliValue;
+  const envValue = process.env[CODEX_WORKSPACE_NETWORK_ACCESS_ENV];
+  if (envValue === undefined) return DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS;
+  return parseBooleanSetting(envValue, CODEX_WORKSPACE_NETWORK_ACCESS_ENV);
 }
 
 /**
@@ -520,7 +574,7 @@ function toTomlString(value) {
 
 /**
  * Build the minimal config for the isolated Codex bridge runtime.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean }} opts
  * @returns {string}
  */
 function buildCodexBridgeConfig({
@@ -528,6 +582,7 @@ function buildCodexBridgeConfig({
   modelReasoningEffort,
   sandboxMode,
   approvalPolicy,
+  workspaceNetworkAccess,
 }) {
   return [
     `model = ${toTomlString(model)}`,
@@ -537,6 +592,9 @@ function buildCodexBridgeConfig({
     'web_search = "cached"',
     "check_for_update_on_startup = false",
     "allow_login_shell = false",
+    "",
+    "[sandbox_workspace_write]",
+    `network_access = ${workspaceNetworkAccess}`,
     "",
     "[history]",
     'persistence = "none"',
@@ -553,7 +611,7 @@ function buildCodexBridgeConfig({
 
 /**
  * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean }} opts
  * @returns {string}
  */
 function createIsolatedCodexHome({
@@ -561,6 +619,7 @@ function createIsolatedCodexHome({
   modelReasoningEffort,
   sandboxMode,
   approvalPolicy,
+  workspaceNetworkAccess,
 }) {
   const codexHome = mkdtempSync(join(tmpdir(), "mcp-agents-codex-"));
   // If auth copy or config write throws after the dir exists, remove the
@@ -581,6 +640,7 @@ function createIsolatedCodexHome({
         modelReasoningEffort,
         sandboxMode,
         approvalPolicy,
+        workspaceNetworkAccess,
       }),
       "utf8",
     );
@@ -1139,13 +1199,14 @@ function rewriteCodexToolsListMessage(msg) {
  * Per-request idle and hard deadlines convert unbounded Codex stalls into
  * surfaced JSON-RPC errors. Correlated events also provide client-visible MCP
  * progress and enough terminal metadata to recover a missing final response.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, idleTimeoutMs?: number, hardTimeoutMs?: number, goal?: string }} opts
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, hardTimeoutMs?: number, goal?: string }} opts
  */
 function runCodexPassthrough({
   model,
   modelReasoningEffort,
   sandboxMode,
   approvalPolicy,
+  workspaceNetworkAccess,
   idleTimeoutMs,
   hardTimeoutMs,
   goal,
@@ -1155,6 +1216,8 @@ function runCodexPassthrough({
     modelReasoningEffort || DEFAULT_CODEX_MODEL_REASONING_EFFORT;
   const resolvedSandboxMode = sandboxMode || DEFAULT_CODEX_SANDBOX_MODE;
   const resolvedApprovalPolicy = approvalPolicy || DEFAULT_CODEX_APPROVAL_POLICY;
+  const resolvedWorkspaceNetworkAccess =
+    workspaceNetworkAccess ?? DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS;
   const resolvedIdleTimeoutMs = idleTimeoutMs ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
   const resolvedHardTimeoutMs = hardTimeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS;
   const terminalGraceMs = testTunableMs(
@@ -1187,6 +1250,7 @@ function runCodexPassthrough({
       modelReasoningEffort: resolvedModelReasoningEffort,
       sandboxMode: resolvedSandboxMode,
       approvalPolicy: resolvedApprovalPolicy,
+      workspaceNetworkAccess: resolvedWorkspaceNetworkAccess,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1216,6 +1280,7 @@ function runCodexPassthrough({
     `[mcp-agents] passthrough: codex ${args.join(" ")} ` +
       `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, ` +
       `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
+      `workspace_network_access=${resolvedWorkspaceNetworkAccess}, ` +
       `goal=${resolvedGoal && resolvedGoal.trim() ? "set" : "none"}, ` +
       `idle_timeout_ms=${resolvedIdleTimeoutMs}, hard_timeout_ms=${resolvedHardTimeoutMs}, ` +
       `isolated_home=true)`,
@@ -3347,6 +3412,7 @@ async function main() {
     modelReasoningEffort,
     sandboxMode,
     approvalPolicy,
+    codexWorkspaceNetworkAccess,
     goal,
     codexIdleTimeoutMs,
     defaultTimeoutMs,
@@ -3366,6 +3432,9 @@ async function main() {
       modelReasoningEffort,
       sandboxMode,
       approvalPolicy,
+      workspaceNetworkAccess: resolveCodexWorkspaceNetworkAccess(
+        codexWorkspaceNetworkAccess,
+      ),
       goal,
       idleTimeoutMs: codexIdleTimeoutMs,
       hardTimeoutMs: defaultTimeoutMs,

@@ -200,7 +200,7 @@ test_cli_flag() {
   OUTPUT=$($SERVER $flag 2>/dev/null) || true
   EXIT_CODE=${PIPESTATUS[0]:-$?}
 
-  if echo "$OUTPUT" | grep -q "$expected"; then
+  if echo "$OUTPUT" | grep -q -- "$expected"; then
     green "PASS: $label"
     PASS=$((PASS + 1))
   else
@@ -230,6 +230,27 @@ test_cli_error() {
   fi
 }
 
+# ── Helper: test an invalid workspace-network environment value ──
+test_codex_workspace_network_env_error() {
+  local label="$1"
+  local value="$2"
+  local expected="$3"
+
+  echo "--- $label ---"
+
+  STDERR_OUTPUT=$(env MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS="$value" \
+    $SERVER --provider codex 2>&1 >/dev/null) || true
+
+  if echo "$STDERR_OUTPUT" | grep -q "$expected"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (expected '$expected' in stderr)"
+    echo "  Stderr: $STDERR_OUTPUT"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 # ========== CLI flag tests ==========
 
 test_cli_flag "--help prints usage"         "--help"    "Usage:"
@@ -237,6 +258,7 @@ test_cli_flag "--help shows GPT-5.6 SOL default" "--help" "gpt-5.6-sol"
 test_cli_flag "--help shows xhigh default"  "--help"    "xhigh"
 test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
+test_cli_flag "--help shows workspace network default" "--help" "--codex-workspace-network"
 test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
 test_cli_flag "--help shows goal flag"      "--help"    "Persistent objective"
 test_cli_flag "--help shows provider timeout defaults" "--help" "claude 900, gemini 300"
@@ -249,6 +271,11 @@ test_cli_error "--model without value"                     "--model"            
 test_cli_error "--model_reasoning_effort without value"    "--model_reasoning_effort"   "requires a value"
 test_cli_error "--sandbox_mode without value"              "--sandbox_mode"             "requires a value"
 test_cli_error "--approval_policy without value"           "--approval_policy"          "requires a value"
+test_cli_error "--codex-workspace-network without value"    "--codex-workspace-network"   "requires a value"
+test_cli_error "--codex-workspace-network invalid value"    "--codex-workspace-network maybe" "must be true or false"
+test_cli_error "--codex-workspace-network invalid inline"   "--codex-workspace-network=maybe" "must be true or false"
+test_codex_workspace_network_env_error \
+  "workspace network env rejects invalid value" "maybe" "must be true or false"
 test_cli_error "--goal without value"                      "--goal"                     "requires a value"
 test_cli_error "--timeout without value"                    "--timeout"                  "requires a value"
 test_cli_error "--timeout with zero"                        "--timeout 0"                "must be a positive number"
@@ -481,9 +508,13 @@ EOF
 }
 
 # ── Helper: verify the generated isolated Codex config is intentionally lean ──
-test_codex_bridge_config_defaults() {
+test_codex_bridge_config() {
   local label="$1"
+  local expected_network="$2"
+  local server_args="$3"
+  local env_network="$4"
   local tmpdir config_capture output_file status expected ok
+  local -a network_env
 
   echo "--- $label ---"
 
@@ -492,11 +523,18 @@ test_codex_bridge_config_defaults() {
   output_file="$tmpdir/output.txt"
   write_codex_config_stub "$tmpdir"
 
+  if [ "$env_network" = "__unset__" ]; then
+    network_env=(-u MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS)
+  else
+    network_env=("MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS=$env_network")
+  fi
+
   set +e
   {
     sleep 0.2
-  } | PATH="$tmpdir:$PATH" MCP_AGENTS_TEST_CONFIG_CAPTURE="$config_capture" \
-    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  } | env "${network_env[@]}" PATH="$tmpdir:$PATH" \
+    MCP_AGENTS_TEST_CONFIG_CAPTURE="$config_capture" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex $server_args >"$output_file" 2>/dev/null
   status=$?
   set -e
 
@@ -508,6 +546,8 @@ test_codex_bridge_config_defaults() {
     'web_search = "cached"' \
     'check_for_update_on_startup = false' \
     'allow_login_shell = false' \
+    '[sandbox_workspace_write]' \
+    "network_access = $expected_network" \
     '[history]' \
     'persistence = "none"' \
     '[features]' \
@@ -519,6 +559,7 @@ test_codex_bridge_config_defaults() {
   do
     grep -Fxq "$expected" "$config_capture" 2>/dev/null || ok=0
   done
+  [ "$(grep -Fxc '[sandbox_workspace_write]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
 
   if [ "$ok" -eq 1 ]; then
     green "PASS: $label"
@@ -1959,7 +2000,18 @@ test_no_registered_child_leaks() {
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 
 # Stub-based strict Codex contract tests (fast — no real Codex needed).
-test_codex_bridge_config_defaults "codex bridge writes lean isolated config"
+test_codex_bridge_config \
+  "codex bridge enables workspace network by default" \
+  "true" "" "__unset__"
+test_codex_bridge_config \
+  "codex bridge disables workspace network from CLI" \
+  "false" "--codex-workspace-network=false" "__unset__"
+test_codex_bridge_config \
+  "codex bridge disables workspace network from env" \
+  "false" "" "false"
+test_codex_bridge_config \
+  "codex workspace network CLI overrides env" \
+  "true" "--codex-workspace-network true" "false"
 test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclusive temp"
 test_codex_call_passes_through_unmodified \
   "codex-reply forwards an accepted no-goal call byte-for-byte" \
@@ -2092,6 +2144,9 @@ test_codex_toolslist_rewrite "tools/list advertises exact sandbox choices" \
 test_codex_toolslist_rewrite "tools/list curates model and hides native config and future drift" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties | (.model.enum == ["gpt-5.6-sol","gpt-5.6-terra"]) and (has("approval-policy")|not) and (has("base-instructions")|not) and (has("compact-prompt")|not) and (has("config")|not) and (has("developer-instructions")|not) and (has("future_upstream_setting")|not)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties | (has("conversationId")|not) and (has("future_reply_setting")|not)))'
+test_codex_toolslist_rewrite "tools/list keeps workspace network server-owned" \
+  "normal" \
+  'select(.id==2) | [.result.tools[] | select(.name == "codex" or .name == "codex-start" or .name == "codex-reply" or .name == "codex-reply-start") | .inputSchema.properties | ((has("network_access")|not) and (has("codex_workspace_network_access")|not) and (has("codex-workspace-network")|not))] | all'
 test_codex_toolslist_rewrite "tools/list preserves non-schema tool metadata" \
   "normal" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0] | ((.title == "Native Codex title") and (.annotations.readOnlyHint == false) and (.outputSchema.type == "object") and (.description | test("Config struct") | not)))'
