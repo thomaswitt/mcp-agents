@@ -564,6 +564,135 @@ function resolveCodexHome() {
 }
 
 /**
+ * Return TOML lines with comments and multiline-string bodies removed.
+ * @param {string} source
+ * @returns {string[] | null}
+ */
+function structuralTomlLines(source) {
+  const lines = [];
+  let multilineQuote;
+
+  for (const rawLine of source.split(/\r?\n/)) {
+    let code = "";
+    let quote;
+    let escaped = false;
+    let touchedMultiline = Boolean(multilineQuote);
+
+    for (let index = 0; index < rawLine.length; index += 1) {
+      const char = rawLine[index];
+      const triple = rawLine.slice(index, index + 3);
+
+      if (multilineQuote) {
+        if (triple === multilineQuote) {
+          let backslashes = 0;
+          for (let before = index - 1; rawLine[before] === "\\"; before -= 1) {
+            backslashes += 1;
+          }
+          if (multilineQuote === "'''" || backslashes % 2 === 0) {
+            let quoteRun = 3;
+            while (rawLine[index + quoteRun] === multilineQuote[0]) {
+              quoteRun += 1;
+            }
+            if (quoteRun > 5) return null;
+            multilineQuote = undefined;
+            index += quoteRun - 1;
+          }
+        }
+        continue;
+      }
+
+      if (quote) {
+        code += char;
+        if (quote === '"' && escaped) {
+          escaped = false;
+        } else if (quote === '"' && char === "\\") {
+          escaped = true;
+        } else if (char === quote) {
+          quote = undefined;
+        }
+        continue;
+      }
+
+      if (triple === "'''" || triple === '\"\"\"') {
+        multilineQuote = triple;
+        touchedMultiline = true;
+        index += 2;
+        continue;
+      }
+      if (char === "#") break;
+
+      code += char;
+      if (char === "'" || char === '"') quote = char;
+    }
+
+    if (quote) return null;
+    lines.push(touchedMultiline ? "" : code.trim());
+  }
+
+  return multilineQuote ? null : lines;
+}
+
+/**
+ * Detect the explicit Fast-mode pair without inheriting any other user config.
+ * @param {string} source
+ * @returns {boolean}
+ */
+function hasCodexFastModeOptIn(source) {
+  const lines = structuralTomlLines(source);
+  if (!lines) return false;
+
+  let table = "";
+  let serviceTierFast = false;
+  let serviceTierSeen = false;
+  let fastModeEnabled = false;
+  let fastModeSeen = false;
+
+  for (const line of lines) {
+    if (!line) continue;
+
+    const tableMatch = line.match(/^\[\s*([^\[\]]+?)\s*\]$/);
+    if (tableMatch) {
+      table = tableMatch[1];
+      continue;
+    }
+    if (line.startsWith("[")) {
+      table = undefined;
+      continue;
+    }
+
+    if (table === "" && /^service_tier\s*=/.test(line)) {
+      if (serviceTierSeen) return false;
+      serviceTierSeen = true;
+      serviceTierFast = /^service_tier\s*=\s*(["'])fast\1\s*$/.test(line);
+    } else if (table === "features" && /^fast_mode\s*=/.test(line)) {
+      if (fastModeSeen) return false;
+      fastModeSeen = true;
+      fastModeEnabled = /^fast_mode\s*=\s*true\s*$/.test(line);
+    }
+  }
+
+  return serviceTierSeen && serviceTierFast && fastModeSeen && fastModeEnabled;
+}
+
+/**
+ * Read the source Codex config and fail closed when Fast mode cannot be resolved.
+ * @param {string} codexHome
+ * @returns {boolean}
+ */
+function readCodexFastModeOptIn(codexHome) {
+  const configPath = join(codexHome, "config.toml");
+  try {
+    return hasCodexFastModeOptIn(readFileSync(configPath, "utf8"));
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      const msg = err instanceof Error ? err.message : String(err);
+      logErr(`[mcp-agents] failed to read source Codex Fast-mode config: ${msg}`);
+    }
+    return false;
+  }
+}
+
+/**
  * Quote a string for TOML output.
  * @param {string} value
  * @returns {string}
@@ -574,7 +703,7 @@ function toTomlString(value) {
 
 /**
  * Build the minimal config for the isolated Codex bridge runtime.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean }} opts
  * @returns {string}
  */
 function buildCodexBridgeConfig({
@@ -583,10 +712,12 @@ function buildCodexBridgeConfig({
   sandboxMode,
   approvalPolicy,
   workspaceNetworkAccess,
+  fastModeEnabled,
 }) {
   return [
     `model = ${toTomlString(model)}`,
     `model_reasoning_effort = ${toTomlString(modelReasoningEffort)}`,
+    ...(fastModeEnabled ? ['service_tier = "fast"'] : []),
     `approval_policy = ${toTomlString(approvalPolicy)}`,
     `sandbox_mode = ${toTomlString(sandboxMode)}`,
     'web_search = "cached"',
@@ -605,27 +736,30 @@ function buildCodexBridgeConfig({
     "plugins = false",
     "multi_agent = false",
     "skill_mcp_dependency_install = false",
+    ...(fastModeEnabled ? ["fast_mode = true"] : []),
     "",
   ].join("\n");
 }
 
 /**
  * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean }} opts
+ * @param {{ sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean }} opts
  * @returns {string}
  */
 function createIsolatedCodexHome({
+  sourceCodexHome,
   model,
   modelReasoningEffort,
   sandboxMode,
   approvalPolicy,
   workspaceNetworkAccess,
+  fastModeEnabled,
 }) {
   const codexHome = mkdtempSync(join(tmpdir(), "mcp-agents-codex-"));
   // If auth copy or config write throws after the dir exists, remove the
   // partially-prepared dir before rethrowing so it is never leaked.
   try {
-    const sourceAuthPath = join(resolveCodexHome(), "auth.json");
+    const sourceAuthPath = join(sourceCodexHome, "auth.json");
     const targetAuthPath = join(codexHome, "auth.json");
     const configPath = join(codexHome, "config.toml");
 
@@ -641,6 +775,7 @@ function createIsolatedCodexHome({
         sandboxMode,
         approvalPolicy,
         workspaceNetworkAccess,
+        fastModeEnabled,
       }),
       "utf8",
     );
@@ -1242,15 +1377,19 @@ function runCodexPassthrough({
   );
   // Server-wide default goal (string or undefined); per-call `goal` overrides it.
   const resolvedGoal = goal;
+  const sourceCodexHome = resolveCodexHome();
+  const fastModeEnabled = readCodexFastModeOptIn(sourceCodexHome);
   let isolatedCodexHome;
 
   try {
     isolatedCodexHome = createIsolatedCodexHome({
+      sourceCodexHome,
       model: resolvedModel,
       modelReasoningEffort: resolvedModelReasoningEffort,
       sandboxMode: resolvedSandboxMode,
       approvalPolicy: resolvedApprovalPolicy,
       workspaceNetworkAccess: resolvedWorkspaceNetworkAccess,
+      fastModeEnabled,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1281,6 +1420,7 @@ function runCodexPassthrough({
       `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, ` +
       `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
       `workspace_network_access=${resolvedWorkspaceNetworkAccess}, ` +
+      `fast_mode_opt_in=${fastModeEnabled}, ` +
       `goal=${resolvedGoal && resolvedGoal.trim() ? "set" : "none"}, ` +
       `idle_timeout_ms=${resolvedIdleTimeoutMs}, hard_timeout_ms=${resolvedHardTimeoutMs}, ` +
       `isolated_home=true)`,

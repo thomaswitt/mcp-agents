@@ -84,6 +84,13 @@ home, writes a minimal `config.toml`, and does not inherit your normal external 
 server list. That keeps Codex from recursively starting other agent tools like Claude
 or Gemini during bridge calls.
 
+The one allowlisted user preference is Fast mode. At startup, the bridge reads the
+source `$CODEX_HOME/config.toml` and enables Fast mode in the isolated home only when
+it finds both top-level `service_tier = "fast"` and `[features].fast_mode = true`.
+Partial, disabled, missing, or unreadable settings keep Standard mode; all other user
+configuration remains isolated. Restart the MCP server after changing either setting.
+[Fast mode uses higher ChatGPT credit consumption or API Priority billing](https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode).
+
 | CLI Flag | Default | Codex config key |
 |----------|---------|-----------------|
 | `--model` | `gpt-5.6-sol` | `model` |
@@ -385,8 +392,9 @@ cap; progress does not extend it. Keep it above the wrapper's `--timeout`
 entry can override a user-level MCP entry of the same name, so put the timeout
 on the project entry instead of relying on the user-level copy.
 
-Because the bridge runs in an isolated Codex home, inherited MCP servers from your normal
-`~/.codex/config.toml` are intentionally unavailable inside bridged Codex sessions.
+Except for the explicit Fast-mode pair described above, the bridge does not inherit
+settings from your normal `~/.codex/config.toml`. In particular, inherited MCP
+servers remain intentionally unavailable inside bridged Codex sessions.
 
 <details>
 <summary>Alternative: using npx (zero install, slower startup)</summary>

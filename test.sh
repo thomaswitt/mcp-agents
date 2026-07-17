@@ -513,14 +513,24 @@ test_codex_bridge_config() {
   local expected_network="$2"
   local server_args="$3"
   local env_network="$4"
-  local tmpdir config_capture output_file status expected ok
+  local source_config="${5:-}"
+  local expected_fast="${6:-false}"
+  local tmpdir real_home config_capture output_file error_file status expected ok
   local -a network_env
 
   echo "--- $label ---"
 
   tmpdir=$(mktemp -d)
+  real_home="$tmpdir/real-codex"
   config_capture="$tmpdir/config.toml"
   output_file="$tmpdir/output.txt"
+  error_file="$tmpdir/error.txt"
+  mkdir "$real_home"
+  if [ "$source_config" = "__read_error__" ]; then
+    mkdir "$real_home/config.toml"
+  elif [ -n "$source_config" ]; then
+    printf '%s\n' "$source_config" > "$real_home/config.toml"
+  fi
   write_codex_config_stub "$tmpdir"
 
   if [ "$env_network" = "__unset__" ]; then
@@ -532,9 +542,9 @@ test_codex_bridge_config() {
   set +e
   {
     sleep 0.2
-  } | env "${network_env[@]}" PATH="$tmpdir:$PATH" \
+  } | env "${network_env[@]}" PATH="$tmpdir:$PATH" CODEX_HOME="$real_home" \
     MCP_AGENTS_TEST_CONFIG_CAPTURE="$config_capture" \
-    $TIMEOUT_CMD 10 $SERVER --provider codex $server_args >"$output_file" 2>/dev/null
+    $TIMEOUT_CMD 10 $SERVER --provider codex $server_args >"$output_file" 2>"$error_file"
   status=$?
   set -e
 
@@ -560,6 +570,25 @@ test_codex_bridge_config() {
     grep -Fxq "$expected" "$config_capture" 2>/dev/null || ok=0
   done
   [ "$(grep -Fxc '[sandbox_workspace_write]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
+  [ "$(grep -Fxc '[features]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
+
+  if [ "$expected_fast" = "true" ]; then
+    [ "$(grep -Fxc 'service_tier = "fast"' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
+    [ "$(grep -Fxc 'fast_mode = true' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
+    sed '/^\[/,$d' "$config_capture" | grep -Fxq 'service_tier = "fast"' || ok=0
+    sed -n '/^\[features\]$/,/^\[/p' "$config_capture" | grep -Fxq 'fast_mode = true' || ok=0
+    grep -Fq 'fast_mode_opt_in=true' "$error_file" || ok=0
+  else
+    [ "$(grep -Fxc 'service_tier = "fast"' "$config_capture" 2>/dev/null)" -eq 0 ] || ok=0
+    [ "$(grep -Fxc 'fast_mode = true' "$config_capture" 2>/dev/null)" -eq 0 ] || ok=0
+    grep -Fq 'fast_mode_opt_in=false' "$error_file" || ok=0
+  fi
+
+  grep -Fq 'do_not_copy' "$config_capture" 2>/dev/null && ok=0
+  grep -Fq 'mcp_servers.sentinel' "$config_capture" 2>/dev/null && ok=0
+  if [ "$source_config" = "__read_error__" ]; then
+    grep -Fq 'failed to read source Codex Fast-mode config' "$error_file" || ok=0
+  fi
 
   if [ "$ok" -eq 1 ]; then
     green "PASS: $label"
@@ -569,6 +598,7 @@ test_codex_bridge_config() {
     echo "  Config:"
     sed 's/^/    /' "$config_capture" 2>/dev/null || true
     echo "  Output: $(cat "$output_file")"
+    echo "  Error: $(cat "$error_file")"
     FAIL=$((FAIL + 1))
   fi
 
@@ -2012,6 +2042,51 @@ test_codex_bridge_config \
 test_codex_bridge_config \
   "codex workspace network CLI overrides env" \
   "true" "--codex-workspace-network true" "false"
+test_codex_bridge_config \
+  "codex bridge mirrors explicit Fast-mode opt-in" \
+  "true" "" "__unset__" \
+  $'basic_decoy = """quoted""""\nliteral_decoy = \'\'\'quoted\'\'\'\'\nservice_tier = "fast" # explicit opt-in\ndo_not_copy = true\n\n[ features ]\nfast_mode = true # explicit opt-in\n\n[mcp_servers.sentinel]\ncommand = "do_not_copy"' \
+  "true"
+test_codex_bridge_config \
+  "codex bridge rejects service-tier-only Fast mode" \
+  "true" "" "__unset__" \
+  'service_tier = "fast"' \
+  "false"
+test_codex_bridge_config \
+  "codex bridge rejects feature-only Fast mode" \
+  "true" "" "__unset__" \
+  $'[features]\nfast_mode = true' \
+  "false"
+test_codex_bridge_config \
+  "codex bridge rejects a disabled Fast-mode feature" \
+  "true" "" "__unset__" \
+  $'service_tier = "fast"\n\n[features]\nfast_mode = false' \
+  "false"
+test_codex_bridge_config \
+  "codex bridge rejects a non-fast service tier" \
+  "true" "" "__unset__" \
+  $'service_tier = "flex"\n\n[features]\nfast_mode = true' \
+  "false"
+test_codex_bridge_config \
+  "codex bridge ignores commented, nested, and multiline decoys" \
+  "true" "" "__unset__" \
+  $'# service_tier = "fast"\ndeveloper_instructions = """\nservice_tier = "fast"\n[features]\nfast_mode = true\n"""\n\n[profiles.fast]\nservice_tier = "fast"\n\n[features.child]\nfast_mode = true' \
+  "false"
+test_codex_bridge_config \
+  "codex bridge rejects ambiguous duplicate Fast settings" \
+  "true" "" "__unset__" \
+  $'service_tier = "fast"\nservice_tier = "fast"\n\n[features]\nfast_mode = true' \
+  "false"
+test_codex_bridge_config \
+  "codex bridge rejects duplicate Fast-mode features" \
+  "true" "" "__unset__" \
+  $'service_tier = "fast"\n\n[features]\nfast_mode = true\nfast_mode = true' \
+  "false"
+test_codex_bridge_config \
+  "codex bridge survives unreadable source Fast-mode config" \
+  "true" "" "__unset__" \
+  "__read_error__" \
+  "false"
 test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclusive temp"
 test_codex_call_passes_through_unmodified \
   "codex-reply forwards an accepted no-goal call byte-for-byte" \
