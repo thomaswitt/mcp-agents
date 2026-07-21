@@ -235,9 +235,20 @@ bounds how long one call may go without correlated Codex activity. Only a Codex
 event carrying that call's `_meta.requestId` (or its matching response or
 interactive exchange) refreshes its idle deadline. Codex stderr, client pings,
 unrelated requests, and events belonging to another call cannot keep a stalled
-call alive. If a call reaches its idle deadline, the wrapper surfaces a JSON-RPC
-error (`-32001`), tears down the shared Codex process group, fails any other open
-calls, and exits so the MCP client can reconnect to a clean bridge.
+call alive. If a call reaches its idle deadline, the wrapper fails **only that
+call** with a JSON-RPC error (`-32001`), sends Codex a `notifications/cancelled`
+for that request so it stops working, suppresses the stalled call's late native
+response, and **keeps the connection open** — sibling calls and the stdio
+transport are unaffected. This matters because a stdio transport close makes MCP
+clients such as Claude Code mark the server `failed` and permanently unregister
+every `mcp__codex__*` tool for the rest of the session (stdio servers are not
+auto-reconnected), so a single stalled review must never take the whole bridge
+down. The Codex process group is still reaped on a real teardown (client
+disconnect, signal, or `stdout` `EPIPE`). The one exception: if Codex is wedged
+partway through writing a response frame (no safe boundary at which to inject the
+error) and also ignores the cancellation, the wrapper escalates to a bounded
+whole-bridge teardown after the cancel grace — there is no way to emit a clean
+frame into a partial one, so the client is left to reconnect to a fresh bridge.
 
 `--timeout <seconds>` is also enforced for Codex calls (default `7200`) as an
 immutable hard deadline. Correlated activity can extend the idle window but
@@ -365,6 +376,43 @@ binary:
 }
 ```
 
+**npm (global install) vs `npx` — prefer a globally installed binary.** The
+`command: "mcp-agents"` form above launches a locally installed binary directly;
+the [npx alternative](#alternative-using-npx) below runs `npx -y mcp-agents` on
+**every** process start. That matters for reliability, not just cold-start speed:
+Claude Code re-launches the stdio server whenever it (re)connects — including
+after a mid-session reconnect — and `npx` performs a package-registry resolution
+on each launch with no offline fallback. If that resolution is slow (VPN, captive
+portal, registry hiccup), stale-cached to a version that no longer exists
+(`npm error code ETARGET`), or otherwise fails, the launch fails, the transport
+closes, and the tools are gone for the session. A globally installed binary (or
+an absolute path to `node server.js`) removes the network dependency and one
+process level from the signal/teardown path. Install once with `npm install -g
+mcp-agents` (or `npm link` from a source checkout), then point the config at it.
+
+For a **from-source checkout** used as your personal Codex bridge, a user-level
+`~/.claude.json` entry can launch the tree directly and disable the per-request
+idle cap (so a long, legitimately-silent review is bounded only by the client's
+own wall-clock timeout rather than aborted early):
+
+```json
+{
+  "mcpServers": {
+    "codex": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-agents/server.js", "--provider", "codex", "--codex_idle_timeout", "0"],
+      "env": {},
+      "timeout": 3600000
+    }
+  }
+}
+```
+
+Bare `node` resolves against the MCP client's `PATH`; if `node` is managed by a
+version manager (nvm/fnm/asdf) that isn't initialized in that environment, use an
+absolute node path instead (`which node`, e.g. `/opt/homebrew/bin/node`).
+
 Override codex defaults at server startup:
 
 ```json
@@ -396,8 +444,10 @@ Except for the explicit Fast-mode pair described above, the bridge does not inhe
 settings from your normal `~/.codex/config.toml`. In particular, inherited MCP
 servers remain intentionally unavailable inside bridged Codex sessions.
 
+<a id="alternative-using-npx"></a>
+
 <details>
-<summary>Alternative: using npx (zero install, slower startup)</summary>
+<summary>Alternative: using npx (zero install, less reliable launch)</summary>
 
 ```json
 {
@@ -411,9 +461,14 @@ servers remain intentionally unavailable inside bridged Codex sessions.
 }
 ```
 
-`npx` only affects process launch. Once the MCP server is connected, normal
-tool-call latency is the same server code either way. Use `npx` when zero install
-matters more than startup/cache reliability.
+`npx` only affects process launch — once connected, tool-call latency is the same
+server code either way. But every launch (including each reconnect) resolves the
+package against the npm registry with no offline fallback, so a slow, offline, or
+stale-cached resolution can fail the launch and drop the tools mid-session (see
+[npm vs npx](#integration-with-claude-code) above). Pinning `mcp-agents@x.y.z`
+avoids a mid-session `@latest` picking up a freshly published version, but does
+not remove the per-launch network dependency. Use `npx` only when zero install
+matters more than launch reliability.
 
 </details>
 

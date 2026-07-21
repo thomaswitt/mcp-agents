@@ -47,6 +47,10 @@ const CODEX_WORKSPACE_NETWORK_ACCESS_ENV =
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_CODEX_TERMINAL_GRACE_MS = 1_000;
 const DEFAULT_CODEX_CANCEL_GRACE_MS = 3_000;
+// Backstop for a queued generated frame that cannot flush because codex left a
+// native frame unterminated (buffer mode latched, no boundary). Generous: it
+// must never fire for legitimate slow-frame delivery, only a genuine wedge.
+const DEFAULT_CODEX_FLUSH_STALL_MS = 60_000;
 const DEFAULT_CODEX_PROGRESS_INTERVAL_MS = 1_000;
 const DEFAULT_CODEX_WAIT_INTERVAL_MS = 10_000;
 const MAX_CODEX_STATUS_WAIT_MS = 60_000;
@@ -1363,6 +1367,10 @@ function runCodexPassthrough({
     "MCP_AGENTS_CODEX_CANCEL_GRACE_MS",
     DEFAULT_CODEX_CANCEL_GRACE_MS,
   );
+  const flushStallLimitMs = testTunableMs(
+    "MCP_AGENTS_CODEX_FLUSH_STALL_MS",
+    DEFAULT_CODEX_FLUSH_STALL_MS,
+  );
   const progressIntervalMs = testTunableMs(
     "MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS",
     DEFAULT_CODEX_PROGRESS_INTERVAL_MS,
@@ -1514,6 +1522,7 @@ function runCodexPassthrough({
       "hardTimer",
       "terminalTimer",
       "cancelTimer",
+      "abortEscalationTimer",
       "progressFlushTimer",
       "waitTimer",
       "localWaitTimer",
@@ -1528,6 +1537,10 @@ function runCodexPassthrough({
         generatedFrames.splice(index, 1);
       }
     }
+    // A cancellation-driven drop can empty the queue without a flush. Reset the
+    // delivery backstop here too, so the next stuck frame gets its OWN full grace
+    // window rather than inheriting this now-stale timer's remaining time.
+    if (generatedFrames.length === 0) clearFlushStallGuard();
   };
   const dropQueuedProgress = (requestKey) =>
     dropQueuedFrames(requestKey, "progress");
@@ -1576,23 +1589,41 @@ function runCodexPassthrough({
     ) return;
     entry.idleTimer = setTimeout(() => {
       if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
-      finalize({
-        reason:
-          `request ${JSON.stringify(entry.id)} idle timeout ` +
-          `(${Math.round(resolvedIdleTimeoutMs / 1000)}s)`,
-        emit: true,
-        exitCode: 1,
-      });
+      // A per-request idle timeout aborts ONLY this request — it must NOT tear
+      // down the whole bridge, which would close the stdio transport and make
+      // the client permanently unregister every codex tool.
+      abortRequestNoTeardown(
+        entry,
+        `request idle timeout (${Math.round(resolvedIdleTimeoutMs / 1000)}s)`,
+      );
     }, resolvedIdleTimeoutMs);
   };
   const armEntryHard = (entry) => {
     if (!(resolvedHardTimeoutMs > 0)) return;
     entry.hardTimer = setTimeout(() => {
       if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+      const label =
+        `request hard timeout (${Math.round(resolvedHardTimeoutMs / 1000)}s)`;
+      if (entry.state === "open") {
+        // Bound the single request, keep the transport (defer/escalate if needed).
+        abortRequestNoTeardown(entry, label);
+        return;
+      }
+      // The immutable hard deadline must ALWAYS bound the request. Unlike
+      // idleTimer, beginTerminalGrace deliberately does NOT clear hardTimer, so
+      // this can fire while the entry sits in terminal_grace (its terminalTimer
+      // not yet run, or its synthesizeTerminalResult deferred on a mid-frame
+      // stall). Try the safe, no-teardown settlement FIRST — synthesizeTerminalResult
+      // settles an internalJob unconditionally and a normal entry when framing is
+      // clean; only a genuinely wedged mid-frame entry stays in_flight afterward.
+      // Fall back to a bounded teardown ONLY for that residue, rather than tearing
+      // the whole bridge down for a request that could have been answered safely.
+      if (entry.state === "terminal_grace") {
+        synthesizeTerminalResult(entry);
+        if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+      }
       finalize({
-        reason:
-          `request ${JSON.stringify(entry.id)} hard timeout ` +
-          `(${Math.round(resolvedHardTimeoutMs / 1000)}s)`,
+        reason: `${label} while state=${entry.state}`,
         emit: true,
         exitCode: 1,
       });
@@ -1649,6 +1680,8 @@ function runCodexPassthrough({
       commentaryItemIds: new Set(),
       commentaryBuffers: new Map(),
       fallbackReady: false,
+      timeoutPending: undefined,
+      nativeCancelSent: false,
     };
     inFlight.set(key, entry);
     armEntryIdle(entry);
@@ -1667,6 +1700,40 @@ function runCodexPassthrough({
     !rewriteSkipUntilNewline && !rewriteDropUntilNewline;
   const canInjectGeneratedFrame = () =>
     !stdoutPaused && canArmResponseSuppression();
+  // Session-level delivery backstop. Suppressing a request id (per-call timeout,
+  // terminal-grace fallback, or cancel) latches buffer mode for the WHOLE stream;
+  // if codex then leaves a native frame unterminated and neither completes it nor
+  // exits, canInjectGeneratedFrame() stays false forever and EVERY queued
+  // generated frame (local tool responses, other requests' aborts) is blocked —
+  // a whole-bridge hang no per-request timer covers once its entry has settled.
+  // Armed when a frame cannot flush; on fire, escalate to a bounded teardown ONLY
+  // if still wedged on FRAMING (not mere client backpressure, which resolves on
+  // drain/EPIPE); otherwise disarm or re-arm while frames remain queued.
+  let flushStallTimer;
+  const clearFlushStallGuard = () => {
+    if (!flushStallTimer) return;
+    clearTimeout(flushStallTimer);
+    flushStallTimer = undefined;
+  };
+  const armFlushStallGuard = () => {
+    if (flushStallTimer || finalizing || flushStallLimitMs <= 0) return;
+    flushStallTimer = setTimeout(() => {
+      flushStallTimer = undefined;
+      if (finalizing || generatedFrames.length === 0) return;
+      if (!stdoutPaused && !canInjectGeneratedFrame()) {
+        finalize({
+          reason:
+            `generated frames undeliverable for ${flushStallLimitMs}ms ` +
+            `(codex left a native frame unterminated)`,
+          emit: true,
+          exitCode: 1,
+        });
+        return;
+      }
+      armFlushStallGuard(); // still queued but backpressured/flushable — wait more
+    }, flushStallLimitMs);
+    flushStallTimer.unref?.();
+  };
   const queueGeneratedFrame = (frame, { requestKey, kind } = {}) => {
     const queued = {
       buffer: Buffer.from(`${JSON.stringify(frame)}\n`, "utf8"),
@@ -1676,10 +1743,23 @@ function runCodexPassthrough({
     if (kind === "progress") {
       // Backpressure or a partial native frame can delay injection. Retain only
       // the latest progress update for this request so silence cannot grow an
-      // unbounded side queue.
-      dropQueuedProgress(requestKey);
+      // unbounded side queue. Coalesce IN PLACE (replace the matching frame's
+      // buffer) rather than remove-then-push: a remove-then-push would transiently
+      // empty the queue and reset the flush-stall delivery backstop on every
+      // heartbeat, defeating it for a genuinely wedged request that keeps
+      // emitting progress. In-place replacement preserves the backstop's original
+      // arm time (how long the queue has actually been stuck).
+      const existing = generatedFrames.findIndex(
+        (f) => f.kind === "progress" && f.requestKey === requestKey,
+      );
+      if (existing !== -1) {
+        generatedFrames[existing] = queued;
+        queueMicrotask(() => flushGeneratedFrames());
+        return;
+      }
     }
     generatedFrames.push(queued);
+    if (!canInjectGeneratedFrame()) armFlushStallGuard();
     queueMicrotask(() => flushGeneratedFrames());
   };
   const generatedFrameIsLive = (frame) => {
@@ -2596,13 +2676,7 @@ function runCodexPassthrough({
         });
       }
       settleInFlight(entry.id);
-      if (suppressedResponseIds.size >= MAX_SUPPRESSED_CODEX_RESPONSES) {
-        setImmediate(() => finalize({
-          reason: "late-response suppression limit reached",
-          emit: true,
-          exitCode: 1,
-        }));
-      }
+      finalizeOnSuppressionCap();
       return;
     }
     if (!canInjectGeneratedFrame()) {
@@ -2621,18 +2695,124 @@ function runCodexPassthrough({
       `[mcp-agents] recovered missing codex response for request ` +
         `${JSON.stringify(entry.id)} (thread_id=${entry.threadId ?? "unknown"})`,
     );
-    if (suppressedResponseIds.size >= MAX_SUPPRESSED_CODEX_RESPONSES) {
-      setImmediate(() => finalize({
+    finalizeOnSuppressionCap();
+  };
+  // Answer a single request that hit its idle/hard timeout with a JSON-RPC
+  // error, suppress codex's eventual (late) native response, and settle it —
+  // WITHOUT tearing down the bridge. A per-request timeout used to call
+  // finalize(), which process.exit()s; that closed the stdio transport and made
+  // Claude Code route the server to `failed` and strip every mcp__codex__* tool
+  // for the rest of the session (stdio servers are not auto-reconnected). This
+  // mirrors synthesizeTerminalResult's frame-boundary + suppression discipline
+  // so a late native response is dropped in the forward path rather than
+  // double-delivered.
+  const timeoutErrorFrame = (entry, label) => ({
+    jsonrpc: "2.0",
+    id: entry.id,
+    error: {
+      code: -32001,
+      message:
+        `mcp-agents: codex pass-through ${label}; the request was aborted but ` +
+        `the bridge stayed connected. Any applied edits may exist — verify the ` +
+        `tree, then retry the call.` +
+        (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
+    },
+  });
+  // Tell codex to stop working on a request whose deadline we've given up on, so
+  // a slow/hung call is not left running unbounded once we stop waiting for it
+  // (the old finalize path SIGKILLed the whole group; a per-request abort must
+  // cancel just this one). Best-effort and idempotent; also prods a codex that
+  // stalled mid-frame to emit a boundary or exit, which lets a deferred abort
+  // resolve. Written to codex's stdin — it never touches the client stdout frame.
+  const requestNativeCancel = (entry, reason) => {
+    if (!entry || entry.nativeCancelSent) return;
+    entry.nativeCancelSent = true;
+    try {
+      child.stdin.write(`${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: entry.id, reason },
+      })}\n`);
+    } catch {}
+  };
+  const overSuppressionCap = () =>
+    suppressedResponseIds.size >= MAX_SUPPRESSED_CODEX_RESPONSES;
+  const finalizeOnSuppressionCap = () => {
+    if (!overSuppressionCap()) return;
+    // Re-check inside the tick: a late native response may have relieved the cap
+    // between scheduling and firing, in which case a full teardown is not needed.
+    setImmediate(() => {
+      if (finalizing || !overSuppressionCap()) return;
+      finalize({
         reason: "late-response suppression limit reached",
         emit: true,
         exitCode: 1,
-      }));
+      });
+    });
+  };
+  const abortRequestNoTeardown = (entry, label) => {
+    if (
+      finalizing || inFlight.get(idKey(entry.id)) !== entry ||
+      entry.state !== "open"
+    ) return;
+    const key = idKey(entry.id);
+    requestNativeCancel(entry, `mcp-agents: ${label}`);
+    if (entry.internalJob) {
+      // Background job: the client already holds the jobId, so there is no
+      // client frame to emit — fail the job and suppress codex's late native
+      // response (mirrors synthesizeTerminalResult's internalJob branch).
+      const job = jobs.get(entry.jobId);
+      privateJobRequestIds.delete(key);
+      suppressedResponseIds.add(key);
+      if (job && !isTerminalJob(job)) transitionJobTerminal(job, "failed", label);
+      settleInFlight(entry.id);
+      entry.timeoutPending = undefined;
+      finalizeOnSuppressionCap();
+      return;
     }
+    if (!canInjectGeneratedFrame()) {
+      // No safe frame boundary (codex stalled mid-frame, or stdout is
+      // backpressured): we CANNOT splice a synthetic frame into a partial native
+      // one, so defer. flushReadyTerminalResults retries on the next codex
+      // stdout activity / drain — which the cancellation above helps produce.
+      // But a codex wedged mid-frame that also ignores the cancellation would
+      // never produce that activity, so a one-shot escalation guarantees the
+      // request cannot hang forever: after the cancel grace, fall back to a
+      // bounded teardown (the only safe resolution for a mid-frame wedge; the
+      // client can then reconnect to a clean bridge).
+      entry.timeoutPending = label;
+      if (!entry.abortEscalationTimer) {
+        entry.abortEscalationTimer = setTimeout(() => {
+          if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+          finalize({
+            reason: `request ${JSON.stringify(entry.id)} ${label} could not be ` +
+              `delivered at a frame boundary within ${cancelGraceMs}ms`,
+            emit: true,
+            exitCode: 1,
+          });
+        }, cancelGraceMs);
+      }
+      return;
+    }
+    entry.timeoutPending = undefined;
+    clearTimer(entry, "abortEscalationTimer");
+    suppressedResponseIds.add(key);
+    settleInFlight(entry.id);
+    queueGeneratedFrame(timeoutErrorFrame(entry, label), { kind: "terminal_result" });
+    logErr(
+      `[mcp-agents] aborted codex request ${JSON.stringify(entry.id)} ` +
+        `(${label}); transport kept alive ` +
+        `(thread_id=${entry.threadId ?? "unknown"})`,
+    );
+    finalizeOnSuppressionCap();
   };
   const flushReadyTerminalResults = () => {
     if (!canInjectGeneratedFrame()) return;
     for (const entry of [...inFlight.values()]) {
       if (entry.fallbackReady) synthesizeTerminalResult(entry);
+      else if (entry.timeoutPending) {
+        abortRequestNoTeardown(entry, entry.timeoutPending);
+      }
     }
   };
   const beginTerminalGrace = (entry, message) => {
@@ -2668,6 +2848,7 @@ function runCodexPassthrough({
     clearTimer(entry, "idleTimer");
     clearTimer(entry, "hardTimer");
     clearTimer(entry, "terminalTimer");
+    clearTimer(entry, "abortEscalationTimer");
     if (canArmResponseSuppression()) suppressedResponseIds.add(idKey(id));
     entry.cancelTimer = setTimeout(() => {
       if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
@@ -3128,6 +3309,9 @@ function runCodexPassthrough({
       forwardChunk(frame.buffer);
       markGeneratedFrameDelivered(frame);
     }
+    // Queue drained (or emptied by dropped/non-live frames): the delivery
+    // backstop is no longer needed until the next stuck frame arms it.
+    if (generatedFrames.length === 0) clearFlushStallGuard();
   };
 
   // Once no tools/list id is outstanding (and not mid-skip), a trailing partial in

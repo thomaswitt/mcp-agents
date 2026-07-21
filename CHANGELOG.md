@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.20.0] - 2026-07-21
+
+### Changed
+
+- A Codex per-request idle or hard timeout now fails **only** the stalled
+  `tools/call` (JSON-RPC `-32001`) and keeps the bridge connected, instead of
+  tearing down the whole process. A stdio transport close makes MCP clients such
+  as Claude Code mark the server `failed` and permanently unregister every
+  `mcp__codex__*` tool for the rest of the session, so a single stalled review no
+  longer takes the entire Codex bridge down with it. The stalled call's late
+  native response is suppressed, Codex is sent a `notifications/cancelled` for
+  that request so it stops working, and the Codex process group is still reaped on
+  a genuine teardown (client disconnect, signal, or `stdout` `EPIPE`). The lone
+  exception is a Codex wedged partway through a response frame that also ignores
+  the cancellation: with no safe boundary to inject the error, the wrapper
+  escalates to a bounded whole-bridge teardown after the cancel grace. The
+  immutable `--timeout` hard deadline always bounds a request, even mid-teardown.
+
+### Documentation
+
+- Recommend a globally installed `mcp-agents` binary (or an absolute
+  `node server.js` path) over `npx -y mcp-agents@latest`, which resolves against
+  the npm registry on every launch — including reconnects — and can drop the
+  tools mid-session on a slow, offline, or stale-cached (`ETARGET`) resolution.
+
 ## [0.19.0] - 2026-07-17
 
 ### Changed

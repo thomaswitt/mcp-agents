@@ -679,6 +679,9 @@ process.stdin.on("data", (d) => {
     }
   }
 });
+// Exit when the bridge closes our stdin so a stall case can shut down cleanly
+// once the client disconnects (the idle watchdog no longer kills us).
+process.stdin.on("end", () => process.exit(0));
 setInterval(() => {}, 1 << 30);
 EOF
   chmod +x "$1/codex"
@@ -731,9 +734,11 @@ run_codex_watchdog_case() {
     child_ok=1
   fi
 
-  # Exact exit code, not just "not a timeout": stall tears down via the idle
-  # watchdog (exit 1); die exits with codex's own clean code (0). A different
-  # code means an unexpected crash.
+  # Exact exit code, not just "not a timeout": under the per-request timeout
+  # contract the idle watchdog fails ONLY the stalled call and keeps the bridge
+  # connected, so a stall now exits 0 when the client closes stdin (NOT exit 1
+  # at the timeout — that would be the old whole-process teardown regression);
+  # die exits with codex's own clean code (0). A different code means a crash.
   if [ "$status" -eq "$expected_status" ] && [ "$resp_ok" -eq 1 ] && [ "$child_ok" -eq 1 ]; then
     green "PASS: $label"
     PASS=$((PASS + 1))
@@ -1411,6 +1416,54 @@ function startCall(id) {
     case "unrelated":
       every(30, () => event(999, "agent_message_content_delta", { delta: "noise" }));
       break;
+    case "survive":
+      // id 2 stalls (idles out); a later id 3 must still get a real result,
+      // proving the transport survived the first call's per-request timeout.
+      if (id === 3) later(20, () => result(id, "SURVIVED"));
+      break;
+    case "gracehang": {
+      // Enter terminal grace via task_complete, then leave a partial
+      // (unterminated) frame and go silent forever. synthesizeTerminalResult must
+      // then defer (no safe boundary) and beginTerminalGrace clears idleTimer —
+      // so ONLY the immutable hard deadline can bound this call. It must fire a
+      // bounded teardown at the hard deadline, never silently no-op and hang.
+      const partial = JSON.stringify(eventMessage(id, "warning", { message: "SAFE" }));
+      process.stdout.write(
+        `${JSON.stringify(eventMessage(id, "task_complete", { last_agent_message: "GRACE" }))}\n${partial.slice(0, partial.length - 5)}`,
+      );
+      break;
+    }
+    case "flushstall":
+      // id 2 idles out at ~300ms and is CLEANLY suppressed (buffer mode latches
+      // while lastForwardedByteWasNewline is still true). Only THEN (350ms) do we
+      // leave a partial, unterminated native frame that never completes and never
+      // exits — canInjectGeneratedFrame() stays false forever, so the local
+      // codex-status response the driver queues later can never flush. The
+      // session-level delivery backstop must escalate to a bounded teardown.
+      later(350, () => process.stdout.write(
+        '{"jsonrpc":"2.0","method":"codex/event","params":{"msg":"STUCK_PARTIAL"',
+      ));
+      break;
+    case "progressstall":
+      // Start progress (so armProgressWait emits "still running" heartbeats with
+      // idle disabled), then leave a partial, unterminated frame and freeze. Each
+      // heartbeat queues a progress frame that cannot flush. With IN-PLACE progress
+      // coalescing the flush-stall backstop's arm time survives every heartbeat and
+      // it fires; a remove-then-push coalesce would reset it each heartbeat and the
+      // wedged request would never be bounded by the backstop.
+      event(id, "task_started");
+      later(200, () => process.stdout.write(
+        '{"jsonrpc":"2.0","method":"codex/event","params":{"msg":"STUCK_PROGRESS"',
+      ));
+      break;
+    case "gracesafe":
+      // Clean terminal event early → terminal_grace with CLEAN framing. With a hard
+      // deadline shorter than the terminal grace, hardTimer fires while still in
+      // terminal_grace. armEntryHard must then settle it via synthesizeTerminalResult
+      // (safe, no teardown) rather than finalize()-ing the whole bridge — proven by
+      // the transport surviving to answer a follow-up call (id 3).
+      later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }));
+      break;
     case "progress":
       event(id, "item_started", { item: { type: "AgentMessage", id: `commentary-${id}`, phase: "commentary" } });
       for (const delay of [100, 200, 300, 400, 500, 600, 700]) {
@@ -1591,7 +1644,7 @@ write_codex_lifecycle_driver() {
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-const [stubDir, serverDir, mode, idle, hard, settle, terminal, cancel, progressConfig] = process.argv.slice(2);
+const [stubDir, serverDir, mode, idle, hard, settle, terminal, cancel, progressConfig, flushStall] = process.argv.slice(2);
 const [progress, wait = "10000"] = progressConfig.split(",");
 const pidFile = `${stubDir}/codex.pid`;
 const callFile = `${stubDir}/calls.jsonl`;
@@ -1609,6 +1662,7 @@ const child = spawn("node", ["server.js", "--provider", "codex", "--codex_idle_t
     MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS: progress,
     MCP_AGENTS_CODEX_WAIT_INTERVAL_MS: wait,
     MCP_AGENTS_TEST_TIMER_AUDIT: "1",
+    ...(flushStall ? { MCP_AGENTS_CODEX_FLUSH_STALL_MS: flushStall } : {}),
   },
   stdio: ["pipe", "pipe", "pipe"],
 });
@@ -1617,6 +1671,7 @@ let err = "";
 let parseBuf = "";
 let scenarioStarted = false;
 let reuseSent = false;
+let surviveSent = false;
 let bootTimer;
 let pingTimer;
 let settleTimer;
@@ -1660,13 +1715,22 @@ const startScenario = () => {
     setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2, reason: "test" } }), 60);
   } else {
     const tokenModes = new Set([
-      "hard", "visibility", "coalesce", "wait", "partial", "partialstall", "settled", "terminalstop",
+      "hard", "visibility", "coalesce", "wait", "partial", "partialstall", "settled", "terminalstop", "progressstall",
     ]);
     call(2, tokenModes.has(mode) ? `${mode}-2` : undefined);
   }
   if (mode === "unrelated") {
     let pingId = 100;
     pingTimer = setInterval(() => send({ jsonrpc: "2.0", id: pingId++, method: "ping", params: {} }), 30);
+  }
+  if (mode === "flushstall") {
+    // After id 2 is suppressed (~300ms) and the stub's partial jams the buffer
+    // (~350ms), poll a bogus job: the local jobNotFound response is queued but
+    // can never flush, so the delivery backstop must fire a bounded teardown.
+    setTimeout(() => send({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "codex-status", arguments: { jobId: "no-such-job", cursor: 0 } },
+    }), 600);
   }
   settleTimer = setTimeout(() => {
     if (pingTimer) clearInterval(pingTimer);
@@ -1686,6 +1750,19 @@ child.stdout.on("data", (data) => {
     if (mode === "reuse" && frame.id === 2 && frame.result?.structuredContent?.content === "DONE" && !reuseSent) {
       reuseSent = true;
       call(2, undefined, "REUSED");
+    }
+    // survive: only AFTER id 2's timeout error do we issue id 3, so a passing
+    // id-3 result proves the bridge served a new call post-timeout (not before it).
+    if (mode === "survive" && frame.id === 2 && frame.error && !surviveSent) {
+      surviveSent = true;
+      call(3);
+    }
+    // gracesafe: after id 2's recovered terminal RESULT (settled at the hard
+    // deadline without teardown), issue id 3 — a passing id-3 result proves the
+    // transport survived (a full teardown would leave id 3 unanswered).
+    if (mode === "gracesafe" && frame.id === 2 && frame.result && !surviveSent) {
+      surviveSent = true;
+      call(3);
     }
   }
 });
@@ -1982,14 +2059,14 @@ test_codex_job_lifecycle() {
 
 test_codex_lifecycle() {
   local label="$1" mode="$2" idle="$3" hard="$4" settle="$5"
-  local terminal="$6" cancel="$7" progress="$8" predicate="$9"
+  local terminal="$6" cancel="$7" progress="$8" predicate="$9" flushstall="${10:-}"
   local tmpdir status summary ok
   echo "--- $label ---"
   tmpdir=$(mktemp -d)
   write_codex_lifecycle_stub "$tmpdir"
   write_codex_lifecycle_driver "$tmpdir"
   set +e
-  summary=$($TIMEOUT_CMD 8 node "$tmpdir/driver.mjs" "$tmpdir" "$(pwd)" "$mode" "$idle" "$hard" "$settle" "$terminal" "$cancel" "$progress" 2>/dev/null)
+  summary=$($TIMEOUT_CMD 8 node "$tmpdir/driver.mjs" "$tmpdir" "$(pwd)" "$mode" "$idle" "$hard" "$settle" "$terminal" "$cancel" "$progress" ${flushstall:+"$flushstall"} 2>/dev/null)
   status=$?
   set -e
   ok=1
@@ -2270,16 +2347,22 @@ test_codex_toolslist_file "tools/list oversized frame forwarded raw, result stil
 test_codex_toolslist_cancel "tools/list cancel flushes a withheld partial raw (not lost)"
 
 # Stub-based per-request Codex lifecycle tests.
+# A per-request idle/hard timeout aborts ONLY that request (one -32001) and
+# keeps the bridge connected — it no longer finalize()s the whole process. So
+# the wrapper now exits cleanly (code 0) when the driver closes stdin, NOT with
+# code 1 at the timeout, and the "stayed connected" message signature must hold.
 test_codex_lifecycle "codex stderr does not reset request idle deadline" \
   "stderr" "0.3" "2" "1000" "80" "100" "0" \
-  '(.code == 1) and (.stubAlive == false) and
-   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")))] | length == 1) and
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")) and (.error.message | ascii_downcase | contains("stayed connected")))] | length == 1) and
    ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
+# Proof the transport SURVIVES the timeout: after id 2 idles out, the bridge
+# keeps answering the driver's ping flood (ids >= 100) — many round-trips, not one.
 test_codex_lifecycle "codex unrelated pings/events do not reset request idle deadline" \
   "unrelated" "0.3" "2" "1000" "80" "100" "0" \
-  '(.code == 1) and (.stubAlive == false) and
+  '(.code == 0) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")))] | length == 1) and
-   ([.frames[] | select((.id // 0) >= 100 and has("result"))] | length >= 1)'
+   ([.frames[] | select((.id // 0) >= 100 and has("result"))] | length >= 5)'
 test_codex_lifecycle "codex matching events extend idle and progress uses supplied token only" \
   "progress" "0.3" "2" "1000" "80" "100" "60" \
   '(.code == 0) and (.stubAlive == false) and
@@ -2314,9 +2397,12 @@ test_codex_lifecycle "codex progress is immediate then coalesces latest distinct
   '(.code == 0) and
    ([.frames[] | select(.method == "notifications/progress") | .params.message] ==
      ["Codex: started", "Codex: working on: Latest status"])'
+# Silence notices must not extend the idle deadline: the idle -32001 still fires
+# (proof it wasn't extended). Process exit is now driven by the driver closing
+# stdin (settle), not by the timeout, so the old idle-timed elapsed bound is gone.
 test_codex_lifecycle "codex silence notices report event age without extending idle" \
   "wait" "1.25" "3" "2400" "80" "100" "20,250" \
-  '(.code == 1) and (.elapsedMs >= 1700) and (.elapsedMs < 2300) and
+  '(.code == 0) and
    ([.frames[] | select(.method == "notifications/progress") | .params.message] as $messages |
      ($messages | any(contains("still running; last activity 0s ago"))) and
      ($messages | any(contains("still running; last activity 1s ago")))) and
@@ -2327,10 +2413,71 @@ test_codex_lifecycle "codex progress waits for a safe boundary and keeps only th
    ([.frames[] | select(.method == "notifications/progress")] | length == 1) and
    ([.frames[] | select(.method == "notifications/progress") | .params.message | contains("still running")] | all) and
    ([.frames[] | select(.id == 2 and .result.structuredContent.content == "PARTIAL")] | length == 1)'
-test_codex_lifecycle "codex permanent partial stall never splices progress and still idles out" \
-  "partialstall" "0.25" "2" "600" "80" "100" "20,60" \
-  '(.code == 1) and (.rawHasProgress == false) and
-   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")))] | length == 1)'
+# Permanent partial stall: the idle abort has NO safe frame boundary to inject at
+# (codex is wedged mid-partial-frame), so it must never splice a frame into the
+# partial (rawHasProgress==false) and instead DEFERS. Because this codex ignores
+# the cancellation too, the deferred abort escalates to a bounded teardown after
+# the cancel grace — the only safe resolution for a mid-frame wedge: exactly one
+# -32001 for id 2, no result, exit code 1. A codex that resolved the partial
+# would instead keep the transport alive (see the "survive" test below).
+test_codex_lifecycle "codex permanent partial stall never splices progress and escalates to a bounded teardown" \
+  "partialstall" "0.25" "2" "1500" "80" "100" "20,60" \
+  '(.code == 1) and (.rawHasProgress == false) and (.elapsedMs < 1100) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001)] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
+# The core guarantee, proven end to end: id 2 idles out with a -32001, and only
+# THEN is id 3 issued — its real result proves the bridge stayed connected and
+# served a brand-new call after the first one timed out (no whole-process exit).
+test_codex_lifecycle "codex keeps the transport alive so a later call succeeds after one times out" \
+  "survive" "0.3" "5" "1200" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")) and (.error.message | ascii_downcase | contains("stayed connected")))] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 0) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "SURVIVED")] | length == 1)'
+# The hard deadline is an immutable backstop even after terminal grace begins:
+# beginTerminalGrace clears idleTimer but NOT hardTimer, and the keep-alive abort
+# path no-ops for a non-"open" entry — so the hard timer must fall back to a
+# bounded teardown. Proof: the bridge exits at the ~1s hard deadline (elapsedMs
+# well under the 4s stdin-close settle), NOT by hanging until the client leaves.
+# A regression (hard timer no-ops in terminal_grace) would hang to ~settle.
+test_codex_lifecycle "codex hard deadline bounds a wedged terminal-grace call (no infinite hang)" \
+  "gracehang" "5" "1" "4000" "200" "100" "0" \
+  '(.code == 1) and (.elapsedMs >= 900) and (.elapsedMs < 2500) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "GRACE")] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("error"))] | length == 0)'
+# Complement to gracehang: when the hard deadline lands on a terminal_grace entry
+# whose framing is CLEAN, armEntryHard settles it via synthesizeTerminalResult
+# WITHOUT tearing down the bridge. Hard (200ms) < terminal grace (500ms) so the
+# hard timer fires first, in terminal_grace; Fix A recovers id 2's result and the
+# transport survives to answer id 3. Reverting Fix A tears down at the hard
+# deadline instead (exit 1, id 3 unanswered) — this is the test that distinguishes
+# it (gracehang alone cannot, since finalize's own recovery emits the same frame).
+test_codex_lifecycle "codex hard deadline on a clean terminal-grace call settles it without teardown" \
+  "gracesafe" "5" "0.2" "1000" "500" "100" "0" \
+  '(.code == 0) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "DONE")] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "DONE")] | length == 1)'
+# Delivery backstop: a suppressed id latches buffer mode; a codex that then leaves
+# a native frame unterminated and never exits blocks EVERY queued generated frame
+# (here a codex-status local response with no timer of its own). The session-level
+# flush-stall guard (400ms here) must escalate to a bounded teardown (exit 1) —
+# proven by exiting well under the 3s stdin-close settle, not hanging until it.
+test_codex_lifecycle "codex delivery backstop tears down when a stuck native partial blocks all frames" \
+  "flushstall" "0.3" "5" "3000" "80" "100" "0" \
+  '(.code == 1) and (.elapsedMs >= 900) and (.elapsedMs < 2200) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001)] | length == 1)' \
+  "400"
+# The backstop must survive a wedged request's own progress heartbeats. The
+# "still running; last activity Ns ago" message changes ~once per second, so a
+# remove-then-push coalesce would empty+reset the guard every ~1s; with the guard
+# limit (2000ms) set ABOVE that reset rate, a buggy coalesce would reset the guard
+# faster than it can fire and the wedge would NEVER be bounded (hang to the 5s
+# stdin-close settle → exit 0). In-place coalescing preserves the arm time, so the
+# guard fires (exit 1) well before settle. Idle disabled so only this can bound it.
+test_codex_lifecycle "codex delivery backstop is not reset by a wedged request's progress heartbeats" \
+  "progressstall" "0" "20" "5000" "80" "100" "20,100" \
+  '(.code == 1) and (.elapsedMs < 4500)' \
+  "2000"
 test_codex_lifecycle "codex settlement clears progress and silence timers" \
   "settled" "0.5" "2" "300" "80" "100" "20,60" \
   '(.code == 0) and
@@ -2376,7 +2523,7 @@ test_codex_lifecycle "codex request-id reuse is rejected while late response is 
    ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("reused")))] | length == 1)'
 test_codex_lifecycle "codex hard deadline is immutable despite matching progress" \
   "hard" "0.3" "0.55" "1000" "80" "100" "0" \
-  '(.code == 1) and (.stubAlive == false) and
+  '(.code == 0) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | test("hard|deadline")))] | length == 1) and
    ([.frames[] | select(.method == "notifications/progress" and .params.progressToken == "hard-2")] | length >= 1)'
 test_codex_lifecycle "codex cancellation tears wrapper down after bounded grace" \
@@ -2481,8 +2628,8 @@ test_codex_job_lifecycle "Canceling a status wait leaves its Codex job running" 
   "asyncwaitcancel"
 
 # Stub-based codex watchdog/child-death tests (fast — no real codex needed)
-run_codex_watchdog_case "codex idle watchdog synthesizes error for stalled call" \
-  "stall" "--codex_idle_timeout 1" 1
+run_codex_watchdog_case "codex idle watchdog fails the stalled call but keeps the bridge alive" \
+  "stall" "--codex_idle_timeout 1" 0
 run_codex_watchdog_case "codex child death synthesizes error (no childless hang)" \
   "die" "--codex_idle_timeout 30" 0
 
