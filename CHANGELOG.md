@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.21.0] - 2026-07-22
+
+### Fixed
+
+- A client cancellation that Codex does not acknowledge in time no longer tears
+  the whole bridge down. 0.20.0 removed the whole-bridge teardown from the
+  *timeout* path but left it on the *cancellation* path, where it fired far more
+  often: every ESC, aborted turn, or subagent teardown sends
+  `notifications/cancelled`, and a Codex mid-turn does not service it within the
+  grace. The teardown killed every **other** in-flight request, every background
+  job, and the isolated `CODEX_HOME` — which holds the Codex `sessions/`
+  directory, so every `threadId` in the process became permanently unresumable
+  and the next `codex-reply` failed with `Session not found for thread_id`.
+  A cancelled request now costs exactly one request: its id is settled locally,
+  Codex's late response is suppressed, and peers keep running. Teardown remains
+  only for a stream wedged mid-frame with no safe boundary, and even that now
+  retries once before escalating.
+- The default cancel grace is raised from 3s to 30s. Three seconds was far below
+  what a Codex running sandboxed commands needs to acknowledge a cancellation, so
+  the escalation path was effectively the default path.
+- A background job (`codex-start`) whose cancellation goes unacknowledged is now
+  driven to a terminal `canceled` state instead of sitting in `canceling`
+  forever, which previously hung every `codex-status` long-poll against it.
+- Background jobs no longer outlive the client that dispatched them. A job is
+  polled by `jobId` through the bridge process, so once the client disconnects
+  nothing can ever read its result — but Codex kept executing it, writing to the
+  workspace, invisible to the client's own task registry (a harness "stop task"
+  cannot reach an mcp-agents job; only `codex-cancel` can, and the `jobId` died
+  with the connection). Client stdin EOF now cancels every non-terminal job and
+  every open request, and a bounded wind-down reaps the Codex process group if it
+  keeps working anyway.
+
+### Added
+
+- `--codex_cancel_grace <secs>` sets how long Codex may take to acknowledge a
+  cancellation before the bridge abandons the request (the bridge stays
+  connected). CLI flag wins over `MCP_AGENTS_CODEX_CANCEL_GRACE_MS`.
+- Abandoned Codex turns are now logged explicitly on stderr — once when the
+  wrapper stops waiting (naming the `thread_id`, `job_id`, and sandbox mode, and
+  warning that the workspace may still have a live writer) and again if the turn
+  later finishes and its result is discarded. A tree that changed under an agent
+  can now be explained from the log instead of inferred.
+- Stale isolated Codex homes (`$TMPDIR/mcp-agents-codex-*`) older than 12h are
+  swept at startup. Each one is left behind by a bridge that died without running
+  cleanup and holds a copy of `auth.json`, so they were both disk litter and
+  credential sprawl.
+
+### Changed
+
+- The isolated Codex home is seeded with `models_cache.json` from the real
+  `CODEX_HOME`. Every bridge start was otherwise a cold Codex install that
+  re-fetched ~280 KB before becoming useful — repeated per session, per
+  reconnect.
+
 ## [0.20.0] - 2026-07-21
 
 ### Changed

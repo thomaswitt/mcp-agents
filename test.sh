@@ -1611,6 +1611,12 @@ function startCall(id) {
       event(id, "task_started");
       every(30, () => event(id, "exec_command_begin", { command: "SENTINEL_CANCEL" }));
       break;
+    case "clientgone":
+      // Keeps working forever and deliberately ignores stdin EOF, standing in
+      // for a codex mid-turn that does not wind down when the client vanishes.
+      event(id, "task_started");
+      every(30, () => event(id, "exec_command_begin", { command: "SENTINEL_GONE" }));
+      break;
   }
 }
 
@@ -1632,7 +1638,7 @@ process.stdin.on("data", (data) => {
     }
   }
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => { if (mode !== "clientgone") process.exit(0); });
 setInterval(() => {}, 1 << 30);
 EOF
   chmod +x "$1/codex"
@@ -1659,6 +1665,7 @@ const child = spawn("node", ["server.js", "--provider", "codex", "--codex_idle_t
     MCP_AGENTS_TEST_CALL_CAPTURE: callFile,
     MCP_AGENTS_CODEX_TERMINAL_GRACE_MS: terminal,
     MCP_AGENTS_CODEX_CANCEL_GRACE_MS: cancel,
+    MCP_AGENTS_CODEX_CLIENT_GONE_GRACE_MS: String(Number(cancel) * 2),
     MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS: progress,
     MCP_AGENTS_CODEX_WAIT_INTERVAL_MS: wait,
     MCP_AGENTS_TEST_TIMER_AUDIT: "1",
@@ -1962,6 +1969,9 @@ const onFrame = (frame) => {
   }
   if (requestName === "codex-cancel") {
     cancelResults.push({ ...structured, text: frame.result.content?.[0]?.text });
+    // The bridge no longer dies when codex ignores the cancellation, so keep
+    // polling: the job must reach a terminal state on its own.
+    poll(structured.cursor);
     return;
   }
   if (requestName === "codex") {
@@ -2526,11 +2536,25 @@ test_codex_lifecycle "codex hard deadline is immutable despite matching progress
   '(.code == 0) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | test("hard|deadline")))] | length == 1) and
    ([.frames[] | select(.method == "notifications/progress" and .params.progressToken == "hard-2")] | length >= 1)'
-test_codex_lifecycle "codex cancellation tears wrapper down after bounded grace" \
+# An unattended writer must never outlive the client that dispatched it: once
+# the client's stdin closes nothing can consume codex's output, so a codex that
+# ignores both the EOF and the cancellations gets a bounded wind-down and is
+# then reaped group-wide. Without the backstop the driver's fallback SIGTERM at
+# settle+500ms would be what finally stopped it.
+test_codex_lifecycle "codex still working after the client disconnects is reaped" \
+  "clientgone" "5" "5" "400" "80" "100" "0" \
+  '(.code == 0) and (.signal == null) and (.stubAlive == false) and
+   (.elapsedMs < 1500)'
+
+# A cancellation codex never acknowledges must cost exactly one request. The
+# bridge stays up and the UNRELATED in-flight call (id 3) keeps running — the
+# old behaviour tore the whole process down ~160ms in, killing every peer
+# request, every background job, and the isolated CODEX_HOME with them.
+test_codex_lifecycle "codex cancellation abandons only its own request and keeps the bridge alive" \
   "cancel" "2" "2" "800" "80" "100" "0" \
-  '(.code == 1) and (.elapsedMs < 1000) and (.stubAlive == false) and
+  '(.code == 0) and (.elapsedMs > 500) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and (has("result") or has("error")))] | length == 0) and
-   ([.frames[] | select(.id == 3 and .error.code == -32001)] | length == 1)'
+   ([.frames[] | select(.params?._meta?.requestId == 3)] | length > 5)'
 
 test_codex_job_lifecycle "Codex background job exposes status, commentary, and result without private-id leakage" \
   '(.code == 0) and (.parseErrors == 0) and
@@ -2556,8 +2580,9 @@ test_codex_job_lifecycle "Codex background job terminal fallback suppresses its 
    ([.frames[] | select(.result.structuredContent.content == "LATE_PRIVATE_RESULT")] | length == 0)' \
   "asyncfallback"
 test_codex_job_lifecycle "Codex background job cancellation is visible and never emits a private-id error" \
-  '(.code == 1) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
    (.cancelResults | length == 1) and (.cancelResults[0].state == "canceling") and
+   ([.statusResults[] | select(.state == "canceled")] | length >= 1) and
    ([.frames[] | select(.method == "codex/event")] | length == 0) and
    ([.frames[] | select((.error.message? // "") | contains("request was still open"))] | length == 0)' \
   "asynccancel"

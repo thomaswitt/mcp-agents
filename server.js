@@ -10,6 +10,8 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readdirSync,
+  statSync,
   renameSync,
   rmSync,
   unlinkSync,
@@ -46,7 +48,12 @@ const CODEX_WORKSPACE_NETWORK_ACCESS_ENV =
 // unrelated calls cannot keep a wedged request alive. 0 disables the idle cap.
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_CODEX_TERMINAL_GRACE_MS = 1_000;
-const DEFAULT_CODEX_CANCEL_GRACE_MS = 3_000;
+// How long codex gets to acknowledge a cancellation before the bridge stops
+// waiting. A codex mid-turn is running sandboxed commands and streaming model
+// output; it does NOT service a cancellation promptly, so this must be generous.
+// Expiry no longer tears the bridge down (see onCancelGraceExpired) — it only
+// decides when the wrapper stops holding the request id open.
+const DEFAULT_CODEX_CANCEL_GRACE_MS = 30_000;
 // Backstop for a queued generated frame that cannot flush because codex left a
 // native frame unterminated (buffer mode latched, no boundary). Generous: it
 // must never fire for legitimate slow-frame delivery, only a genuine wedge.
@@ -61,6 +68,10 @@ const MAX_ACTIVE_CODEX_JOBS = 8;
 const MAX_RETAINED_CODEX_JOBS = 32;
 const CODEX_JOB_RETENTION_MS = 60 * 60 * 1_000;
 const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
+// Isolated Codex homes older than this are assumed to belong to a bridge that
+// died without cleanup and are swept at startup. Comfortably longer than the
+// hard timeout so a live long-running session is never touched.
+const STALE_CODEX_HOME_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 const CODEX_PER_SESSION_MODEL_ARG = "model";
@@ -263,6 +274,10 @@ Options:
                                  overrides it [default: none]
   --codex_idle_timeout <secs>    Codex pass-through idle watchdog; 0 disables
                                  [default: ${DEFAULT_CODEX_IDLE_TIMEOUT_MS / 1000}]
+  --codex_cancel_grace <secs>    How long codex may take to acknowledge a
+                                 cancellation before the bridge abandons the
+                                 request (the bridge stays connected)
+                                 [default: ${DEFAULT_CODEX_CANCEL_GRACE_MS / 1000}]
   --timeout <seconds>            Default timeout per call
                                  [default: codex ${DEFAULT_CODEX_TIMEOUT_MS / 1000}, claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
   --help, -h                     Show this help message
@@ -273,8 +288,8 @@ Options:
  * Parse CLI flags from process.argv.
  * Handles --help, --version, --provider, --model, --model_reasoning_effort,
  * --sandbox_mode, --approval_policy, --codex-workspace-network, --goal,
- * --codex_idle_timeout, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, defaultTimeoutMs?: number }}
+ * --codex_idle_timeout, --codex_cancel_grace, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -286,6 +301,7 @@ function parseArgs() {
   let codexWorkspaceNetworkAccess;
   let goal;
   let codexIdleTimeoutMs;
+  let codexCancelGraceMs;
   let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
@@ -379,6 +395,21 @@ function parseArgs() {
         codexIdleTimeoutMs = Math.round(secs * 1000);
         break;
       }
+      case "--codex_cancel_grace": {
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --codex_cancel_grace requires a value\n");
+          process.exit(1);
+        }
+        const secs = Number(args[++i]);
+        if (!Number.isFinite(secs) || secs < 0) {
+          process.stderr.write(
+            "error: --codex_cancel_grace must be a non-negative number\n",
+          );
+          process.exit(1);
+        }
+        codexCancelGraceMs = Math.round(secs * 1000);
+        break;
+      }
       case "--timeout": {
         if (i + 1 >= args.length) {
           process.stderr.write("error: --timeout requires a value\n");
@@ -407,6 +438,7 @@ function parseArgs() {
     codexWorkspaceNetworkAccess,
     goal,
     codexIdleTimeoutMs,
+    codexCancelGraceMs,
     defaultTimeoutMs,
   };
 }
@@ -746,6 +778,37 @@ function buildCodexBridgeConfig({
 }
 
 /**
+ * Remove isolated Codex homes left behind by bridges that died without running
+ * their cleanup (SIGKILL, a hard crash, a machine restart). Each one holds a
+ * copy of auth.json, so they are both disk litter and credential sprawl. Only
+ * directories older than the cutoff are touched, so a concurrently starting
+ * bridge is never disturbed. Entirely best-effort.
+ * @param {number} [maxAgeMs]
+ * @returns {number} count removed
+ */
+function sweepStaleCodexHomes(maxAgeMs = STALE_CODEX_HOME_MAX_AGE_MS) {
+  const root = tmpdir();
+  const cutoff = Date.now() - maxAgeMs;
+  let removed = 0;
+  let names;
+  try {
+    names = readdirSync(root);
+  } catch {
+    return 0;
+  }
+  for (const name of names) {
+    if (!name.startsWith("mcp-agents-codex-")) continue;
+    const dir = join(root, name);
+    try {
+      if (statSync(dir).mtimeMs >= cutoff) continue;
+      rmSync(dir, { recursive: true, force: true });
+      removed += 1;
+    } catch {}
+  }
+  return removed;
+}
+
+/**
  * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
  * @param {{ sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean }} opts
  * @returns {string}
@@ -770,6 +833,18 @@ function createIsolatedCodexHome({
     if (existsSync(sourceAuthPath)) {
       copyFileSync(sourceAuthPath, targetAuthPath);
     }
+
+    // Seed the model catalogue from the real CODEX_HOME. Without it every bridge
+    // start is a cold Codex install that re-fetches ~280 KB before it is useful;
+    // with several concurrent sessions that is a pointless, repeated dependency
+    // on the network during startup. Best-effort: a missing or unreadable cache
+    // just means codex fetches it as before.
+    try {
+      const sourceModelsCache = join(sourceCodexHome, "models_cache.json");
+      if (existsSync(sourceModelsCache)) {
+        copyFileSync(sourceModelsCache, join(codexHome, "models_cache.json"));
+      }
+    } catch {}
 
     writeFileSync(
       configPath,
@@ -1338,7 +1413,7 @@ function rewriteCodexToolsListMessage(msg) {
  * Per-request idle and hard deadlines convert unbounded Codex stalls into
  * surfaced JSON-RPC errors. Correlated events also provide client-visible MCP
  * progress and enough terminal metadata to recover a missing final response.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, hardTimeoutMs?: number, goal?: string }} opts
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, hardTimeoutMs?: number, goal?: string }} opts
  */
 function runCodexPassthrough({
   model,
@@ -1347,6 +1422,7 @@ function runCodexPassthrough({
   approvalPolicy,
   workspaceNetworkAccess,
   idleTimeoutMs,
+  cancelGraceOverrideMs,
   hardTimeoutMs,
   goal,
 }) {
@@ -1363,10 +1439,18 @@ function runCodexPassthrough({
     "MCP_AGENTS_CODEX_TERMINAL_GRACE_MS",
     DEFAULT_CODEX_TERMINAL_GRACE_MS,
   );
-  const cancelGraceMs = testTunableMs(
+  // CLI flag wins over the env tunable, which wins over the default.
+  const cancelGraceMs = cancelGraceOverrideMs ?? testTunableMs(
     "MCP_AGENTS_CODEX_CANCEL_GRACE_MS",
     DEFAULT_CODEX_CANCEL_GRACE_MS,
   );
+  // How long codex may keep working after the client's stdin closed before the
+  // detached group is reaped outright.
+  const clientGoneGraceMs = testTunableMs(
+    "MCP_AGENTS_CODEX_CLIENT_GONE_GRACE_MS",
+    Math.max(cancelGraceMs * 2, DEFAULT_CODEX_CANCEL_GRACE_MS),
+  );
+  let clientGoneTimer;
   const flushStallLimitMs = testTunableMs(
     "MCP_AGENTS_CODEX_FLUSH_STALL_MS",
     DEFAULT_CODEX_FLUSH_STALL_MS,
@@ -1387,6 +1471,13 @@ function runCodexPassthrough({
   const resolvedGoal = goal;
   const sourceCodexHome = resolveCodexHome();
   const fastModeEnabled = readCodexFastModeOptIn(sourceCodexHome);
+  const sweptHomes = sweepStaleCodexHomes();
+  if (sweptHomes > 0) {
+    logErr(
+      `[mcp-agents] swept ${sweptHomes} stale isolated codex home(s) left by ` +
+        `bridges that exited without cleanup`,
+    );
+  }
   let isolatedCodexHome;
 
   try {
@@ -1483,6 +1574,14 @@ function runCodexPassthrough({
   // path only changes HOW bytes reach the wire.
   const pendingToolsListIds = new Set(); // idKey(id) of outstanding tools/list requests (the latch)
   const suppressedResponseIds = new Set(); // late native responses already synthesized upstream
+  // Requests the wrapper stopped waiting for while codex was still working on
+  // them. The turn keeps running inside codex (it does not honour MCP
+  // cancellation promptly), so it can still write to the workspace long after
+  // the client gave up — the "zombie writer". Tracked purely for operator
+  // visibility: entries are logged on abandonment and again when the real
+  // response finally lands, so a stale tree can be explained rather than
+  // guessed at. Bounded by MAX_SUPPRESSED_CODEX_RESPONSES via the same ids.
+  const abandonedTurns = new Map(); // request key -> { threadId, jobId, at }
   let rewriteBuf = Buffer.alloc(0); // buffer-mode accumulator; holds ≤1 trailing partial after a flush
   let rewriteSkipUntilNewline = false; // forwarding raw to the next newline (oversized frame or mode-boundary align)
   let rewriteSkipReleaseId; // idKey to release when the skipped frame's newline lands (oversized response only)
@@ -2782,15 +2881,29 @@ function runCodexPassthrough({
       // client can then reconnect to a clean bridge).
       entry.timeoutPending = label;
       if (!entry.abortEscalationTimer) {
-        entry.abortEscalationTimer = setTimeout(() => {
+        const escalate = () => {
           if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+          // Retry first: the boundary may simply not have arrived yet. Only a
+          // stream still wedged after a second window justifies dropping the
+          // bridge (and with it every other request and background job).
+          if (canInjectGeneratedFrame()) {
+            entry.abortEscalationTimer = undefined;
+            abortRequestNoTeardown(entry, label);
+            return;
+          }
+          if (!entry.abortEscalated) {
+            entry.abortEscalated = true;
+            entry.abortEscalationTimer = setTimeout(escalate, cancelGraceMs);
+            return;
+          }
           finalize({
             reason: `request ${JSON.stringify(entry.id)} ${label} could not be ` +
-              `delivered at a frame boundary within ${cancelGraceMs}ms`,
+              `delivered at a frame boundary within ${cancelGraceMs * 2}ms`,
             emit: true,
             exitCode: 1,
           });
-        }, cancelGraceMs);
+        };
+        entry.abortEscalationTimer = setTimeout(escalate, cancelGraceMs);
       }
       return;
     }
@@ -2799,11 +2912,7 @@ function runCodexPassthrough({
     suppressedResponseIds.add(key);
     settleInFlight(entry.id);
     queueGeneratedFrame(timeoutErrorFrame(entry, label), { kind: "terminal_result" });
-    logErr(
-      `[mcp-agents] aborted codex request ${JSON.stringify(entry.id)} ` +
-        `(${label}); transport kept alive ` +
-        `(thread_id=${entry.threadId ?? "unknown"})`,
-    );
+    noteAbandonedTurn(entry, label);
     finalizeOnSuppressionCap();
   };
   const flushReadyTerminalResults = () => {
@@ -2826,6 +2935,107 @@ function runCodexPassthrough({
       () => synthesizeTerminalResult(entry),
       terminalGraceMs,
     );
+  };
+  // Record — and shout about — a request the wrapper has stopped waiting for
+  // while codex may still be executing it. This is the single most expensive
+  // failure mode in practice: the client believes the work is dead, codex keeps
+  // editing the workspace, and a second agent is dispatched onto the same files.
+  const noteAbandonedTurn = (entry, label) => {
+    const key = idKey(entry.id);
+    abandonedTurns.set(key, {
+      threadId: entry.threadId,
+      jobId: entry.jobId,
+      at: Date.now(),
+    });
+    logErr(
+      `[mcp-agents] WARNING codex turn abandoned while possibly still running: ` +
+        `request ${JSON.stringify(entry.id)} (${label}); ` +
+        `thread_id=${entry.threadId ?? "unknown"} ` +
+        `job_id=${entry.jobId ?? "none"} ` +
+        `sandbox_mode=${resolvedSandboxMode}. The bridge stays connected, but ` +
+        `codex was NOT confirmed stopped — treat the workspace as having a live ` +
+        `writer until this bridge exits` +
+        (entry.jobId ? `, or stop it with codex-cancel jobId=${entry.jobId}` : "") +
+        `.`,
+    );
+  };
+  // The counterpart: codex finally answered a request nobody is waiting for. It
+  // proves the turn ran to completion after the client gave up, which is the
+  // evidence needed to explain unexpected edits in the tree.
+  const noteAbandonedTurnSettled = (key) => {
+    const info = abandonedTurns.get(key);
+    if (!info) return;
+    abandonedTurns.delete(key);
+    logErr(
+      `[mcp-agents] abandoned codex turn finished after ` +
+        `${Math.round((Date.now() - info.at) / 1_000)}s and its result was ` +
+        `discarded (thread_id=${info.threadId ?? "unknown"} ` +
+        `job_id=${info.jobId ?? "none"}); any writes it made are in the tree`,
+    );
+  };
+  // A cancellation grace expiry used to tear the WHOLE bridge down, which killed
+  // every other in-flight request and every background job in this process, and
+  // destroyed the isolated CODEX_HOME (so no thread could ever be resumed). A
+  // codex mid-turn simply does not service MCP cancellation quickly, so this
+  // fired routinely and was the dominant cause of "the MCP keeps dropping".
+  // The client has already cancelled — it will never read a response for this id
+  // — so the correct resolution is to stop tracking the id and swallow codex's
+  // late response. Teardown is reserved for the one case that genuinely cannot
+  // be resolved per-request: a stream wedged mid-frame with no safe boundary.
+  const onCancelGraceExpired = (entry) => {
+    if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
+    const key = idKey(entry.id);
+    if (entry.internalJob) {
+      // Background job: the client polls by jobId and never sees this native id,
+      // so there is no client frame to place and no boundary to wait for. Drive
+      // the job terminal, otherwise it sits in "canceling" forever and every
+      // codex-status long-poll against it hangs.
+      const job = jobs.get(entry.jobId);
+      privateJobRequestIds.delete(key);
+      suppressedResponseIds.add(key);
+      if (job && !isTerminalJob(job)) {
+        transitionJobTerminal(
+          job,
+          "canceled",
+          `canceled (codex did not acknowledge within ${cancelGraceMs}ms)`,
+        );
+      }
+      settleInFlight(entry.id);
+      noteAbandonedTurn(
+        entry,
+        `cancellation unacknowledged within ${cancelGraceMs}ms`,
+      );
+      finalizeOnSuppressionCap();
+      return;
+    }
+    if (canArmResponseSuppression()) {
+      suppressedResponseIds.add(key);
+      settleInFlight(entry.id);
+      noteAbandonedTurn(
+        entry,
+        `cancellation unacknowledged within ${cancelGraceMs}ms`,
+      );
+      finalizeOnSuppressionCap();
+      return;
+    }
+    // No frame boundary yet: splicing suppression state in now could corrupt a
+    // partial native frame. Give the stream one more window to reach a boundary
+    // before falling back to the bounded teardown.
+    if (!entry.cancelGraceEscalated) {
+      entry.cancelGraceEscalated = true;
+      entry.cancelTimer = setTimeout(
+        () => onCancelGraceExpired(entry),
+        cancelGraceMs,
+      );
+      return;
+    }
+    finalize({
+      reason:
+        `request ${JSON.stringify(entry.id)} cancellation did not settle ` +
+        `within ${cancelGraceMs * 2}ms and codex left a frame unterminated`,
+      emit: true,
+      exitCode: 1,
+    });
   };
   const cancelInFlight = (id) => {
     const entry = id == null ? undefined : inFlight.get(idKey(id));
@@ -2850,16 +3060,14 @@ function runCodexPassthrough({
     clearTimer(entry, "terminalTimer");
     clearTimer(entry, "abortEscalationTimer");
     if (canArmResponseSuppression()) suppressedResponseIds.add(idKey(id));
-    entry.cancelTimer = setTimeout(() => {
-      if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
-      finalize({
-        reason:
-          `request ${JSON.stringify(entry.id)} cancellation did not settle ` +
-          `within ${cancelGraceMs}ms`,
-        emit: true,
-        exitCode: 1,
-      });
-    }, cancelGraceMs);
+    // Ask codex to stop as well. Without this the turn runs to completion even
+    // though nothing will ever read its result.
+    requestNativeCancel(entry, "mcp-agents: client cancelled the request");
+    entry.cancelGraceEscalated = false;
+    entry.cancelTimer = setTimeout(
+      () => onCancelGraceExpired(entry),
+      cancelGraceMs,
+    );
     return false;
   };
 
@@ -3102,7 +3310,20 @@ function runCodexPassthrough({
     finalizing = true;
     clearAllEntryTimers();
     stopAllEntryProgress();
+    if (clientGoneTimer) {
+      clearTimeout(clientGoneTimer);
+      clientGoneTimer = undefined;
+    }
     logErr(`[mcp-agents] codex passthrough finalize: ${reason}`);
+    if (abandonedTurns.size > 0) {
+      logErr(
+        `[mcp-agents] ${abandonedTurns.size} abandoned codex turn(s) were still ` +
+          `unaccounted for at teardown: ` +
+          [...abandonedTurns.values()]
+            .map((info) => info.threadId ?? "unknown")
+            .join(", "),
+      );
+    }
 
     // Stop forwarding further codex stdout so a late real response cannot race
     // the synthetic error onto the wire after we've taken over the stream.
@@ -3250,6 +3471,7 @@ function runCodexPassthrough({
     // Hygiene: drop the rewrite latch/skip state (forwarding has stopped).
     pendingToolsListIds.clear();
     suppressedResponseIds.clear();
+    abandonedTurns.clear();
     privateJobRequestIds.clear();
     locallyHandledResponseIds.clear();
     serverRequestParents.clear();
@@ -3401,6 +3623,7 @@ function runCodexPassthrough({
         }
         if (key !== undefined && suppressedResponseIds.has(key)) {
           suppressedResponseIds.delete(key);
+          noteAbandonedTurnSettled(key);
           continue;
         }
         if (key !== undefined && pendingToolsListIds.has(key)) {
@@ -3431,6 +3654,7 @@ function runCodexPassthrough({
             outBuf = null;
           } else if (suppressedResponseIds.has(key)) {
             suppressedResponseIds.delete(key);
+            noteAbandonedTurnSettled(key);
             outBuf = null;
           } else if (pendingToolsListIds.has(key)) {
             pendingToolsListIds.delete(key);
@@ -3671,6 +3895,48 @@ function runCodexPassthrough({
         child.stdin.write(transformCodexToolCall(line, { serverGoal: resolvedGoal }));
       }
     }
+    // The client is gone for good. A background job (codex-start) is polled by
+    // jobId through THIS process, so once the client disconnects nothing can
+    // ever read its result — but codex keeps executing it, writing to the
+    // workspace, invisible to the client's own task registry (a harness
+    // "stop task" cannot reach it; only codex-cancel could, and the jobId died
+    // with the connection). Cancel every non-terminal job and every open
+    // request before closing codex's stdin so the turn is asked to stop rather
+    // than left running as an unattended writer.
+    if (!finalizing) {
+      for (const job of jobs.values()) {
+        if (!isTerminalJob(job)) {
+          logErr(
+            `[mcp-agents] client disconnected; cancelling background job ` +
+              `${job.jobId} (state=${job.state}, ` +
+              `thread_id=${job.threadId ?? "unknown"})`,
+          );
+          requestJobCancellation(job, "client disconnected");
+        }
+      }
+      for (const entry of [...inFlight.values()]) {
+        if (entry.state === "open") {
+          requestNativeCancel(entry, "mcp-agents: client disconnected");
+        }
+      }
+      // Hard backstop. Closing codex's stdin normally makes it exit, but a codex
+      // mid-turn may ignore both the EOF and the cancellations above and keep
+      // writing. Nothing can consume its output any more, so bound the wind-down
+      // and then reap the whole detached group — an unattended writer must never
+      // outlive the client that dispatched it.
+      if (!clientGoneTimer) {
+        clientGoneTimer = setTimeout(() => {
+          if (finalizing) return;
+          finalize({
+            reason:
+              `client disconnected and codex did not wind down within ` +
+              `${clientGoneGraceMs}ms`,
+            emit: false,
+            exitCode: 0,
+          });
+        }, clientGoneGraceMs);
+      }
+    }
     child.stdin.end();
   });
 
@@ -3739,6 +4005,7 @@ async function main() {
     codexWorkspaceNetworkAccess,
     goal,
     codexIdleTimeoutMs,
+    codexCancelGraceMs,
     defaultTimeoutMs,
   } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
@@ -3761,6 +4028,7 @@ async function main() {
       ),
       goal,
       idleTimeoutMs: codexIdleTimeoutMs,
+      cancelGraceOverrideMs: codexCancelGraceMs,
       hardTimeoutMs: defaultTimeoutMs,
     });
     return;

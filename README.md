@@ -246,9 +246,35 @@ auto-reconnected), so a single stalled review must never take the whole bridge
 down. The Codex process group is still reaped on a real teardown (client
 disconnect, signal, or `stdout` `EPIPE`). The one exception: if Codex is wedged
 partway through writing a response frame (no safe boundary at which to inject the
-error) and also ignores the cancellation, the wrapper escalates to a bounded
-whole-bridge teardown after the cancel grace — there is no way to emit a clean
+error) and also ignores the cancellation, the wrapper retries once and then
+escalates to a bounded whole-bridge teardown — there is no way to emit a clean
 frame into a partial one, so the client is left to reconnect to a fresh bridge.
+
+**Cancellation.** A client cancellation (`notifications/cancelled` — every ESC,
+aborted turn, or subagent teardown) is treated the same way: it costs exactly one
+request. `--codex_cancel_grace <seconds>` (default `30`) bounds how long Codex may
+take to acknowledge it; on expiry the wrapper settles that request id locally,
+suppresses Codex's late response, and leaves the bridge and every sibling call
+running. The grace is generous on purpose — a Codex mid-turn is running sandboxed
+commands and does not service MCP cancellation quickly, so a short grace would
+make the escalation path the default path. This matters more than the timeout
+case because the isolated `CODEX_HOME` holds Codex's `sessions/` directory: a
+whole-bridge teardown makes every `threadId` in that process permanently
+unresumable, and the next `codex-reply` fails with `Session not found`.
+
+> [!WARNING]
+> Abandoning a request does **not** stop Codex. The wrapper asks it to stop, but
+> a turn that ignores the cancellation keeps running — and keeps writing to the
+> workspace — long after the client gave up. Every abandonment is logged to
+> stderr with its `thread_id` and `job_id`, and logged again if the turn later
+> finishes, so an unexpectedly modified tree can be explained rather than
+> guessed at. Background jobs are the sharp edge here: a `codex-start` job lives
+> in this wrapper's job table, **not** in the MCP client's task registry, so a
+> client-side "stop task" cannot reach it — only `codex-cancel` with its `jobId`
+> can. Because a job is polled through this process it can never survive a
+> reconnect, so a client disconnect cancels every non-terminal job and open
+> request, and a bounded wind-down reaps the Codex process group if it keeps
+> working anyway.
 
 `--timeout <seconds>` is also enforced for Codex calls (default `7200`) as an
 immutable hard deadline. Correlated activity can extend the idle window but
