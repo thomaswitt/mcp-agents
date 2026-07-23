@@ -565,12 +565,18 @@ test_codex_bridge_config() {
     'hooks = false' \
     'plugins = false' \
     'multi_agent = false' \
-    'skill_mcp_dependency_install = false'
+    'skill_mcp_dependency_install = false' \
+    '[agents]' \
+    'enabled = false'
   do
     grep -Fxq "$expected" "$config_capture" 2>/dev/null || ok=0
   done
   [ "$(grep -Fxc '[sandbox_workspace_write]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
   [ "$(grep -Fxc '[features]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
+  [ "$(grep -Fxc '[agents]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
+  # `enabled = false` must live INSIDE the [agents] table (the real off switch
+  # for native subagents on Codex >= 0.145.0), not as a stray top-level key.
+  sed -n '/^\[agents\]$/,/^\[/p' "$config_capture" | grep -Fxq 'enabled = false' || ok=0
 
   if [ "$expected_fast" = "true" ]; then
     [ "$(grep -Fxc 'service_tier = "fast"' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
@@ -2233,6 +2239,28 @@ test_codex_call_transform "codex injects multi-word per-call goal" \
   '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"xhigh","goal":"keep the public API unchanged"}' \
   '.params.arguments | (.["developer-instructions"]|test("keep the public API unchanged"))'
 
+# allow_subagents is wrapper-only: always stripped; only `true` becomes the
+# native per-call override features.multi_agent. The isolated home config keeps
+# multi_agent = false and no [mcp_servers] regardless (asserted by the bridge
+# config tests above), so enabling it can never re-open MCP delegation.
+test_codex_call_transform "codex allow_subagents=true injects both subagent overrides" \
+  "" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","allow_subagents":true}' \
+  '.params.arguments | ((has("allow_subagents")|not) and (.config == {"features.multi_agent":true,"agents.enabled":true}))'
+test_codex_call_transform "codex allow_subagents=false is stripped with no override" \
+  "" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","allow_subagents":false}' \
+  '.params.arguments | ((has("allow_subagents")|not) and (has("config")|not))'
+test_codex_call_transform "codex composes allow_subagents with per-session effort" \
+  "" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model_reasoning_effort":"max","allow_subagents":true}' \
+  '.params.arguments | ((has("allow_subagents")|not) and (has("model_reasoning_effort")|not) and (.config == {"model_reasoning_effort":"max","features.multi_agent":true,"agents.enabled":true}))'
+test_codex_call_transform "codex-start strips allow_subagents into the private job config" \
+  "" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","allow_subagents":true}' \
+  '(.params.name == "codex") and (.params.arguments | ((has("allow_subagents")|not) and (.config == {"features.multi_agent":true,"agents.enabled":true})))' \
+  "codex-start"
+
 # Forbidden, missing, malformed, and deprecated arguments fail before Codex runs.
 test_codex_rejects_call "codex rejects hidden native configuration" \
   '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only","model_reasoning_effort":"xhigh","model":"STRICT_SECRET_MODEL","config":{"secret":"STRICT_SECRET_CONFIG"},"approval-policy":"never","developer-instructions":"STRICT_SECRET_DEV","base-instructions":"STRICT_SECRET_BASE","compact-prompt":"STRICT_SECRET_COMPACT"}' \
@@ -2241,8 +2269,8 @@ test_codex_rejects_call "codex rejects missing required arguments" \
   '{"prompt":"hi"}' \
   '(.error.data.issues | map(.argument) | sort) == ["cwd","sandbox"]'
 test_codex_rejects_call "codex rejects malformed operational arguments" \
-  '{"prompt":false,"cwd":"relative/path","sandbox":"escape","model":"gpt-5.6-luna","model_reasoning_effort":"ultra","goal":false}' \
-  '(.error.data.issues | map(.argument) | sort) == ["cwd","goal","model","model_reasoning_effort","prompt","sandbox"]'
+  '{"prompt":false,"cwd":"relative/path","sandbox":"escape","model":"gpt-5.6-luna","model_reasoning_effort":"ultra","goal":false,"allow_subagents":"yes"}' \
+  '(.error.data.issues | map(.argument) | sort) == ["allow_subagents","cwd","goal","model","model_reasoning_effort","prompt","sandbox"]'
 test_codex_rejects_call "codex rejects a non-object arguments value" \
   'null' \
   '(.error.data.issues == [{"argument":"arguments","problem":"must be an object"}])'
@@ -2251,8 +2279,8 @@ test_codex_rejects_call "codex-reply requires threadId and rejects conversationI
   '(.error.data.issues | map(.argument) | sort) == ["conversationId","threadId"]' \
   "codex-reply"
 test_codex_rejects_call "codex-reply rejects inherited session controls" \
-  '{"prompt":"continue","threadId":"abc","sandbox":"read-only","model":"gpt-5.6-terra","model_reasoning_effort":"max","cwd":"/tmp/work"}' \
-  '(.error.data.issues | map(.argument) | sort) == ["cwd","model","model_reasoning_effort","sandbox"]' \
+  '{"prompt":"continue","threadId":"abc","sandbox":"read-only","model":"gpt-5.6-terra","model_reasoning_effort":"max","cwd":"/tmp/work","allow_subagents":true}' \
+  '(.error.data.issues | map(.argument) | sort) == ["allow_subagents","cwd","model","model_reasoning_effort","sandbox"]' \
   "codex-reply"
 test_codex_rejects_call "codex-status rejects missing cursor and invalid wait" \
   '{"jobId":"job","wait_ms":60001}' \
@@ -2269,7 +2297,7 @@ test_codex_local_response_lifecycle "codex local validation responses remain fra
 # contract; everything else stays byte-for-byte.
 test_codex_toolslist_rewrite "tools/list advertises exact curated argument sets" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties|keys) == ["cwd","goal","model","model_reasoning_effort","prompt","sandbox"] and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|keys) == ["goal","prompt","threadId"])'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties|keys) == ["allow_subagents","cwd","goal","model","model_reasoning_effort","prompt","sandbox"] and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|keys) == ["goal","prompt","threadId"])'
 test_codex_toolslist_rewrite "tools/list advertises all optional Codex job tools" \
   "normal" \
   'select(.id==2) | ([.result.tools[].name | select(startswith("codex-"))] | sort) == ["codex-cancel","codex-commentary","codex-reply","codex-reply-start","codex-result","codex-start","codex-status"]'
@@ -2288,6 +2316,14 @@ test_codex_toolslist_rewrite "tools/list advertises exact Sol|Terra model on cod
 test_codex_toolslist_rewrite "tools/list advertises exact medium|high|xhigh|max effort on codex only" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["medium","high","xhigh","max"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
+test_codex_toolslist_rewrite "tools/list advertises boolean allow_subagents on session-start tools only" \
+  "normal" \
+  'select(.id==2) | (.result.tools | map({key:.name,value:.}) | from_entries) as $t |
+   (($t.codex.inputSchema.properties.allow_subagents | ((.type == "boolean") and (has("default")|not) and (.description|test("default false")))) and
+    ($t["codex-start"].inputSchema.properties.allow_subagents.type == "boolean") and
+    ($t["codex-reply"].inputSchema.properties|has("allow_subagents")|not) and
+    ($t["codex-reply-start"].inputSchema.properties|has("allow_subagents")|not) and
+    (($t.codex.inputSchema.required|sort) == ["cwd","prompt","sandbox"]))'
 test_codex_toolslist_rewrite "tools/list explains model, effort, and reply inheritance" \
   "normal" \
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties) as $p | (($p.model.description|test("gpt-5.6-sol.*demanding")) and ($p.model.description|test("gpt-5.6-terra.*faster")) and ($p.model.description|test("repl.*inherit")) and ($p.model_reasoning_effort.description|ascii_downcase|test("medium.*balanced.*high.*complex.*xhigh.*hard.*max.*quality-first.*repl.*inherit")))'

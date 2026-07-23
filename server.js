@@ -84,6 +84,7 @@ const CODEX_PER_SESSION_REASONING_EFFORT_SET = new Set(
 );
 const CODEX_SANDBOXES = ["read-only", "workspace-write", "danger-full-access"];
 const CODEX_SANDBOX_SET = new Set(CODEX_SANDBOXES);
+const CODEX_ALLOW_SUBAGENTS_ARG = "allow_subagents";
 const CODEX_TOOL_CONTRACTS = {
   codex: {
     allowed: [
@@ -92,6 +93,7 @@ const CODEX_TOOL_CONTRACTS = {
       "sandbox",
       CODEX_PER_SESSION_MODEL_ARG,
       CODEX_PER_SESSION_REASONING_EFFORT_ARG,
+      CODEX_ALLOW_SUBAGENTS_ARG,
       "goal",
     ],
     required: ["prompt", "cwd", "sandbox"],
@@ -774,6 +776,15 @@ function buildCodexBridgeConfig({
     "skill_mcp_dependency_install = false",
     ...(fastModeEnabled ? ["fast_mode = true"] : []),
     "",
+    // `features.multi_agent` alone is NOT a working off switch on Codex
+    // >= 0.145.0 — the flag is stabilized (on by default) and sessions still
+    // get the collab tools with it set to false. `agents.enabled = false` is
+    // the gate that actually removes them; keep both so older Codex versions
+    // stay disabled through the feature flag. Sessions opt back in per call
+    // with `allow_subagents` (see transformCodexToolCall).
+    "[agents]",
+    "enabled = false",
+    "",
   ].join("\n");
 }
 
@@ -955,7 +966,11 @@ function applyGoalPreamble(prompt, goal) {
  * forwarding it to native Codex:
  *   1. Translate the wrapper-only initial-session `model_reasoning_effort` into
  *      native `config.model_reasoning_effort`.
- *   2. Inject the wrapper-only goal — codex's native `/goal` is a TUI-only slash
+ *   2. Strip the wrapper-only `allow_subagents` flag; `true` becomes the native
+ *      per-call config overrides `agents.enabled = true` +
+ *      `features.multi_agent = true` for the new session (the isolated home
+ *      keeps both gates hard-off as the baseline).
+ *   3. Inject the wrapper-only goal — codex's native `/goal` is a TUI-only slash
  *      command, not
  *      reachable via MCP, so a wrapper-only `goal` arg is always stripped and the
  *      objective is injected the MCP-correct way: into `developer-instructions`
@@ -1005,6 +1020,34 @@ function transformCodexToolCall(line, opts = {}) {
     changed = true;
   }
 
+  // ── Native subagent opt-in ────────────────────────────────────────────────
+  // The wrapper-only `allow_subagents` flag is always stripped; only an
+  // explicit `true` re-enables the session's multi-agent gates via per-call
+  // native config overrides. The isolated home config keeps its hard-off
+  // baseline (`[features] multi_agent = false` + `[agents] enabled = false`)
+  // and writes no [mcp_servers], so an enabled session can spawn only
+  // Codex-native in-process subagents — never MCP or other LLM-backed tools.
+  // Session-scoped like `sandbox`: replies inherit it.
+  let subagentsLog;
+  if (toolName === "codex" && Object.hasOwn(args, CODEX_ALLOW_SUBAGENTS_ARG)) {
+    const allowSubagents = args[CODEX_ALLOW_SUBAGENTS_ARG] === true;
+    delete args[CODEX_ALLOW_SUBAGENTS_ARG];
+    if (allowSubagents) {
+      // Flip BOTH gates: `agents.enabled` is the effective switch on Codex
+      // >= 0.145.0, `features.multi_agent` covers older versions where the
+      // feature flag still gates the collab tools.
+      args.config = {
+        ...args.config,
+        "features.multi_agent": true,
+        "agents.enabled": true,
+      };
+      subagentsLog =
+        "enabled native Codex subagents for this session " +
+        "(agents.enabled=true, features.multi_agent=true)";
+    }
+    changed = true;
+  }
+
   // ── Goal injection ────────────────────────────────────────────────────────
   // A validated per-call `goal` (including "") replaces the server default for
   // this call. The wrapper field is never forwarded to native Codex.
@@ -1039,6 +1082,9 @@ function transformCodexToolCall(line, opts = {}) {
   if (effortLog) {
     logErr(`[mcp-agents] codex passthrough: ${effortLog}`);
   }
+  if (subagentsLog) {
+    logErr(`[mcp-agents] codex passthrough: ${subagentsLog}`);
+  }
   if (goalLog) {
     logErr(`[mcp-agents] codex passthrough: ${goalLog}`);
   }
@@ -1058,13 +1104,19 @@ const CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION =
   "high for complex work, xhigh for hard work, or max for quality-first work " +
   "requiring deeper exploration. Defaults to the server-configured xhigh; replies " +
   "inherit it.";
+const CODEX_ALLOW_SUBAGENTS_PROPERTY_DESCRIPTION =
+  "Optional: let this session spawn Codex's native in-process subagents " +
+  "(default false). Subagents share the session's sandbox and approval policy " +
+  "and get no MCP or external tool access. Set at session start; replies " +
+  "inherit it.";
 
 function codexToolPresentation(toolName) {
   if (toolName === "codex") {
     return {
       description:
         "Start a Codex session with an explicit workspace and sandbox, optional model " +
-        "and reasoning effort, and optional standing goal.",
+        "and reasoning effort, optional standing goal, and optional native subagents " +
+        "(allow_subagents, default false; Codex-only, no external tool access).",
       inputSchema: {
         type: "object",
         properties: {
@@ -1090,6 +1142,10 @@ function codexToolPresentation(toolName) {
             type: "string",
             enum: [...CODEX_PER_SESSION_REASONING_EFFORTS],
             description: CODEX_PER_SESSION_REASONING_EFFORT_PROPERTY_DESCRIPTION,
+          },
+          [CODEX_ALLOW_SUBAGENTS_ARG]: {
+            type: "boolean",
+            description: CODEX_ALLOW_SUBAGENTS_PROPERTY_DESCRIPTION,
           },
           goal: {
             type: "string",
@@ -1131,8 +1187,9 @@ function codexToolPresentation(toolName) {
     return {
       ...presentation,
       description:
-        "Start an optional background Codex job. This returns immediately; call " +
-        "codex-status with the returned job ID and cursor until the job is terminal.",
+        "Start an optional background Codex job (same arguments as codex, including " +
+        "allow_subagents). This returns immediately; call codex-status with the " +
+        "returned job ID and cursor until the job is terminal.",
     };
   }
   if (toolName === "codex-reply-start") {
@@ -1288,6 +1345,15 @@ function validateCodexToolCallMessage(msg) {
         problem: `must be one of: ${CODEX_PER_SESSION_REASONING_EFFORTS.join(", ")}`,
       });
     }
+  }
+  if (
+    Object.hasOwn(args, CODEX_ALLOW_SUBAGENTS_ARG) &&
+    typeof args[CODEX_ALLOW_SUBAGENTS_ARG] !== "boolean"
+  ) {
+    issues.push({
+      argument: CODEX_ALLOW_SUBAGENTS_ARG,
+      problem: "must be a boolean",
+    });
   }
   if (Object.hasOwn(args, "goal") && typeof args.goal !== "string") {
     issues.push({ argument: "goal", problem: "must be a string" });
@@ -2721,6 +2787,11 @@ function runCodexPassthrough({
         return "generating an image";
       case "image_generation_end":
         return "image generation finished";
+      // Multi-agent V2 (codex >= 0.145.0) reports spawn/lifecycle work as
+      // sub_agent_activity; the older collab_agent_* names remain for
+      // earlier versions.
+      case "sub_agent_activity":
+        return "subagent activity";
       case "collab_agent_spawn_begin":
         return "starting a subagent";
       case "collab_agent_spawn_end":

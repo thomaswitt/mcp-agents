@@ -105,7 +105,10 @@ defaults are `features.multi_agent=false`, `features.apps=false`,
 `features.plugins=false`, `features.hooks=false`, and
 `features.skill_mcp_dependency_install=false`; apps/plugins stay disabled to
 keep ChatGPT app/plugin skills — Figma, Gmail, Presentations, etc. — out of the
-bridged session context.
+bridged session context. Native subagents are additionally disabled with
+`[agents] enabled = false`, because on Codex >= 0.145.0 the stabilized
+`multi_agent` feature flag alone no longer removes the collab tools; sessions
+opt back in per call with `allow_subagents` (see below).
 
 Workspace-write sessions have network access enabled by default so sandboxed
 commands can reach local services such as DynamoDB, Redis, OpenSearch, and MinIO.
@@ -131,6 +134,7 @@ small contract:
 | `sandbox` | `string` | yes | `read-only`, `workspace-write`, or `danger-full-access` |
 | `model` | `string` | no | `gpt-5.6-sol` or `gpt-5.6-terra`; defaults to the server model |
 | `model_reasoning_effort` | `string` | no | `medium`, `high`, `xhigh`, or `max`; defaults to the server effort |
+| `allow_subagents` | `boolean` | no | Let the session spawn Codex's native in-process subagents; defaults to `false` |
 | `goal` | `string` | no | Standing objective; `""` suppresses a server-wide goal for this call |
 
 | `codex-reply` parameter | Type | Required | Description |
@@ -145,6 +149,21 @@ includes native escape hatches such as `config`, `approval-policy`,
 `developer-instructions`, `base-instructions`, and `compact-prompt`; future
 upstream schema additions stay hidden until mcp-agents intentionally adopts them.
 Model values outside the two curated choices are rejected the same way.
+
+**Native subagents.** `allow_subagents: true` on `codex` or `codex-start` lets
+that session use Codex's built-in multi-agent tools (`spawn_agent`,
+`wait_agent`, …). It is session-scoped exactly like `sandbox`: replies inherit
+it and cannot change it, and it defaults to off. Internally the flag flips only
+the native multi-agent gates (`agents.enabled` plus `features.multi_agent`) via
+a per-call config override; everything else about the isolated home is
+unchanged. In particular the `[mcp_servers]` strip stays in force, so spawned
+subagents are Codex-only in-process workers — they cannot re-enter this bridge
+or reach Claude, Gemini, or any other external MCP tool, and custom agent
+roles from your real `$CODEX_HOME/agents/` are not copied in. The residual
+caveat is concurrency, not reach: subagents inherit the session's
+`sandbox_mode` and `approval_policy`, so under `workspace-write` with
+`approval_policy=never` several agents may write the same workspace at once.
+Codex coordinates them, but scope the commission accordingly.
 
 `approval_policy=never` is intentional for an MCP bridge: a detached tool call
 cannot reliably conduct an interactive approval conversation. Operators can pick

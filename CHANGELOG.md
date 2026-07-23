@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.22.0] - 2026-07-24
+
+### Added
+
+- `allow_subagents` (boolean, default `false`) on `codex` and `codex-start` lets
+  a new session use Codex's native in-process subagents (`spawn_agent`,
+  `wait_agent`, and friends). Session-scoped like `sandbox`: replies inherit it
+  and cannot change it. The flag flips ONLY the native multi-agent gates
+  (`agents.enabled` and `features.multi_agent`) through a per-call config
+  override — the isolated home still writes no `[mcp_servers]`, so subagents
+  are Codex-only and cannot re-enter this bridge or reach other LLM-backed
+  tools (Claude/Gemini). Residual caveat: native subagents inherit the
+  session's `approval_policy` and `sandbox_mode`, so under `workspace-write`
+  with `approval_policy=never` several agents may write the SAME workspace
+  concurrently. Codex's agent control coordinates them, but the caller still
+  scopes the commission.
+
+### Fixed
+
+- The `[features] multi_agent = false` hard-disable is ineffective on Codex
+  >= 0.145.0: upstream stabilized the flag (on by default) and bridge sessions
+  still received the collab tools — verified empirically by a bridge session
+  spawning a live subagent despite the flag. The isolated config now also
+  writes `[agents] enabled = false`, the gate 0.145.0 actually honors
+  (`multi_agent = false` stays for older Codex versions). Commissioned
+  sessions are guaranteed leaves again unless the caller opts in with
+  `allow_subagents`.
+- Multi-agent V2 lifecycle activity (`sub_agent_activity`, Codex >= 0.145.0)
+  now surfaces in MCP progress next to the older `collab_agent_*` events.
+
 ## [0.21.0] - 2026-07-22
 
 ### Fixed
