@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`multi_agent = false` stays for older Codex versions). Commissioned
   sessions are guaranteed leaves again unless the caller opts in with
   `allow_subagents`.
+- The `[agents]` off switch is version-gated: Codex 0.102–0.144 parse a
+  boolean under `[agents]` as a custom agent role and hard-fail config
+  loading at startup, which would have broken the whole codex provider on
+  those versions. The bridge now probes `codex --version` once at startup and
+  emits the `[agents]` line (and the matching `agents.enabled` opt-in
+  override) only on >= 0.145.0; older versions keep the feature flag, which
+  both parses everywhere and still gates their collab tools. An unparseable
+  version assumes modern Codex, failing toward subagents staying off.
 - Multi-agent V2 lifecycle activity (`sub_agent_activity`, Codex >= 0.145.0)
   now surfaces in MCP progress next to the older `collab_agent_*` events.
 

@@ -469,6 +469,7 @@ EOF
 write_codex_capture_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1" = "--version" ]; then printf '%s\n' "${MCP_STUB_CODEX_VERSION:-codex-cli 0.145.0}"; exit 0; fi
 printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 # Stub codex mcp-server: echo each received stdin line into the capture file.
 # `|| [ -n "$line" ]` also captures a final line with no trailing newline
@@ -485,6 +486,7 @@ EOF
 write_codex_config_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1" = "--version" ]; then printf '%s\n' "${MCP_STUB_CODEX_VERSION:-codex-cli 0.145.0}"; exit 0; fi
 printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 cp "$CODEX_HOME/config.toml" "$MCP_AGENTS_TEST_CONFIG_CAPTURE"
 while IFS= read -r _line; do :; done
@@ -497,6 +499,7 @@ EOF
 write_codex_auth_rotation_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1" = "--version" ]; then printf '%s\n' "${MCP_STUB_CODEX_VERSION:-codex-cli 0.145.0}"; exit 0; fi
 printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 stale="$MCP_AGENTS_TEST_REAL_CODEX_HOME/.auth.json.mcp-agents-${PPID}.tmp"
 printf '%s' '{"token":"stale"}' > "$stale"
@@ -515,6 +518,7 @@ test_codex_bridge_config() {
   local env_network="$4"
   local source_config="${5:-}"
   local expected_fast="${6:-false}"
+  local expected_agents="${7:-present}"
   local tmpdir real_home config_capture output_file error_file status expected ok
   local -a network_env
 
@@ -565,18 +569,26 @@ test_codex_bridge_config() {
     'hooks = false' \
     'plugins = false' \
     'multi_agent = false' \
-    'skill_mcp_dependency_install = false' \
-    '[agents]' \
-    'enabled = false'
+    'skill_mcp_dependency_install = false'
   do
     grep -Fxq "$expected" "$config_capture" 2>/dev/null || ok=0
   done
   [ "$(grep -Fxc '[sandbox_workspace_write]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
   [ "$(grep -Fxc '[features]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
-  [ "$(grep -Fxc '[agents]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
-  # `enabled = false` must live INSIDE the [agents] table (the real off switch
-  # for native subagents on Codex >= 0.145.0), not as a stray top-level key.
-  sed -n '/^\[agents\]$/,/^\[/p' "$config_capture" | grep -Fxq 'enabled = false' || ok=0
+  if [ "$expected_agents" = "present" ]; then
+    # >= 0.145.0 (or unknown version): the [agents] off switch is emitted, and
+    # `enabled = false` must live INSIDE the [agents] table (the real off
+    # switch for native subagents there), not as a stray top-level key.
+    [ "$(grep -Fxc '[agents]' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
+    sed -n '/^\[agents\]$/,/^\[/p' "$config_capture" | grep -Fxq 'enabled = false' || ok=0
+    grep -Fq 'subagent_gate=agents_enabled' "$error_file" || ok=0
+  else
+    # 0.102–0.144 hard-fail parsing a boolean under [agents]; the whole table
+    # must be absent and the feature flag remains the (working) off switch.
+    grep -Fq '[agents]' "$config_capture" 2>/dev/null && ok=0
+    grep -Fxq 'enabled = false' "$config_capture" 2>/dev/null && ok=0
+    grep -Fq 'subagent_gate=feature_flag_only' "$error_file" || ok=0
+  fi
 
   if [ "$expected_fast" = "true" ]; then
     [ "$(grep -Fxc 'service_tier = "fast"' "$config_capture" 2>/dev/null)" -eq 1 ] || ok=0
@@ -661,6 +673,7 @@ test_codex_auth_persistence_secure_temp() {
 write_codex_watchdog_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env node
+if (process.argv[2] === "--version") { process.stdout.write(`${process.env.MCP_STUB_CODEX_VERSION || "codex-cli 0.145.0"}\n`); process.exit(0); }
 const MODE = process.env.MCP_STUB_MODE || "stall";
 require("fs").appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
 // Record our pid so the test can assert the wrapper actually killed us on
@@ -897,6 +910,7 @@ test_codex_local_response_lifecycle() {
 
   cat >"$tmpdir/codex" <<'EOF'
 #!/usr/bin/env node
+if (process.argv[2] === "--version") { process.stdout.write(`${process.env.MCP_STUB_CODEX_VERSION || "codex-cli 0.145.0"}\n`); process.exit(0); }
 const fs = require("fs");
 const mode = process.env.MCP_STUB_LOCAL_MODE;
 const capture = process.env.MCP_STUB_LOCAL_CAPTURE;
@@ -1090,6 +1104,7 @@ test_codex_percall_write() {
 write_codex_toolslist_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env node
+if (process.argv[2] === "--version") { process.stdout.write(`${process.env.MCP_STUB_CODEX_VERSION || "codex-cli 0.145.0"}\n`); process.exit(0); }
 const MODE = process.env.MCP_STUB_TLMODE || "normal";
 require("fs").appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
 const SENTINEL = '{"jsonrpc":"2.0","method":"codex/event","params":{"marker":"PASSTHROUGH_SENTINEL"}}';
@@ -1379,6 +1394,7 @@ test_codex_toolslist_cancel() {
 write_codex_lifecycle_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env node
+if (process.argv[2] === "--version") { process.stdout.write(`${process.env.MCP_STUB_CODEX_VERSION || "codex-cli 0.145.0"}\n`); process.exit(0); }
 const fs = require("fs");
 const mode = process.env.MCP_STUB_LIFECYCLE_MODE;
 fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
@@ -1501,6 +1517,7 @@ function startCall(id) {
       later(420, () => event(id, "item_completed", { item: { type: "AgentMessage", id: "completed-safe", phase: "commentary", content: [{ type: "Text", text: "Completed commentary" }] } }));
       later(440, () => event(id, "item_completed", { item: { type: "AgentMessage", id: "completed-final", phase: "final_answer", content: [{ type: "Text", text: "SENTINEL_COMPLETED_FINAL" }] } }));
       later(470, () => event(id, "agent_message", { phase: "commentary", message: "🚀".repeat(250) }));
+      later(505, () => event(id, "sub_agent_activity", { agent_id: "SENTINEL_AGENT", detail: "SENTINEL_ACTIVITY" }));
       later(550, () => result(id, "VISIBLE"));
       break;
     }
@@ -2180,6 +2197,39 @@ test_codex_bridge_config \
   "true" "" "__unset__" \
   "__read_error__" \
   "false"
+# The [agents] enabled=false off switch is version-gated: 0.102–0.144 route a
+# boolean under [agents] into the flattened role map and hard-fail config
+# parsing, so the table must be absent there (the feature flag still gates the
+# collab tools on those versions). Unknown versions assume modern codex.
+export MCP_STUB_CODEX_VERSION="codex-cli 0.130.0"
+test_codex_bridge_config \
+  "codex bridge omits the agents table on codex 0.130" \
+  "true" "" "__unset__" \
+  "" \
+  "false" \
+  "absent"
+export MCP_STUB_CODEX_VERSION="codex-cli 0.144.9"
+test_codex_bridge_config \
+  "codex bridge omits the agents table on codex 0.144" \
+  "true" "" "__unset__" \
+  "" \
+  "false" \
+  "absent"
+export MCP_STUB_CODEX_VERSION="codex-cli 1.2.3"
+test_codex_bridge_config \
+  "codex bridge keeps the agents off switch on codex 1.2.3" \
+  "true" "" "__unset__" \
+  "" \
+  "false" \
+  "present"
+export MCP_STUB_CODEX_VERSION="not-a-version"
+test_codex_bridge_config \
+  "codex bridge assumes modern codex on an unknown version" \
+  "true" "" "__unset__" \
+  "" \
+  "false" \
+  "present"
+unset MCP_STUB_CODEX_VERSION
 test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclusive temp"
 test_codex_call_passes_through_unmodified \
   "codex-reply forwards an accepted no-goal call byte-for-byte" \
@@ -2260,6 +2310,14 @@ test_codex_call_transform "codex-start strips allow_subagents into the private j
   '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","allow_subagents":true}' \
   '(.params.name == "codex") and (.params.arguments | ((has("allow_subagents")|not) and (.config == {"features.multi_agent":true,"agents.enabled":true})))' \
   "codex-start"
+# On pre-0.145 codex the agents.enabled override would be a fatal config type
+# error at the native layer, so the opt-in injects the feature flag only.
+export MCP_STUB_CODEX_VERSION="codex-cli 0.130.0"
+test_codex_call_transform "codex allow_subagents on codex 0.130 injects the feature flag only" \
+  "" \
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","allow_subagents":true}' \
+  '.params.arguments | ((has("allow_subagents")|not) and (.config == {"features.multi_agent":true}))'
+unset MCP_STUB_CODEX_VERSION
 
 # Forbidden, missing, malformed, and deprecated arguments fail before Codex runs.
 test_codex_rejects_call "codex rejects hidden native configuration" \
@@ -2436,6 +2494,7 @@ test_codex_lifecycle "codex progress allowlist exposes useful status and redacts
        ($messages | contains("applying changes to 2 file(s)")) and
        ($messages | contains("calling safe-server/safe-tool")) and
        ($messages | contains("web search finished")) and
+       ($messages | contains("subagent activity")) and
        ($messages | contains("Completed commentary")) and
        ($messages | contains("SENTINEL_") | not)))'
 test_codex_lifecycle "codex progress is immediate then coalesces latest distinct status" \

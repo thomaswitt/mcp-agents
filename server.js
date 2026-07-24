@@ -2,7 +2,7 @@
 /* eslint-disable no-console */
 
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   closeSync,
   copyFileSync,
@@ -731,6 +731,50 @@ function readCodexFastModeOptIn(codexHome) {
 }
 
 /**
+ * Probe the installed codex binary's version once at bridge startup.
+ * @returns {{ major: number, minor: number, patch: number } | undefined}
+ */
+function readCodexBinaryVersion() {
+  try {
+    const output = execFileSync("codex", ["--version"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3_000,
+      encoding: "utf8",
+    });
+    const match = /(\d+)\.(\d+)\.(\d+)/.exec(output);
+    if (!match) return undefined;
+    return {
+      major: Number(match[1]),
+      minor: Number(match[2]),
+      patch: Number(match[3]),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether this codex accepts the scalar `agents.enabled` config key.
+ *
+ * Version-dependent on purpose (verified against codex-rs source history):
+ *   - >= 0.145.0: `enabled` is an explicit Option<bool> — accepted, and the
+ *     only gate that actually removes the collab tools there.
+ *   - 0.102.0 – 0.144.x: `[agents]` flattens unreserved keys into a
+ *     role-name -> role-table map, so a boolean `enabled` HARD-FAILS config
+ *     parsing at startup and codex exits. Never emit it there; the
+ *     `features.multi_agent` flag still gates the (experimental) collab tools.
+ *   - < 0.102.0: unknown key/table, silently ignored either way.
+ * An unknown version assumes modern codex: that fails toward subagents
+ * staying OFF (the safety property) and any breakage is loud, never silent.
+ * @param {{ major: number, minor: number } | undefined} version
+ * @returns {boolean}
+ */
+function codexSupportsAgentsEnabledKey(version) {
+  if (!version) return true;
+  return version.major > 0 || version.minor >= 145;
+}
+
+/**
  * Quote a string for TOML output.
  * @param {string} value
  * @returns {string}
@@ -741,7 +785,7 @@ function toTomlString(value) {
 
 /**
  * Build the minimal config for the isolated Codex bridge runtime.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean }} opts
  * @returns {string}
  */
 function buildCodexBridgeConfig({
@@ -751,6 +795,7 @@ function buildCodexBridgeConfig({
   approvalPolicy,
   workspaceNetworkAccess,
   fastModeEnabled,
+  agentsEnabledKeySupported,
 }) {
   return [
     `model = ${toTomlString(model)}`,
@@ -781,10 +826,11 @@ function buildCodexBridgeConfig({
     // get the collab tools with it set to false. `agents.enabled = false` is
     // the gate that actually removes them; keep both so older Codex versions
     // stay disabled through the feature flag. Sessions opt back in per call
-    // with `allow_subagents` (see transformCodexToolCall).
-    "[agents]",
-    "enabled = false",
-    "",
+    // with `allow_subagents` (see transformCodexToolCall). The [agents] line
+    // is version-gated: 0.102–0.144 hard-fail parsing a boolean there (see
+    // codexSupportsAgentsEnabledKey), and the feature flag still gates the
+    // collab tools on those versions.
+    ...(agentsEnabledKeySupported ? ["[agents]", "enabled = false", ""] : []),
   ].join("\n");
 }
 
@@ -821,7 +867,7 @@ function sweepStaleCodexHomes(maxAgeMs = STALE_CODEX_HOME_MAX_AGE_MS) {
 
 /**
  * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
- * @param {{ sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean }} opts
+ * @param {{ sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean }} opts
  * @returns {string}
  */
 function createIsolatedCodexHome({
@@ -832,6 +878,7 @@ function createIsolatedCodexHome({
   approvalPolicy,
   workspaceNetworkAccess,
   fastModeEnabled,
+  agentsEnabledKeySupported,
 }) {
   const codexHome = mkdtempSync(join(tmpdir(), "mcp-agents-codex-"));
   // If auth copy or config write throws after the dir exists, remove the
@@ -866,6 +913,7 @@ function createIsolatedCodexHome({
         approvalPolicy,
         workspaceNetworkAccess,
         fastModeEnabled,
+        agentsEnabledKeySupported,
       }),
       "utf8",
     );
@@ -984,7 +1032,7 @@ function applyGoalPreamble(prompt, goal) {
  * re-serializes the message (the intended, framing-safe path for a changed
  * message).
  * @param {string} line
- * @param {{ serverGoal?: string }} [opts]
+ * @param {{ serverGoal?: string, agentsEnabledKeySupported?: boolean }} [opts]
  * @returns {string}
  */
 function transformCodexToolCall(line, opts = {}) {
@@ -1033,17 +1081,22 @@ function transformCodexToolCall(line, opts = {}) {
     const allowSubagents = args[CODEX_ALLOW_SUBAGENTS_ARG] === true;
     delete args[CODEX_ALLOW_SUBAGENTS_ARG];
     if (allowSubagents) {
-      // Flip BOTH gates: `agents.enabled` is the effective switch on Codex
-      // >= 0.145.0, `features.multi_agent` covers older versions where the
-      // feature flag still gates the collab tools.
+      // Flip the right gate(s) for the running codex: `agents.enabled` is the
+      // effective switch on >= 0.145.0 but a fatal config type error on
+      // 0.102–0.144 (see codexSupportsAgentsEnabledKey), where the
+      // `features.multi_agent` flag still gates the collab tools itself.
       args.config = {
         ...args.config,
         "features.multi_agent": true,
-        "agents.enabled": true,
+        ...(opts.agentsEnabledKeySupported === false
+          ? {}
+          : { "agents.enabled": true }),
       };
       subagentsLog =
         "enabled native Codex subagents for this session " +
-        "(agents.enabled=true, features.multi_agent=true)";
+        `(features.multi_agent=true${
+          opts.agentsEnabledKeySupported === false ? "" : ", agents.enabled=true"
+        })`;
     }
     changed = true;
   }
@@ -1537,6 +1590,8 @@ function runCodexPassthrough({
   const resolvedGoal = goal;
   const sourceCodexHome = resolveCodexHome();
   const fastModeEnabled = readCodexFastModeOptIn(sourceCodexHome);
+  const codexVersion = readCodexBinaryVersion();
+  const agentsEnabledKeySupported = codexSupportsAgentsEnabledKey(codexVersion);
   const sweptHomes = sweepStaleCodexHomes();
   if (sweptHomes > 0) {
     logErr(
@@ -1555,6 +1610,7 @@ function runCodexPassthrough({
       approvalPolicy: resolvedApprovalPolicy,
       workspaceNetworkAccess: resolvedWorkspaceNetworkAccess,
       fastModeEnabled,
+      agentsEnabledKeySupported,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1586,6 +1642,14 @@ function runCodexPassthrough({
       `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
       `workspace_network_access=${resolvedWorkspaceNetworkAccess}, ` +
       `fast_mode_opt_in=${fastModeEnabled}, ` +
+      `codex_version=${
+        codexVersion
+          ? `${codexVersion.major}.${codexVersion.minor}.${codexVersion.patch}`
+          : "unknown"
+      }, ` +
+      `subagent_gate=${
+        agentsEnabledKeySupported ? "agents_enabled" : "feature_flag_only"
+      }, ` +
       `goal=${resolvedGoal && resolvedGoal.trim() ? "set" : "none"}, ` +
       `idle_timeout_ms=${resolvedIdleTimeoutMs}, hard_timeout_ms=${resolvedHardTimeoutMs}, ` +
       `isolated_home=true)`,
@@ -2528,7 +2592,7 @@ function runCodexPassthrough({
     try {
       const transformed = transformCodexToolCall(
         JSON.stringify(nativeMsg),
-        { serverGoal: resolvedGoal },
+        { serverGoal: resolvedGoal, agentsEnabledKeySupported },
       );
       child.stdin.write(`${transformed}\n`);
     } catch (err) {
@@ -3954,7 +4018,10 @@ function runCodexPassthrough({
       const line = stdinBuf.subarray(0, nl).toString("utf8");
       stdinBuf = stdinBuf.subarray(nl + 1);
       if (noteInbound(line) && !finalizing) {
-        child.stdin.write(`${transformCodexToolCall(line, { serverGoal: resolvedGoal })}\n`);
+        child.stdin.write(`${transformCodexToolCall(line, {
+          serverGoal: resolvedGoal,
+          agentsEnabledKeySupported,
+        })}\n`);
       }
     }
   });
@@ -3963,7 +4030,10 @@ function runCodexPassthrough({
     if (stdinBuf.length > 0) {
       const line = stdinBuf.toString("utf8");
       if (noteInbound(line) && !finalizing) {
-        child.stdin.write(transformCodexToolCall(line, { serverGoal: resolvedGoal }));
+        child.stdin.write(transformCodexToolCall(line, {
+          serverGoal: resolvedGoal,
+          agentsEnabledKeySupported,
+        }));
       }
     }
     // The client is gone for good. A background job (codex-start) is polled by

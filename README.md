@@ -108,7 +108,11 @@ keep ChatGPT app/plugin skills — Figma, Gmail, Presentations, etc. — out of 
 bridged session context. Native subagents are additionally disabled with
 `[agents] enabled = false`, because on Codex >= 0.145.0 the stabilized
 `multi_agent` feature flag alone no longer removes the collab tools; sessions
-opt back in per call with `allow_subagents` (see below).
+opt back in per call with `allow_subagents` (see below). That `[agents]` line
+is version-aware: the bridge probes `codex --version` once at startup and
+omits it on Codex < 0.145.0, where a boolean under `[agents]` is a fatal
+config parse error (0.102–0.144) and the feature flag still gates the collab
+tools by itself. An unparseable version assumes modern Codex.
 
 Workspace-write sessions have network access enabled by default so sandboxed
 commands can reach local services such as DynamoDB, Redis, OpenSearch, and MinIO.
@@ -154,9 +158,9 @@ Model values outside the two curated choices are rejected the same way.
 that session use Codex's built-in multi-agent tools (`spawn_agent`,
 `wait_agent`, …). It is session-scoped exactly like `sandbox`: replies inherit
 it and cannot change it, and it defaults to off. Internally the flag flips only
-the native multi-agent gates (`agents.enabled` plus `features.multi_agent`) via
-a per-call config override; everything else about the isolated home is
-unchanged. In particular the `[mcp_servers]` strip stays in force, so spawned
+the native multi-agent gates (`agents.enabled` plus `features.multi_agent`,
+matching the same version gate as above) via a per-call config override;
+everything else about the isolated home is unchanged. In particular the `[mcp_servers]` strip stays in force, so spawned
 subagents are Codex-only in-process workers — they cannot re-enter this bridge
 or reach Claude, Gemini, or any other external MCP tool, and custom agent
 roles from your real `$CODEX_HOME/agents/` are not copied in. The residual
