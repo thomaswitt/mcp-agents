@@ -304,6 +304,266 @@ EOF
   rm -rf "$tmpdir"
 }
 
+# ── Helper: exercise one black-box HTTP daemon contract ──
+test_http_daemon_case() {
+  local label="$1"
+  local scenario="$2"
+  local tmpdir output_file status
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/output.txt"
+  set +e
+  "$TIMEOUT_CMD" 20 node --input-type=module - \
+    "$scenario" "$tmpdir" >"$output_file" 2>&1 <<'EOF'
+import {
+  appendFileSync,
+  chmodSync,
+  lstatSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { request as httpRequest, createServer } from "node:http";
+import { spawn, spawnSync } from "node:child_process";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+
+const scenario = process.argv[2];
+const tmpdir = process.argv[3];
+const tokenFile = `${tmpdir}/bearer-token`;
+const projectRoot = process.cwd();
+if (scenario === "shutdown") {
+  writeFileSync(`${tmpdir}/agy`, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.MCP_STUB_PROVIDER_PID, String(process.pid));
+setInterval(() => {}, 1000);
+`);
+  chmodSync(`${tmpdir}/agy`, 0o755);
+}
+const port = await new Promise((resolve, reject) => {
+  const probe = createServer();
+  probe.once("error", reject);
+  probe.listen(0, "127.0.0.1", () => {
+    const address = probe.address();
+    probe.close((error) => error ? reject(error) : resolve(address.port));
+  });
+});
+
+const child = spawn(process.execPath, [
+  "server.js",
+  "--provider", "gemini",
+  "--transport", "http",
+  "--http-port", String(port),
+  "--http-token-file", tokenFile,
+], {
+  cwd: process.cwd(),
+  detached: true,
+  stdio: ["pipe", "pipe", "pipe"],
+  env: {
+    ...process.env,
+    PATH: `${tmpdir}:${process.env.PATH}`,
+    MCP_STUB_PROVIDER_PID: `${tmpdir}/provider.pid`,
+  },
+});
+appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${child.pid}\n`);
+child.stdout.resume();
+let stderr = "";
+child.stderr.setEncoding("utf8");
+child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+const ready = new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error(`HTTP daemon did not become ready: ${stderr}`)), 5_000);
+  const inspect = () => {
+    if (!stderr.includes("HTTP MCP listening")) return;
+    clearTimeout(timer);
+    child.stderr.off("data", inspect);
+    resolve();
+  };
+  child.stderr.on("data", inspect);
+  child.once("exit", (code, signal) => {
+    clearTimeout(timer);
+    reject(new Error(`HTTP daemon exited before ready: code=${code} signal=${signal} stderr=${stderr}`));
+  });
+});
+
+const stop = async () => {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try { child.stdin.end(); } catch {}
+  try { process.kill(-child.pid, "SIGTERM"); } catch {}
+  await Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    new Promise((resolve) => setTimeout(resolve, 2_000)),
+  ]);
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+};
+
+const rawRequest = (path, headers = {}) => new Promise((resolve, reject) => {
+  const req = httpRequest({
+    host: "127.0.0.1",
+    port,
+    path,
+    method: "GET",
+    headers,
+  }, (response) => {
+    response.resume();
+    response.once("end", () => resolve(response.statusCode));
+  });
+  req.once("error", reject);
+  req.end();
+});
+
+try {
+  await ready;
+  const token = readFileSync(tokenFile, "utf8").trim();
+  const authorization = `Bearer ${token}`;
+
+  if (scenario === "token") {
+    const stats = lstatSync(tokenFile);
+    if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o777) !== 0o600) {
+      throw new Error(`token permissions are not 0600: ${(stats.mode & 0o777).toString(8)}`);
+    }
+    if (!/^[a-f0-9]{64}$/u.test(token)) throw new Error("token format is not 32-byte hex");
+    const helper = spawnSync(process.execPath, [
+      "server.js", "http-auth-headers", "--http-token-file", tokenFile,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    if (helper.status !== 0) throw new Error(`auth helper failed: ${helper.stderr}`);
+    const parsed = JSON.parse(helper.stdout);
+    if (JSON.stringify(parsed) !== JSON.stringify({ Authorization: authorization })) {
+      throw new Error(`unexpected auth helper result: ${helper.stdout}`);
+    }
+  } else if (scenario === "security") {
+    if (await rawRequest("/mcp") !== 401) throw new Error("missing token was not rejected with 401");
+    if (await rawRequest("/mcp", { Authorization: "Bearer wrong" }) !== 401) {
+      throw new Error("wrong token was not rejected with 401");
+    }
+    if (await rawRequest("/mcp", {
+      Authorization: authorization,
+      Origin: "https://evil.example",
+    }) !== 403) throw new Error("untrusted Origin was not rejected with 403");
+    if (await rawRequest("/mcp", {
+      Authorization: authorization,
+      Host: "evil.example",
+    }) !== 403) throw new Error("untrusted Host was not rejected with 403");
+    if (await rawRequest("/not-mcp", { Authorization: authorization }) !== 404) {
+      throw new Error("unknown path was not rejected with 404");
+    }
+    if (await rawRequest("/mcp", { Authorization: authorization }) !== 405) {
+      throw new Error("unsupported method was not rejected with 405");
+    }
+  } else if (scenario === "shutdown") {
+    const client = new Client(
+      { name: "mcp-agents-http-shutdown-test", version: "0.0.0" },
+      { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+    );
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`),
+      { requestInit: { headers: { Authorization: authorization } } },
+    );
+    await client.connect(transport);
+    const openCall = client.callTool({
+      name: "gemini",
+      arguments: { prompt: "stay active" },
+    }).catch((error) => ({ transportError: error.message }));
+    let providerStarted = false;
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      try {
+        if (readFileSync(`${tmpdir}/provider.pid`, "utf8").trim()) {
+          providerStarted = true;
+          break;
+        }
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!providerStarted) {
+      const earlyResult = await Promise.race([
+        openCall,
+        new Promise((resolve) => setTimeout(() => resolve("still pending"), 100)),
+      ]);
+      throw new Error(
+        `provider did not start; result=${JSON.stringify(earlyResult)} stderr=${stderr}`,
+      );
+    }
+    const providerPid = Number(readFileSync(`${tmpdir}/provider.pid`, "utf8"));
+    const stoppedAt = Date.now();
+    try { process.kill(-child.pid, "SIGTERM"); } catch {}
+    const closeInfo = await Promise.race([
+      new Promise((resolve) => child.once("exit", (code, signal) =>
+        resolve({ code, signal })
+      )),
+      new Promise((resolve) => setTimeout(() => resolve(null), 3_000)),
+    ]);
+    await client.close().catch(() => {});
+    await Promise.race([
+      openCall,
+      new Promise((resolve) => setTimeout(resolve, 500)),
+    ]);
+    if (!closeInfo || Date.now() - stoppedAt >= 3_000) {
+      throw new Error(`HTTP daemon did not drain its active provider: ${stderr}`);
+    }
+    try {
+      process.kill(providerPid, 0);
+      throw new Error(`provider child ${providerPid} survived HTTP shutdown`);
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
+  } else {
+    const versionNegotiation = scenario === "modern"
+      ? { mode: { pin: "2026-07-28" } }
+      : { mode: "legacy" };
+    const client = new Client(
+      { name: `mcp-agents-${scenario}-http-test`, version: "0.0.0" },
+      { versionNegotiation },
+    );
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`),
+      {
+        requestInit: {
+          headers: {
+            Authorization: authorization,
+            "X-Mcp-Agents-Project-Root": projectRoot,
+          },
+        },
+      },
+    );
+    try {
+      await client.connect(transport);
+      const expectedEra = scenario === "modern" ? "modern" : "legacy";
+      if (client.getProtocolEra() !== expectedEra) {
+        throw new Error(`expected ${expectedEra}, got ${client.getProtocolEra()}`);
+      }
+      const result = await client.callTool({ name: "ping", arguments: {} });
+      if (result.content?.[0]?.text !== "pong") {
+        throw new Error(`unexpected ping result: ${JSON.stringify(result)}`);
+      }
+      const readyCount = (stderr.match(
+        new RegExp(`ready \\(provider: gemini, era=${expectedEra}\\)`, "gu"),
+      ) ?? []).length;
+      if (readyCount !== 1) {
+        throw new Error(`provider readiness was logged ${readyCount} times`);
+      }
+    } finally {
+      await client.close().catch(() => {});
+    }
+  }
+} finally {
+  await stop();
+}
+EOF
+  status=$?
+  set -e
+
+  if [ "$status" -eq 0 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (exit $status)"
+    cat "$output_file"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 # ── Helper: full handshake → tools/call with a connectivity check ──
 test_connectivity() {
   local label="$1"
@@ -420,6 +680,62 @@ test_codex_workspace_network_env_error() {
   fi
 }
 
+# ── Helper: the HTTP auth helper must fail closed when its token is absent ──
+test_http_auth_headers_missing_token() {
+  local label="$1"
+  local tmpdir stderr_output status
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  set +e
+  stderr_output=$($SERVER http-auth-headers \
+    --http-token-file "$tmpdir/missing-token" 2>&1 >/dev/null)
+  status=$?
+  set -e
+
+  if [ "$status" -ne 0 ] &&
+    printf '%s' "$stderr_output" | grep -Fq "HTTP bearer token file does not exist"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (exit=$status)"
+    echo "  Stderr: $stderr_output"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+test_http_token_parent_safety() {
+  local label="$1"
+  local tmpdir shared_dir stderr_output status mode
+
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  shared_dir="$tmpdir/shared"
+  mkdir "$shared_dir"
+  chmod 0755 "$shared_dir"
+  set +e
+  stderr_output=$($TIMEOUT_CMD 2 $SERVER --provider gemini \
+    --transport http --http-port 18766 \
+    --http-token-file "$shared_dir/bearer-token" 2>&1 >/dev/null)
+  status=$?
+  set -e
+  mode=$(node -e 'console.log((require("node:fs").statSync(process.argv[1]).mode & 0o777).toString(8))' \
+    "$shared_dir")
+
+  if [ "$status" -ne 0 ] && [ "$status" -ne 124 ] && [ "$mode" = "755" ] &&
+    printf '%s' "$stderr_output" | grep -Fq "directory permissions"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (exit=$status, mode=$mode)"
+    echo "  Stderr: $stderr_output"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 # ========== CLI flag tests ==========
 
 test_cli_flag "--help prints usage"         "--help"    "Usage:"
@@ -436,6 +752,9 @@ test_cli_flag "--help shows goal flag"      "--help"    "Native durable goal"
 test_cli_flag "--help shows browser provider" "--help" "browser_lease_command"
 test_cli_flag "--help shows browser downstream fallback" "--help" "npx chrome-devtools-mcp@latest"
 test_cli_flag "--help shows provider timeout defaults" "--help" "claude 900, browser 600, gemini 300"
+test_cli_flag "--help shows additive stdio and HTTP transports" "--help" "--transport <stdio|http>"
+test_cli_flag "--help shows the HTTP runtime idle timeout" "--help" "--http-runtime-idle-timeout"
+test_cli_flag "--help shows the HTTP auth helper" "--help" "http-auth-headers"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
@@ -451,6 +770,16 @@ test_cli_error "--codex-workspace-network invalid inline"   "--codex-workspace-n
 test_codex_workspace_network_env_error \
   "workspace network env rejects invalid value" "maybe" "must be true or false"
 test_cli_error "--goal without value"                      "--goal"                     "requires a value"
+test_cli_error "--transport without value"                 "--transport"                "requires a value"
+test_cli_error "--transport rejects unknown values"        "--transport pipe"           "must be stdio or http"
+test_cli_error "--http-port without value"                 "--http-port"                "requires a value"
+test_cli_error "--http-port rejects zero"                  "--http-port 0"              "integer from 1 to 65535"
+test_cli_error "--http-port rejects values above 65535"    "--http-port 65536"          "integer from 1 to 65535"
+test_cli_error "--http-runtime-idle-timeout without value" "--http-runtime-idle-timeout" "requires a value"
+test_cli_error "--http-runtime-idle-timeout rejects negative values" \
+  "--http-runtime-idle-timeout -1" "non-negative number"
+test_cli_error "--http-token-file without value"           "--http-token-file"          "requires a value"
+test_cli_error "--http-token-file rejects relative paths"  "--http-token-file token"    "must be absolute"
 test_cli_error "--timeout without value"                    "--timeout"                  "requires a value"
 test_cli_error "--timeout with zero"                        "--timeout 0"                "must be a positive number"
 test_cli_error "--timeout with negative"                    "--timeout -5"               "must be a positive number"
@@ -498,8 +827,28 @@ test_cli_error "browser flags reject the Claude provider"     "--provider claude
 test_cli_error "browser flags reject the Gemini provider"     "--provider gemini --browser_viewport 800x600" "only valid with --provider browser"
 test_cli_error "browser flags reject the Codex provider"      "--provider codex --browser_command fake" "only valid with --provider browser"
 test_cli_error "browser provider requires an injected lease helper" "--provider browser" "browser_lease_command"
+test_cli_error "HTTP rejects the browser byte proxy" \
+  "--transport http --provider browser" "HTTP transport is not supported by --provider browser"
+test_cli_error "HTTP rejects the frozen Codex native proxy" \
+  "--transport http --provider codex-legacy" "HTTP transport is not supported by --provider codex-legacy"
+test_http_auth_headers_missing_token \
+  "HTTP auth helper fails closed when its token file is absent"
+test_http_token_parent_safety \
+  "HTTP token creation never chmods an existing shared parent"
 
 # ========== Protocol tests (fast) ==========
+
+# ---------- Shared loopback HTTP daemon ----------
+test_http_daemon_case \
+  "HTTP daemon creates a private token and emits Claude auth headers" "token"
+test_http_daemon_case \
+  "HTTP daemon rejects unauthorized and cross-origin requests" "security"
+test_http_daemon_case \
+  "HTTP daemon serves MCP 2026 requests" "modern"
+test_http_daemon_case \
+  "HTTP daemon preserves stateless legacy requests" "legacy"
+test_http_daemon_case \
+  "HTTP daemon drains an active provider child on shutdown" "shutdown"
 
 # ---------- MCP 2026-07-28 modern negotiation ----------
 test_modern_stdio_provider \
@@ -1908,6 +2257,10 @@ function completeActive(text = "APP_SERVER_OK", status = "completed") {
   if (!active) return;
   const current = active;
   active = null;
+  fs.appendFileSync(
+    `${captureDir}/app-completions.jsonl`,
+    `${JSON.stringify({ threadId: current.threadId, turnId: current.turnId })}\n`,
+  );
   const item = { type: "agentMessage", id: current.itemId, text };
   notify("item/started", {
     threadId: current.threadId,
@@ -2056,7 +2409,10 @@ function startTurn(message, review = false, responseExtra = {}) {
       }
       return;
     }
-    setTimeout(() => completeActive(review ? "REVIEW_OK" : "APP_SERVER_OK"), 25);
+    setTimeout(
+      () => completeActive(review ? "REVIEW_OK" : "APP_SERVER_OK"),
+      mode === "delayed" ? 400 : 25,
+    );
   };
 
   if (mode === "early-complete") {
@@ -2921,6 +3277,415 @@ process.stdout.write(`${JSON.stringify({
   parseTail: parseBuffer,
 })}\n`, () => process.exit(0));
 EOF
+}
+
+test_codex_http_case() {
+  local label="$1" scenario="$2"
+  local tmpdir output_file status
+
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/output.txt"
+  mkdir -p "$tmpdir/real-codex-home" "$tmpdir/state" \
+    "$tmpdir/project-a" "$tmpdir/project-b"
+  printf '%s' '{"token":"stub"}' > "$tmpdir/real-codex-home/auth.json"
+  printf '%s' '{}' > "$tmpdir/real-codex-home/models_cache.json"
+  printf '%s' 'not a directory' > "$tmpdir/project-file"
+  ln -s "$tmpdir/project-a" "$tmpdir/project-link"
+  write_codex_app_server_stub "$tmpdir"
+
+  set +e
+  MCP_AGENTS_TEST_HTTP_DIR="$tmpdir" \
+    "$TIMEOUT_CMD" 20 node --input-type=module - \
+      "$scenario" "$(pwd)" >"$output_file" 2>&1 <<'EOF'
+import { appendFileSync, readFileSync, readdirSync } from "node:fs";
+import { createServer, request as httpRequest } from "node:http";
+import { spawn } from "node:child_process";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+
+const [scenario, serverDir] = process.argv.slice(2);
+const testDir = process.env.MCP_AGENTS_TEST_HTTP_DIR;
+const tokenFile = `${testDir}/bearer-token`;
+const port = await new Promise((resolve, reject) => {
+  const probe = createServer();
+  probe.once("error", reject);
+  probe.listen(0, "127.0.0.1", () => {
+    const address = probe.address();
+    probe.close((error) => error ? reject(error) : resolve(address.port));
+  });
+});
+
+const child = spawn(process.execPath, [
+  "server.js",
+  "--provider", "codex",
+  "--transport", "http",
+  "--http-port", String(port),
+  "--http-token-file", tokenFile,
+  "--http-runtime-idle-timeout", scenario === "pool" ? "10" : "0.15",
+  "--codex-state-root", `${testDir}/state/mcp-agents/codex`,
+], {
+  cwd: serverDir,
+  detached: true,
+  stdio: ["pipe", "pipe", "pipe"],
+  env: {
+    ...process.env,
+    PATH: `${testDir}:${process.env.PATH}`,
+    CODEX_HOME: `${testDir}/real-codex-home`,
+    XDG_STATE_HOME: `${testDir}/state`,
+    MCP_STUB_APP_CAPTURE_DIR: testDir,
+    MCP_STUB_APP_MODE: ["active", "active-request", "shutdown-active"].includes(scenario)
+      ? "park"
+      : scenario === "post-terminal-grace" ? "delayed" : "normal",
+    MCP_STUB_APP_WORKSPACE: `${testDir}/project-a`,
+    MCP_STUB_CODEX_VERSION: "codex-cli 0.149.1",
+  },
+});
+appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${child.pid}\n`);
+child.stdout.resume();
+let stderr = "";
+child.stderr.setEncoding("utf8");
+child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+const ready = new Promise((resolve, reject) => {
+  const timer = setTimeout(
+    () => reject(new Error(`Codex HTTP daemon did not become ready: ${stderr}`)),
+    5_000,
+  );
+  const inspect = () => {
+    if (!stderr.includes("HTTP MCP listening")) return;
+    clearTimeout(timer);
+    child.stderr.off("data", inspect);
+    resolve();
+  };
+  child.stderr.on("data", inspect);
+  child.once("exit", (code, signal) => {
+    clearTimeout(timer);
+    reject(new Error(
+      `Codex HTTP daemon exited before ready: code=${code} signal=${signal} stderr=${stderr}`,
+    ));
+  });
+});
+
+const rawRequest = (projectRoot) => new Promise((resolve, reject) => {
+  const headers = {
+    Authorization: `Bearer ${readFileSync(tokenFile, "utf8").trim()}`,
+    "Content-Type": "application/json",
+  };
+  if (projectRoot !== undefined) {
+    headers["X-Mcp-Agents-Project-Root"] = projectRoot;
+  }
+  const req = httpRequest({
+    host: "127.0.0.1",
+    port,
+    path: "/mcp",
+    method: "POST",
+    headers,
+  }, (response) => {
+    response.resume();
+    response.once("end", () => resolve(response.statusCode));
+  });
+  req.once("error", reject);
+  req.end("{}");
+});
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const waitFor = async (predicate, timeoutMs = 3_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await sleep(20);
+  }
+  return false;
+};
+const readJsonl = (path) => {
+  try {
+    return readFileSync(path, "utf8").split("\n").filter(Boolean).map(JSON.parse);
+  } catch {
+    return [];
+  }
+};
+const reapCount = () =>
+  (stderr.match(/reaped idle Codex runtime/gu) ?? []).length;
+const countProjectRuntimes = () => {
+  try {
+    const projects = `${testDir}/state/mcp-agents/codex/projects`;
+    return readdirSync(projects).reduce((count, project) => {
+      const bridges = `${projects}/${project}/v1/bridges`;
+      try { return count + readdirSync(bridges).length; } catch { return count; }
+    }, 0);
+  } catch {
+    return 0;
+  }
+};
+const openClient = async (projectRoot, era = "modern") => {
+  const versionNegotiation = era === "modern"
+    ? { mode: { pin: "2026-07-28" } }
+    : { mode: "legacy" };
+  const client = new Client(
+    { name: `codex-http-${era}-test`, version: "0.0.0" },
+    { versionNegotiation },
+  );
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`http://127.0.0.1:${port}/mcp`),
+    {
+      requestInit: {
+        headers: {
+          Authorization: `Bearer ${readFileSync(tokenFile, "utf8").trim()}`,
+          "X-Mcp-Agents-Project-Root": projectRoot,
+        },
+      },
+    },
+  );
+  await client.connect(transport);
+  return client;
+};
+const initialArgs = (cwd, prompt = "hello") => ({
+  prompt,
+  cwd,
+  sandbox: "read-only",
+  model: "gpt-6-astra",
+  model_reasoning_effort: "high",
+});
+const assertToolText = (result, expected) => {
+  if (result.content?.[0]?.text !== expected) {
+    throw new Error(`expected ${expected}, got ${JSON.stringify(result)}`);
+  }
+};
+
+const stop = async () => {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try { process.kill(-child.pid, "SIGTERM"); } catch {}
+  await Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    new Promise((resolve) => setTimeout(resolve, 2_000)),
+  ]);
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+};
+
+try {
+  await ready;
+  if (scenario === "roots") {
+    const cases = [
+      [undefined, "missing"],
+      ["relative", "relative"],
+      [`${testDir}/absent`, "nonexistent"],
+      [`${testDir}/project-file`, "non-directory"],
+    ];
+    for (const [projectRoot, description] of cases) {
+      const status = await rawRequest(projectRoot);
+      if (status !== 400) {
+        throw new Error(`${description} project root returned ${status}, expected 400`);
+      }
+    }
+  } else if (scenario === "pool") {
+    const [modern, legacy] = await Promise.all([
+      openClient(`${testDir}/project-a`, "modern"),
+      openClient(`${testDir}/project-link`, "legacy"),
+    ]);
+    try {
+      assertToolText(
+        await modern.callTool({ name: "ping", arguments: {} }),
+        "pong",
+      );
+      assertToolText(
+        await legacy.callTool({ name: "ping", arguments: {} }),
+        "pong",
+      );
+      if (modern.getProtocolEra() !== "modern" || legacy.getProtocolEra() !== "legacy") {
+        throw new Error("modern and legacy clients did not preserve independent MCP eras");
+      }
+      if (countProjectRuntimes() !== 1) {
+        throw new Error(`same canonical root created ${countProjectRuntimes()} runtimes`);
+      }
+      assertToolText(await modern.callTool({
+        name: "codex",
+        arguments: initialArgs(`${testDir}/project-a`, "modern client"),
+      }), "APP_SERVER_OK");
+      assertToolText(await legacy.callTool({
+        name: "codex",
+        arguments: initialArgs(`${testDir}/project-a`, "legacy client"),
+      }), "APP_SERVER_OK");
+    } finally {
+      await Promise.allSettled([modern.close(), legacy.close()]);
+    }
+
+    const isolated = await openClient(`${testDir}/project-b`);
+    try {
+      assertToolText(await isolated.callTool({
+        name: "codex",
+        arguments: initialArgs(`${testDir}/project-b`, "isolated project"),
+      }), "APP_SERVER_OK");
+    } finally {
+      await isolated.close();
+    }
+    await waitFor(() => readJsonl(`${testDir}/app-spawns.jsonl`).length === 2);
+    if (readJsonl(`${testDir}/app-spawns.jsonl`).length !== 2) {
+      throw new Error("same-root requests did not share one child or projects were not isolated");
+    }
+    if (countProjectRuntimes() !== 2) {
+      throw new Error(`expected two isolated runtimes, got ${countProjectRuntimes()}`);
+    }
+    const modernReadyCount = (stderr.match(/Codex MCP adapter ready \(era=modern/gu) ?? []).length;
+    const legacyReadyCount = (stderr.match(/Codex MCP adapter ready \(era=legacy/gu) ?? []).length;
+    if (modernReadyCount !== 2 || legacyReadyCount !== 1) {
+      throw new Error(
+        `adapter readiness was logged per request instead of per runtime/era: ` +
+        `modern=${modernReadyCount} legacy=${legacyReadyCount}`,
+      );
+    }
+  } else if (scenario === "eviction") {
+    const first = await openClient(`${testDir}/project-a`);
+    assertToolText(await first.callTool({
+      name: "codex",
+      arguments: initialArgs(`${testDir}/project-a`, "first generation"),
+    }), "APP_SERVER_OK");
+    await first.close();
+    if (!await waitFor(() => stderr.includes("reaped idle Codex runtime"))) {
+      throw new Error(`runtime was not reaped after becoming idle: ${stderr}`);
+    }
+    if (countProjectRuntimes() !== 0) {
+      throw new Error("reaped runtime left a live bridge directory");
+    }
+    const second = await openClient(`${testDir}/project-a`);
+    try {
+      assertToolText(await second.callTool({
+        name: "codex",
+        arguments: initialArgs(`${testDir}/project-a`, "second generation"),
+      }), "APP_SERVER_OK");
+    } finally {
+      await second.close();
+    }
+    if (!await waitFor(() => readJsonl(`${testDir}/app-spawns.jsonl`).length === 2)) {
+      throw new Error("request after eviction did not recreate the Codex runtime");
+    }
+  } else if (scenario === "active") {
+    const starter = await openClient(`${testDir}/project-a`);
+    const started = await starter.callTool({
+      name: "codex-start",
+      arguments: initialArgs(`${testDir}/project-a`, "keep running"),
+    });
+    const jobId = started.structuredContent?.jobId;
+    if (!jobId) throw new Error(`Codex job did not start: ${JSON.stringify(started)}`);
+    await starter.close();
+    const reapsBeforeActiveWait = reapCount();
+    await sleep(500);
+    if (reapCount() !== reapsBeforeActiveWait) {
+      throw new Error("runtime was reaped while a background job was active");
+    }
+    const observer = await openClient(`${testDir}/project-link`);
+    try {
+      const status = await observer.callTool({
+        name: "codex-status",
+        arguments: { jobId, cursor: 0, wait_ms: 0 },
+      });
+      if (status.structuredContent?.state !== "running") {
+        throw new Error(`shared job was not running: ${JSON.stringify(status)}`);
+      }
+      await observer.callTool({ name: "codex-cancel", arguments: { jobId } });
+    } finally {
+      await observer.close();
+    }
+    if (readJsonl(`${testDir}/app-spawns.jsonl`).length !== 1) {
+      throw new Error("active same-root job did not retain one shared App Server");
+    }
+    if (!await waitFor(() => reapCount() > reapsBeforeActiveWait)) {
+      throw new Error("runtime was not reaped after its active job became terminal");
+    }
+  } else if (scenario === "post-terminal-grace") {
+    const starter = await openClient(`${testDir}/project-a`);
+    const started = await starter.callTool({
+      name: "codex-start",
+      arguments: initialArgs(`${testDir}/project-a`, "complete later"),
+    });
+    if (!started.structuredContent?.jobId) {
+      throw new Error(`Codex job did not start: ${JSON.stringify(started)}`);
+    }
+    await starter.close();
+    const reapsBeforeCompletion = reapCount();
+    await sleep(250);
+    if (reapCount() !== reapsBeforeCompletion) {
+      throw new Error("runtime was reaped while the delayed job was active");
+    }
+    if (!await waitFor(() =>
+      readJsonl(`${testDir}/app-completions.jsonl`).length === 1
+    )) {
+      throw new Error("delayed background job did not complete");
+    }
+    if (reapCount() !== reapsBeforeCompletion) {
+      throw new Error("runtime was reaped as soon as the background job completed");
+    }
+    await sleep(100);
+    if (reapCount() !== reapsBeforeCompletion) {
+      throw new Error("runtime did not receive a fresh idle grace period after completion");
+    }
+    if (!await waitFor(() => reapCount() > reapsBeforeCompletion)) {
+      throw new Error("runtime was not reaped after its post-completion idle grace");
+    }
+  } else if (scenario === "active-request" || scenario === "shutdown-active") {
+    const client = await openClient(`${testDir}/project-a`);
+    const openCall = client.callTool({
+      name: "codex",
+      arguments: initialArgs(`${testDir}/project-a`, "foreground work"),
+    }).catch((error) => ({ transportError: error.message }));
+    if (!await waitFor(() =>
+      readJsonl(`${testDir}/app-stdin.jsonl`).some((entry) =>
+        entry.method === "turn/start"
+      )
+    )) throw new Error("foreground request never reached App Server");
+    const reapsBeforeActiveWait = reapCount();
+    await sleep(500);
+    if (reapCount() !== reapsBeforeActiveWait) {
+      throw new Error("runtime was reaped while a foreground request was active");
+    }
+    if (scenario === "active-request") {
+      await client.close();
+      await Promise.race([openCall, sleep(1_500)]);
+      if (!await waitFor(() => reapCount() > reapsBeforeActiveWait)) {
+        throw new Error("runtime was not reaped after foreground cancellation settled");
+      }
+    } else {
+      const stoppedAt = Date.now();
+      try { process.kill(-child.pid, "SIGTERM"); } catch {}
+      const closeInfo = await Promise.race([
+        new Promise((resolve) => child.once("exit", (code, signal) =>
+          resolve({ code, signal })
+        )),
+        sleep(3_000).then(() => null),
+      ]);
+      await client.close().catch(() => {});
+      await Promise.race([openCall, sleep(500)]);
+      if (!closeInfo || Date.now() - stoppedAt >= 3_000) {
+        throw new Error(`daemon did not drain active request: ${stderr}`);
+      }
+      const appPid = readJsonl(`${testDir}/app-spawns.jsonl`)[0]?.pid;
+      if (appPid) {
+        try {
+          process.kill(appPid, 0);
+          throw new Error(`App Server child ${appPid} survived daemon shutdown`);
+        } catch (error) {
+          if (error?.code !== "ESRCH") throw error;
+        }
+      }
+    }
+  } else {
+    throw new Error(`unknown scenario: ${scenario}`);
+  }
+} finally {
+  await stop();
+}
+EOF
+  status=$?
+  set -e
+
+  if [ "$status" -eq 0 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (exit $status)"
+    cat "$output_file"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
 }
 
 test_codex_app_case() {
@@ -4330,6 +5095,8 @@ test_browser_npx_resolution() {
   cp server.js package.json "$package_dir/"
   ln -s "$(pwd)/node_modules/@modelcontextprotocol/server" \
     "$package_dir/node_modules/@modelcontextprotocol/server"
+  ln -s "$(pwd)/node_modules/@modelcontextprotocol/node" \
+    "$package_dir/node_modules/@modelcontextprotocol/node"
   write_browser_mcp_stub "$tmpdir"
   write_browser_lease_stub "$tmpdir"
   write_browser_npx_stub "$tmpdir/bin"
@@ -4689,6 +5456,21 @@ test_claude_job \
 
 
 # App Server adapter contract tests (fast — no real Codex needed).
+test_codex_http_case "Codex HTTP rejects invalid project roots before MCP dispatch" \
+  "roots"
+test_codex_http_case "Codex HTTP pools by canonical root across MCP eras" \
+  "pool"
+test_codex_http_case "Codex HTTP recreates runtimes after true idle eviction" \
+  "eviction"
+test_codex_http_case "Codex HTTP retains runtimes while background jobs are active" \
+  "active"
+test_codex_http_case "Codex HTTP starts idle grace when a background job completes" \
+  "post-terminal-grace"
+test_codex_http_case "Codex HTTP retains runtimes while foreground requests are active" \
+  "active-request"
+test_codex_http_case "Codex HTTP shutdown drains an active request and child" \
+  "shutdown-active"
+
 test_codex_app_case "Codex discovery is wrapper-owned and never forwarded" \
   "schema" \
   '(.closeInfo.code == 0) and

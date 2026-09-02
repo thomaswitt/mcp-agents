@@ -34,6 +34,7 @@
   },
   "author": "Thomas Witt",
   "dependencies": {
+    "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0"
   },
   "devDependencies": {

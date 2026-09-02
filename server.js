@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { get as httpGet } from "node:http";
+import { createServer as createHttpServer, get as httpGet } from "node:http";
 import { createRequire } from "node:module";
 import { createServer as createNetServer } from "node:net";
 import {
@@ -33,11 +39,17 @@ import {
   Server,
   ProtocolError,
   ProtocolErrorCode,
+  createMcpHandler,
   createRequestStateCodec,
   inputRequired,
   inputResponse,
 } from "@modelcontextprotocol/server";
 import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import {
+  localhostHostValidation,
+  localhostOriginValidation,
+  toNodeHandler,
+} from "@modelcontextprotocol/node";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STARTUP_CWD = process.cwd();
@@ -63,6 +75,8 @@ const CODEX_SESSION_RETENTION_DAYS_ENV =
 const CODEX_APP_INIT_TIMEOUT_ENV = "MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS";
 const DEFAULT_CODEX_SESSION_RETENTION_DAYS = 30;
 const DEFAULT_CODEX_APP_INIT_TIMEOUT_MS = 300_000;
+const DEFAULT_HTTP_PORT = 8_765;
+const DEFAULT_HTTP_RUNTIME_IDLE_TIMEOUT_MS = 600_000;
 const MINIMUM_CODEX_VERSION = "0.149.1";
 const CODEX_INTERACTION_TIMEOUT_MS = 10 * 60 * 1_000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
@@ -497,9 +511,17 @@ function printHelp() {
   console.log(`mcp-agents v${VERSION}
 
 Usage: mcp-agents [options]
+       mcp-agents http-auth-headers [--http-token-file <path>]
 
 Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
+  --transport <stdio|http>       MCP transport [default: stdio]
+  --http-port <port>             Loopback HTTP port [default: ${DEFAULT_HTTP_PORT}]
+  --http-runtime-idle-timeout <secs>
+                                 Reap an inactive project runtime; 0 disables
+                                 [default: ${DEFAULT_HTTP_RUNTIME_IDLE_TIMEOUT_MS / 1_000}]
+  --http-token-file <path>       Absolute bearer-token file path
+                                 [default: XDG state under mcp-agents/http]
   --model <model>                Codex model [default: ${DEFAULT_CODEX_MODEL}]
   --model_reasoning_effort <e>   Codex reasoning effort [default: ${DEFAULT_CODEX_MODEL_REASONING_EFFORT}]
   --sandbox_mode <mode>          Codex sandbox mode: read-only, workspace-write,
@@ -562,20 +584,212 @@ Options:
                                  identity plus the first tool call; a smaller
                                  value is rejected at startup
   --help, -h                     Show this help message
-  --version, -v                  Show version number`);
+  --version, -v                  Show version number
+
+Commands:
+  http-auth-headers              Print the Authorization header JSON for
+                                 Claude Code's headersHelper`);
+}
+
+function defaultHttpTokenFile() {
+  const stateHome = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
+  if (!isAbsolute(stateHome)) {
+    throw new Error("XDG_STATE_HOME must be absolute for HTTP token storage");
+  }
+  return join(stateHome, "mcp-agents", "http", "bearer-token");
+}
+
+function readHttpBearerToken(tokenFile) {
+  let stats;
+  try {
+    stats = lstatSync(tokenFile);
+  } catch (err) {
+    if (err?.code === "ENOENT") {
+      throw new Error(`HTTP bearer token file does not exist: ${tokenFile}`);
+    }
+    throw err;
+  }
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new Error("HTTP bearer token path must be a regular file");
+  }
+  if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+    throw new Error("HTTP bearer token file must be owned by the current user");
+  }
+  if ((stats.mode & 0o077) !== 0) {
+    throw new Error("HTTP bearer token file permissions must be 0600 or stricter");
+  }
+  const token = readFileSync(tokenFile, "utf8").trim();
+  if (!/^[a-f0-9]{64}$/u.test(token)) {
+    throw new Error("HTTP bearer token file is invalid");
+  }
+  return token;
+}
+
+function ensureHttpBearerToken(tokenFile) {
+  try {
+    return readHttpBearerToken(tokenFile);
+  } catch (err) {
+    if (!String(err?.message).startsWith("HTTP bearer token file does not exist:")) {
+      throw err;
+    }
+  }
+
+  const tokenDir = dirname(tokenFile);
+  mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
+  const dirStats = lstatSync(tokenDir);
+  if (!dirStats.isDirectory() || dirStats.isSymbolicLink()) {
+    throw new Error("HTTP bearer token directory must be a regular directory");
+  }
+  if (
+    typeof process.getuid === "function" &&
+    dirStats.uid !== process.getuid()
+  ) {
+    throw new Error("HTTP bearer token directory must be owned by the current user");
+  }
+  if ((dirStats.mode & 0o077) !== 0) {
+    throw new Error(
+      "HTTP bearer token directory permissions must be 0700 or stricter",
+    );
+  }
+
+  const token = randomBytes(32).toString("hex");
+  let fd;
+  try {
+    fd = openSync(tokenFile, "wx", 0o600);
+    writeFileSync(fd, `${token}\n`, { encoding: "utf8" });
+  } catch (err) {
+    if (err?.code === "EEXIST") return readHttpBearerToken(tokenFile);
+    throw err;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  chmodSync(tokenFile, 0o600);
+  return readHttpBearerToken(tokenFile);
+}
+
+function hasValidHttpBearerToken(header, token) {
+  if (typeof header !== "string") return false;
+  const actual = Buffer.from(header, "utf8");
+  const expected = Buffer.from(`Bearer ${token}`, "utf8");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function writeHttpStatus(res, statusCode, message, extraHeaders = {}) {
+  if (res.headersSent || res.destroyed) return;
+  const body = `${message}\n`;
+  res.writeHead(statusCode, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    ...extraHeaders,
+  });
+  res.end(body);
+}
+
+async function createHttpMcpHost({
+  factory,
+  port,
+  tokenFile,
+  providerName,
+  validateRequest,
+}) {
+  const token = ensureHttpBearerToken(tokenFile);
+  const validateHost = localhostHostValidation();
+  const validateOrigin = localhostOriginValidation();
+  const handler = createMcpHandler(factory, {
+    onerror(error) {
+      logErr(`[mcp-agents] HTTP MCP error: ${error.message}`);
+    },
+  });
+  const nodeHandler = toNodeHandler(handler, {
+    onerror(error) {
+      logErr(`[mcp-agents] HTTP adapter error: ${error.message}`);
+    },
+  });
+  let closePromise;
+  const httpServer = createHttpServer((req, res) => {
+    if (!validateHost(req, res) || !validateOrigin(req, res)) return;
+    let pathname;
+    try {
+      pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    } catch {
+      writeHttpStatus(res, 400, "Bad request");
+      return;
+    }
+    if (pathname !== "/mcp") {
+      writeHttpStatus(res, 404, "Not found");
+      return;
+    }
+    if (!hasValidHttpBearerToken(req.headers.authorization, token)) {
+      writeHttpStatus(res, 401, "Unauthorized", {
+        "WWW-Authenticate": "Bearer",
+      });
+      return;
+    }
+    if (validateRequest && !validateRequest(req, res)) return;
+    void nodeHandler(req, res).catch((error) => {
+      logErr(`[mcp-agents] HTTP request failed: ${error.message}`);
+      writeHttpStatus(res, 500, "Internal server error");
+    });
+  });
+
+  await new Promise((resolveListen, rejectListen) => {
+    const onError = (error) => {
+      httpServer.off("listening", onListening);
+      rejectListen(error);
+    };
+    const onListening = () => {
+      httpServer.off("error", onError);
+      resolveListen();
+    };
+    httpServer.once("error", onError);
+    httpServer.once("listening", onListening);
+    httpServer.listen(port, "127.0.0.1");
+  });
+
+  logErr(
+    `[mcp-agents] HTTP MCP listening on http://127.0.0.1:${port}/mcp ` +
+      `(provider=${providerName})`,
+  );
+
+  const stopAccepting = () => {
+    if (!closePromise) {
+      closePromise = new Promise((resolveClose) => {
+        httpServer.close(() => resolveClose());
+      });
+    }
+    return closePromise;
+  };
+  return {
+    stopAccepting,
+    async close() {
+      const listenerClosed = stopAccepting();
+      await handler.close();
+      httpServer.closeAllConnections?.();
+      await listenerClosed;
+    },
+  };
 }
 
 /**
  * Parse CLI flags from process.argv.
- * Handles --help, --version, --provider, --model, --model_reasoning_effort,
+ * Handles commands, --help, --version, --provider, --transport, HTTP options,
+ * --model, --model_reasoning_effort,
  * --sandbox_mode, --approval_policy, --codex-workspace-network, --goal,
  * --codex_idle_timeout, --codex_cancel_grace, --codex_status_interval, browser
  * provider settings, --timeout, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, codexStateRoot?: string, codexSessionRetentionDays?: number, browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[], defaultTimeoutMs?: number }}
+ * @returns {{ command: "serve"|"http-auth-headers", provider: string, transport: "stdio"|"http", httpPort: number, httpRuntimeIdleTimeoutMs: number, httpTokenFile?: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, codexStateRoot?: string, codexSessionRetentionDays?: number, browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[], defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
+  let command = "serve";
+  if (args[0] === "http-auth-headers") {
+    command = args.shift();
+  }
   let provider = "codex";
+  let transport = "stdio";
+  let httpPort = DEFAULT_HTTP_PORT;
+  let httpRuntimeIdleTimeoutMs = DEFAULT_HTTP_RUNTIME_IDLE_TIMEOUT_MS;
+  let httpTokenFile;
   let model;
   let modelReasoningEffort;
   let sandboxMode;
@@ -623,6 +837,58 @@ function parseArgs() {
           process.exit(1);
         }
         provider = args[++i];
+        break;
+      case "--transport":
+        if (i + 1 >= args.length) {
+          writeStderr("error: --transport requires a value\n");
+          process.exit(1);
+        }
+        transport = args[++i];
+        if (!["stdio", "http"].includes(transport)) {
+          writeStderr("error: --transport must be stdio or http\n");
+          process.exit(1);
+        }
+        break;
+      case "--http-port": {
+        if (i + 1 >= args.length) {
+          writeStderr("error: --http-port requires a value\n");
+          process.exit(1);
+        }
+        const port = Number(args[++i]);
+        if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+          writeStderr("error: --http-port must be an integer from 1 to 65535\n");
+          process.exit(1);
+        }
+        httpPort = port;
+        break;
+      }
+      case "--http-runtime-idle-timeout": {
+        if (i + 1 >= args.length) {
+          writeStderr(
+            "error: --http-runtime-idle-timeout requires a value\n",
+          );
+          process.exit(1);
+        }
+        const secs = Number(args[++i]);
+        if (!Number.isFinite(secs) || secs < 0) {
+          writeStderr(
+            "error: --http-runtime-idle-timeout must be a non-negative number\n",
+          );
+          process.exit(1);
+        }
+        httpRuntimeIdleTimeoutMs = Math.round(secs * 1_000);
+        break;
+      }
+      case "--http-token-file":
+        if (i + 1 >= args.length) {
+          writeStderr("error: --http-token-file requires a value\n");
+          process.exit(1);
+        }
+        httpTokenFile = args[++i];
+        if (!isAbsolute(httpTokenFile)) {
+          writeStderr("error: --http-token-file must be absolute\n");
+          process.exit(1);
+        }
         break;
       case "--model":
         if (i + 1 >= args.length) {
@@ -865,6 +1131,16 @@ function parseArgs() {
     );
     process.exit(1);
   }
+
+  if (
+    command === "serve" && transport === "http" &&
+    ["browser", "codex-legacy"].includes(provider)
+  ) {
+    writeStderr(
+      `error: HTTP transport is not supported by --provider ${provider}\n`,
+    );
+    process.exit(1);
+  }
   const approvalPolicies = provider === "codex-legacy"
     ? ["untrusted", "on-failure", "on-request", "never"]
     : ["untrusted", "on-request", "never"];
@@ -920,7 +1196,12 @@ function parseArgs() {
   }
 
   return {
+    command,
     provider,
+    transport,
+    httpPort,
+    httpRuntimeIdleTimeoutMs,
+    httpTokenFile,
     model,
     modelReasoningEffort,
     sandboxMode,
@@ -5593,13 +5874,13 @@ async function runBrowserPassthrough({
 }
 
 /**
- * Serve the curated Codex MCP contract while using Codex App Server privately.
+ * Create the project-scoped Codex runtime independently from its MCP transport.
  * App Server request IDs, raw events, reasoning items, and private storage paths
  * never cross the outer MCP boundary.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, statusIntervalOverrideMs?: number, hardTimeoutMs?: number, goal?: string, stateRoot?: string, sessionRetentionDays?: number }} opts
- * @returns {Promise<void>}
+ * @param {{ projectCwd?: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, statusIntervalOverrideMs?: number, hardTimeoutMs?: number, goal?: string, stateRoot?: string, sessionRetentionDays?: number }} opts
  */
-async function runCodexAppServer({
+async function createCodexRuntime({
+  projectCwd = STARTUP_CWD,
   model,
   modelReasoningEffort,
   sandboxMode,
@@ -5687,7 +5968,7 @@ async function runCodexAppServer({
     ttlSeconds: Math.ceil((interactionTimeoutMs + 30_000) / 1_000),
   });
   const bridgeStartedAt = new Date().toISOString();
-  const canonicalProjectCwd = realpathSync(STARTUP_CWD);
+  const canonicalProjectCwd = realpathSync(projectCwd);
   const projectHash = createHash("sha256")
     .update(canonicalProjectCwd)
     .digest("hex");
@@ -5828,7 +6109,6 @@ async function runCodexAppServer({
   let appStarting;
   let innerRequestSequence = 0;
   let shuttingDown = false;
-  let keepAlive;
   let ownerHeartbeat;
   let bridgeStateEnabled = true;
   let retentionTimer;
@@ -5842,6 +6122,24 @@ async function runCodexAppServer({
   const threadWorkspaces = new Map();
   const jobs = new Map();
   const interactions = new Map();
+  const requestServers = new WeakMap();
+  const announcedMcpEras = new Set();
+  let activeMcpRequests = 0;
+  let lastUsedAt = performance.now();
+
+  const touch = () => {
+    lastUsedAt = performance.now();
+  };
+  const withRuntimeActivity = (handler) => async (...args) => {
+    activeMcpRequests += 1;
+    touch();
+    try {
+      return await handler(...args);
+    } finally {
+      activeMcpRequests -= 1;
+      touch();
+    }
+  };
 
   const appError = (code, message, extra = {}) => {
     const error = new Error(message);
@@ -6908,11 +7206,10 @@ async function runCodexAppServer({
     }
     return { decision: args.decision };
   };
-  let outerServer;
   const supportsFormElicitation = (ctx) => {
     const envelopeCapabilities = ctx?.mcpReq.envelope?.[CLIENT_CAPABILITIES_META_KEY];
     const capability = envelopeCapabilities === undefined
-      ? outerServer?.getClientCapabilities()?.elicitation
+      ? requestServers.get(ctx)?.getClientCapabilities()?.elicitation
       : envelopeCapabilities?.elicitation;
     if (!capability) return false;
     // Mirror the SDK's own gate for an embedded elicitation/create input
@@ -8300,7 +8597,7 @@ async function runCodexAppServer({
   };
 
   const buildCodexMcpServer = (era) => {
-    outerServer = new Server(
+    const server = new Server(
       { name: "mcp-agents", version: VERSION },
       {
         capabilities: { tools: {}, resources: {}, prompts: {} },
@@ -8314,7 +8611,7 @@ async function runCodexAppServer({
         requestState: { verify: interactionStateCodec.verify },
       },
     );
-    outerServer.setRequestHandler("tools/list", async () => ({
+    server.setRequestHandler("tools/list", withRuntimeActivity(async () => ({
       tools: [
         {
           name: "ping",
@@ -8328,16 +8625,23 @@ async function runCodexAppServer({
           ...CODEX_APP_TOOL_NAMES,
         ].map((name) => ({ name, ...codexToolPresentation(name) })),
       ],
-    }));
-    outerServer.setRequestHandler("resources/list", async () => ({ resources: [] }));
-    outerServer.setRequestHandler(
-      "resources/templates/list",
-      async () => ({ resourceTemplates: [] }),
+    })));
+    server.setRequestHandler(
+      "resources/list",
+      withRuntimeActivity(async () => ({ resources: [] })),
     );
-    outerServer.setRequestHandler("prompts/list", async () => ({ prompts: [] }));
-    outerServer.setRequestHandler("ping", async () => toolResult("pong"));
+    server.setRequestHandler(
+      "resources/templates/list",
+      withRuntimeActivity(async () => ({ resourceTemplates: [] })),
+    );
+    server.setRequestHandler(
+      "prompts/list",
+      withRuntimeActivity(async () => ({ prompts: [] })),
+    );
+    server.setRequestHandler("ping", withRuntimeActivity(async () => toolResult("pong")));
 
-    outerServer.setRequestHandler("tools/call", async ({ params }, ctx) => {
+    server.setRequestHandler("tools/call", withRuntimeActivity(async ({ params }, ctx) => {
+    requestServers.set(ctx, server);
     if (params.name === "ping") return toolResult("pong");
     const message = {
       method: "tools/call",
@@ -8775,48 +9079,95 @@ async function runCodexAppServer({
         args.threadId ? { threadId: args.threadId } : {},
       );
     }
-    });
-    logErr(
-      `[mcp-agents] Codex MCP adapter ready (era=${era}, app-server lazy, ` +
-        `model=${resolvedModel}, effort=${resolvedEffort}, sandbox=${resolvedSandbox}, ` +
-        `approval=${resolvedApproval}, retention_days=${resolvedRetentionDays}, ` +
-        `state=${durableRoot})`,
-    );
-    return outerServer;
-  };
-
-  let stdioHandle;
-  const shutdown = async (reason, exitCode = 0) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    logErr(`[mcp-agents] shutting down Codex App Server bridge (${reason})`);
-    if (ownerHeartbeat) clearInterval(ownerHeartbeat);
-    if (retentionTimer) clearInterval(retentionTimer);
-    if (retentionStartupTimer) clearTimeout(retentionStartupTimer);
-    for (const interaction of [...interactions.values()]) {
-      settleInteraction(
-        interaction,
-        interaction.kind === "user_input" ? { answers: {} } : { decision: "cancel" },
+    }));
+    if (!announcedMcpEras.has(era)) {
+      announcedMcpEras.add(era);
+      logErr(
+        `[mcp-agents] Codex MCP adapter ready (era=${era}, app-server lazy, ` +
+          `model=${resolvedModel}, effort=${resolvedEffort}, sandbox=${resolvedSandbox}, ` +
+          `approval=${resolvedApproval}, retention_days=${resolvedRetentionDays}, ` +
+          `state=${durableRoot})`,
       );
     }
-    for (const turn of activeTurns.values()) void interruptTurn(turn, "bridge shutdown");
-    const generationState = app;
-    if (generationState?.alive) {
-      try { generationState.child.stdin.end(); } catch {}
-      killChildGroup(generationState.child, "SIGTERM");
-      setTimeout(() => killChildGroup(generationState.child), 1_000).unref();
-    }
-    writeBridgeState();
-    bridgeStateEnabled = false;
-    try { await stdioHandle?.close(); } catch {}
-    try { rmSync(bridgeDir, { recursive: true, force: true }); } catch {}
-    if (keepAlive) clearInterval(keepAlive);
-    process.exitCode = exitCode;
+    return server;
+  };
+
+  let shutdownPromise;
+  const shutdown = (reason) => {
+    if (shutdownPromise) return shutdownPromise;
+    shuttingDown = true;
+    shutdownPromise = (async () => {
+      logErr(`[mcp-agents] shutting down Codex App Server runtime (${reason})`);
+      if (ownerHeartbeat) clearInterval(ownerHeartbeat);
+      if (retentionTimer) clearInterval(retentionTimer);
+      if (retentionStartupTimer) clearTimeout(retentionStartupTimer);
+      for (const interaction of [...interactions.values()]) {
+        settleInteraction(
+          interaction,
+          interaction.kind === "user_input" ? { answers: {} } : { decision: "cancel" },
+        );
+      }
+      for (const turn of activeTurns.values()) {
+        void interruptTurn(turn, "bridge shutdown");
+      }
+      const generationState = app;
+      if (generationState?.alive) {
+        try { generationState.child.stdin.end(); } catch {}
+        killChildGroup(generationState.child, "SIGTERM");
+        const killTimer = setTimeout(
+          () => killChildGroup(generationState.child),
+          1_000,
+        );
+        killTimer.unref();
+        await generationState.gone;
+        clearTimeout(killTimer);
+      }
+      writeBridgeState();
+      bridgeStateEnabled = false;
+      try { rmSync(bridgeDir, { recursive: true, force: true }); } catch {}
+    })();
+    return shutdownPromise;
+  };
+
+  return {
+    canonicalProjectCwd,
+    buildMcpServer: buildCodexMcpServer,
+    canEvict() {
+      return activeMcpRequests === 0 &&
+        activeTurns.size === 0 &&
+        provisionalTurns.size === 0 &&
+        interactions.size === 0 &&
+        !appStarting &&
+        [...jobs.values()].every((job) => isTerminalJob(job));
+    },
+    lastUsedAt: () => lastUsedAt,
+    touch,
+    shutdown,
+  };
+}
+
+async function runCodexAppServer(opts) {
+  const runtime = await createCodexRuntime({
+    projectCwd: STARTUP_CWD,
+    ...opts,
+  });
+  let stdioHandle;
+  let keepAlive;
+  let shutdownPromise;
+  const shutdown = (reason, exitCode = 0) => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      await runtime.shutdown(reason);
+      try { await stdioHandle?.close(); } catch {}
+      if (keepAlive) clearInterval(keepAlive);
+      process.exitCode = exitCode;
+    })();
+    return shutdownPromise;
   };
   fatalShutdown = (reason, exitCode) => { void shutdown(reason, exitCode); };
   const stdioTransport = new StdioServerTransport();
   stdioHandle = serveStdio(
-    ({ era }) => buildCodexMcpServer(era),
+    ({ era }) => runtime.buildMcpServer(era),
     {
       transport: stdioTransport,
       onerror(error) {
@@ -8848,13 +9199,212 @@ async function runCodexAppServer({
   logErr("[mcp-agents] Codex MCP adapter listening (awaiting protocol era)");
 }
 
+function canonicalizeHttpProjectRoot(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("X-Mcp-Agents-Project-Root is required");
+  }
+  if (!isAbsolute(value)) {
+    throw new Error("X-Mcp-Agents-Project-Root must be absolute");
+  }
+  let canonical;
+  try {
+    canonical = realpathSync(value);
+  } catch {
+    throw new Error("X-Mcp-Agents-Project-Root must exist");
+  }
+  const stats = lstatSync(canonical);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error("X-Mcp-Agents-Project-Root must resolve to a directory");
+  }
+  return canonical;
+}
+
+function createCodexRuntimePool({ runtimeOptions, idleTimeoutMs }) {
+  const entries = new Map();
+  let shuttingDown = false;
+  let reapPromise;
+
+  const acquire = async (canonicalProjectCwd) => {
+    while (true) {
+      if (shuttingDown) throw new Error("Codex runtime pool is shutting down");
+      let entry = entries.get(canonicalProjectCwd);
+      if (entry?.closing) {
+        await entry.closing;
+        continue;
+      }
+      if (!entry) {
+        entry = {
+          runtime: undefined,
+          observedLastUsedAt: undefined,
+          evictableSince: undefined,
+          closing: undefined,
+        };
+        entry.promise = createCodexRuntime({
+          ...runtimeOptions,
+          projectCwd: canonicalProjectCwd,
+        }).then((runtime) => {
+          entry.runtime = runtime;
+          entry.observedLastUsedAt = runtime.lastUsedAt();
+          return runtime;
+        }).catch((error) => {
+          if (entries.get(canonicalProjectCwd) === entry) {
+            entries.delete(canonicalProjectCwd);
+          }
+          throw error;
+        });
+        entries.set(canonicalProjectCwd, entry);
+      }
+      entry.runtime?.touch();
+      const runtime = await entry.promise;
+      if (entry.closing) {
+        await entry.closing;
+        continue;
+      }
+      if (shuttingDown) {
+        await runtime.shutdown("pool shutdown during runtime creation");
+        throw new Error("Codex runtime pool is shutting down");
+      }
+      runtime.touch();
+      return runtime;
+    }
+  };
+
+  const reap = () => {
+    if (reapPromise || shuttingDown || idleTimeoutMs === 0) {
+      return reapPromise ?? Promise.resolve();
+    }
+    reapPromise = (async () => {
+      const now = performance.now();
+      for (const [projectRoot, entry] of entries) {
+        const runtime = entry.runtime;
+        if (!runtime) continue;
+        const lastUsedAt = runtime.lastUsedAt();
+        if (lastUsedAt !== entry.observedLastUsedAt) {
+          entry.observedLastUsedAt = lastUsedAt;
+          entry.evictableSince = undefined;
+        }
+        if (!runtime.canEvict()) {
+          entry.evictableSince = undefined;
+          continue;
+        }
+        entry.evictableSince ??= now;
+        if (now - entry.evictableSince < idleTimeoutMs) continue;
+        if (entries.get(projectRoot) !== entry) continue;
+        entry.closing = runtime.shutdown("HTTP runtime idle timeout");
+        try {
+          await entry.closing;
+          logErr(`[mcp-agents] reaped idle Codex runtime (project=${projectRoot})`);
+        } finally {
+          if (entries.get(projectRoot) === entry) entries.delete(projectRoot);
+        }
+      }
+    })().finally(() => {
+      reapPromise = undefined;
+    });
+    return reapPromise;
+  };
+
+  const reaper = idleTimeoutMs === 0
+    ? undefined
+    : setInterval(
+      () => {
+        void reap().catch((error) => {
+          logErr(`[mcp-agents] Codex runtime reap failed: ${error.message}`);
+        });
+      },
+      Math.max(25, Math.min(1_000, Math.ceil(idleTimeoutMs / 2))),
+    );
+  reaper?.unref();
+
+  return {
+    acquire,
+    async shutdown(reason) {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      if (reaper) clearInterval(reaper);
+      await reapPromise?.catch(() => {});
+      const activeEntries = [...entries.values()];
+      entries.clear();
+      await Promise.allSettled(activeEntries.map(async (entry) => {
+        const runtime = await entry.promise;
+        await runtime.shutdown(reason);
+      }));
+    },
+  };
+}
+
+async function runCodexHttpServer({
+  httpPort,
+  httpTokenFile,
+  httpRuntimeIdleTimeoutMs,
+  ...runtimeOptions
+}) {
+  const pool = createCodexRuntimePool({
+    runtimeOptions,
+    idleTimeoutMs: httpRuntimeIdleTimeoutMs,
+  });
+  let httpHandle;
+  let shutdownPromise;
+  const shutdown = (reason, exitCode = 0) => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      logErr(`[mcp-agents] shutting down Codex HTTP daemon (${reason})`);
+      void httpHandle?.stopAccepting();
+      await pool.shutdown(reason);
+      await httpHandle?.close();
+      process.exitCode = exitCode;
+    })();
+    return shutdownPromise;
+  };
+  fatalShutdown = (reason, exitCode) => { void shutdown(reason, exitCode); };
+  try {
+    httpHandle = await createHttpMcpHost({
+      factory: async ({ era, requestInfo }) => {
+        const projectRoot = requestInfo.headers.get(
+          "x-mcp-agents-project-root",
+        );
+        const runtime = await pool.acquire(projectRoot);
+        return runtime.buildMcpServer(era);
+      },
+      port: httpPort,
+      tokenFile: httpTokenFile,
+      providerName: "codex",
+      validateRequest(req, res) {
+        try {
+          const canonical = canonicalizeHttpProjectRoot(
+            req.headers["x-mcp-agents-project-root"],
+          );
+          req.headers["x-mcp-agents-project-root"] = canonical;
+          return true;
+        } catch (error) {
+          writeHttpStatus(res, 400, error.message);
+          return false;
+        }
+      },
+    });
+  } catch (error) {
+    await pool.shutdown("HTTP listener startup failed");
+    throw error;
+  }
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(signal, () => {
+      void shutdown(signal, 128 + SIGNAL_CODES[signal]);
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main() {
   const {
+    command,
     provider: providerName,
+    transport,
+    httpPort,
+    httpRuntimeIdleTimeoutMs,
+    httpTokenFile,
     model,
     modelReasoningEffort,
     sandboxMode,
@@ -8875,6 +9425,19 @@ async function main() {
     browserAllowedUrlPatterns,
     defaultTimeoutMs,
   } = parseArgs();
+
+  if (command === "http-auth-headers") {
+    try {
+      const token = readHttpBearerToken(httpTokenFile ?? defaultHttpTokenFile());
+      console.log(JSON.stringify({ Authorization: `Bearer ${token}` }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      writeStderr(`error: ${message}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const backend = CLI_BACKENDS[providerName];
 
   if (!backend) {
@@ -8885,7 +9448,7 @@ async function main() {
   }
 
   if (providerName === "codex") {
-    await runCodexAppServer({
+    const codexOptions = {
       model,
       modelReasoningEffort,
       sandboxMode,
@@ -8900,7 +9463,17 @@ async function main() {
       hardTimeoutMs: defaultTimeoutMs,
       stateRoot: codexStateRoot,
       sessionRetentionDays: codexSessionRetentionDays,
-    });
+    };
+    if (transport === "http") {
+      await runCodexHttpServer({
+        ...codexOptions,
+        httpPort,
+        httpTokenFile: httpTokenFile ?? defaultHttpTokenFile(),
+        httpRuntimeIdleTimeoutMs,
+      });
+    } else {
+      await runCodexAppServer(codexOptions);
+    }
     return;
   }
 
@@ -8957,6 +9530,7 @@ async function main() {
   }
 
   let stdioHandle;
+  let httpHandle;
   let keepAlive;
   let shutdownStarted = false;
   let shutdownExitCode = 0;
@@ -8964,6 +9538,7 @@ async function main() {
   let shutdownTimer;
   let activeRequests = 0;
   const activeChildren = new Map();
+  const announcedMcpEras = new Set();
   let claudeJobs;
 
   const maybeFinalizeShutdown = () => {
@@ -8979,6 +9554,7 @@ async function main() {
     shutdownPromise = Promise.resolve()
       .then(async () => {
         if (keepAlive) clearInterval(keepAlive);
+        await httpHandle?.close();
         await stdioHandle?.close();
       })
       .catch((err) => {
@@ -9004,6 +9580,8 @@ async function main() {
       process.exit(shutdownExitCode);
     }, SHUTDOWN_TIMEOUT_MS);
     shutdownTimer.unref();
+
+    void httpHandle?.stopAccepting();
 
     claudeJobs?.shutdown();
     for (const stopChild of activeChildren.values()) {
@@ -9295,9 +9873,27 @@ async function main() {
       maybeFinalizeShutdown();
     }
     });
-    logErr(`[mcp-agents] ready (provider: ${providerName}, era=${era})`);
+    if (!announcedMcpEras.has(era)) {
+      announcedMcpEras.add(era);
+      logErr(`[mcp-agents] ready (provider: ${providerName}, era=${era})`);
+    }
     return server;
   };
+
+  if (transport === "http") {
+    httpHandle = await createHttpMcpHost({
+      factory: ({ era }) => buildBlockingProviderServer(era),
+      port: httpPort,
+      tokenFile: httpTokenFile ?? defaultHttpTokenFile(),
+      providerName,
+    });
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      process.once(sig, () => {
+        beginShutdown(sig, 128 + SIGNAL_CODES[sig]);
+      });
+    }
+    return;
+  }
 
   const stdioTransport = new StdioServerTransport();
   stdioHandle = serveStdio(

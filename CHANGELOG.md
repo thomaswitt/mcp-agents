@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Add an opt-in authenticated loopback Streamable HTTP transport for the
+  wrapper-owned `codex`, `claude`, and `gemini` providers. Codex HTTP requests
+  share idle-reaped App Server runtimes by canonical project root while each
+  request retains independent MCP connection state; stdio remains the default.
 - Negotiate both legacy MCP and revision `2026-07-28` over stdio for the
   wrapper-owned `codex`, `claude`, and `gemini` providers. Foreground Codex
   interactions now resume through signed, content-free `input_required`
