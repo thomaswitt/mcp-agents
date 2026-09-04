@@ -16,8 +16,8 @@
 > setups.
 
 Install one package, then add one MCP server entry per agent you want to expose.
-Each entry starts one provider process with provider-specific tools; this is one
-installation and integration pattern, not one process that dynamically routes
+Each provider has its own tool surface. A client can start it over stdio or
+connect to an operator-run HTTP daemon; one process never dynamically routes
 every backend.
 
 ## Table of contents
@@ -26,6 +26,7 @@ every backend.
 - [Quickstart](#quickstart)
   - [Claude Code calls Codex](#claude-code-calls-codex)
   - [Codex calls Claude Code](#codex-calls-claude-code)
+- [Transport modes](#transport-modes)
 - [Providers](#providers)
 - [Client configuration](#client-configuration)
 - [Provider reference](#provider-reference)
@@ -146,7 +147,20 @@ For substantial reviews, Codex should use `claude-start` →
 `claude-status` → `claude-result`. The blocking `claude_code` tool is intended
 for small prompts.
 
-The bridge speaks
+This quickstart uses the default client-managed stdio transport. The optional
+[shared HTTP mode](#shared-http-daemon) avoids one bridge process per client.
+
+## Transport modes
+
+Both modes expose the same MCP tools. The difference is process ownership and
+lifetime.
+
+| Mode | Process lifecycle | Trade-off |
+| --- | --- | --- |
+| Client-managed stdio (default) | Each MCP client starts and stops its own provider process. | No service setup; every concurrent connection pays its own process, memory, and startup cost. |
+| Shared HTTP daemon (optional) | The operator keeps one provider daemon running and clients connect to `http://127.0.0.1:<port>/mcp`. | Faster reconnects and fewer adapter processes; requires service and local-auth configuration. |
+
+Stdio uses
 [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio).
 Because the protocol era is chosen by the opening exchange, the bridge logs
 twice to stderr: `[mcp-agents] listening (provider: <name>, awaiting protocol
@@ -155,6 +169,134 @@ era)` once the transport accepts input, then `[mcp-agents] ready (provider:
 logs the same pair as `[mcp-agents] Codex MCP adapter listening` and
 `[mcp-agents] Codex MCP adapter ready`. Wait for the listening line, not the
 ready line, to know the bridge accepts traffic. stdout remains MCP-only.
+Use the Quickstart configuration above if you prefer this mode.
+
+### Shared HTTP daemon
+
+HTTP is additive and opt-in. Each daemon serves one of the `codex`, `claude`,
+or `gemini` providers. Use a separate port and service for each additional
+provider. The raw `browser` and `codex-legacy` providers remain stdio-only.
+
+Test the Codex daemon in a terminal first:
+
+```bash
+mcp-agents --provider codex --transport http --http-port 8765
+```
+
+It listens only on loopback at `http://127.0.0.1:8765/mcp` and creates a
+private bearer-token file. Point Claude Code at it with:
+
+```json
+{
+  "mcpServers": {
+    "codex": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "X-Mcp-Agents-Project-Root": "${PWD}"
+      },
+      "headersHelper": "/absolute/path/to/mcp-agents http-auth-headers",
+      "timeout": 7500000
+    }
+  }
+}
+```
+
+Use the same `mcp-agents` installation for the daemon and `headersHelper`.
+Claude Code runs the helper on every connection; it reads the token file and
+returns the `Authorization` header without storing the token in `.mcp.json`.
+The project-root header is required by the Codex provider so one daemon can
+isolate and pool runtimes by canonical project path.
+
+Service managers do not load interactive shell initialization. The examples
+below use the absolute path from `command -v mise` and a working directory
+whose `.tool-versions` contains `mcp-agents` and its provider CLI. Without
+Mise, invoke the absolute `mcp-agents` path directly and set `PATH` for Node.js
+and the provider CLI in the service definition.
+
+<details>
+<summary>Linux: systemd user service</summary>
+
+Create `~/.config/systemd/user/mcp-agents-codex.service`:
+
+```ini
+[Unit]
+Description=mcp-agents Codex HTTP daemon
+
+[Service]
+Type=simple
+WorkingDirectory=/absolute/path/to/project-with-tool-versions
+ExecStart=/absolute/path/to/mise exec -- mcp-agents --provider codex --transport http --http-port 8765
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+Enable it for the current user:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now mcp-agents-codex.service
+systemctl --user status mcp-agents-codex.service
+```
+
+The user service starts at login. To start it at boot and keep it running after
+logout, additionally enable lingering with `loginctl enable-linger "$USER"`
+(some distributions require `sudo`). Read logs with
+`journalctl --user -u mcp-agents-codex.service`.
+
+</details>
+
+<details>
+<summary>macOS: launchd user service</summary>
+
+Create `~/Library/LaunchAgents/dev.mcp-agents.codex.plist`, replacing every
+absolute path:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.mcp-agents.codex</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/mise</string>
+    <string>exec</string>
+    <string>--</string>
+    <string>mcp-agents</string>
+    <string>--provider</string>
+    <string>codex</string>
+    <string>--transport</string>
+    <string>http</string>
+    <string>--http-port</string>
+    <string>8765</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/absolute/path/to/project-with-tool-versions</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+```
+
+Load and inspect the service:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/dev.mcp-agents.codex.plist"
+launchctl print "gui/$(id -u)/dev.mcp-agents.codex"
+```
+
+A LaunchAgent starts at login and stays running for that user's session.
+
+</details>
 
 ## Providers
 
@@ -837,8 +979,10 @@ have Claude Code call `codex-start`, poll `codex-status`, and read
 
 ## How it works
 
-1. An MCP client starts `mcp-agents` over stdio.
-2. The server reads `--provider <name>` from argv; the default is `codex`.
+1. An MCP client either starts `mcp-agents` over stdio or connects to an
+   authenticated loopback HTTP daemon.
+2. The server selects one `--provider <name>` at startup; the default is
+   `codex`.
 3. The selected provider registers its own tools:
    - Claude exposes one blocking tool plus one-shot review jobs.
    - Codex exposes a wrapper-owned MCP surface and lazily starts App Server.
@@ -855,11 +999,13 @@ and retained result pages. The legacy provider transforms and observes native
 MCP frames. The browser provider validates every result against its lease
 generation.
 
-A small keepalive prevents Node.js from exiting when stdin reaches EOF before
-an asynchronous subprocess registers an active handle. When the MCP connection
-closes, active Claude and Codex work receives a native interrupt where
-available, followed by bounded TERM/KILL fallback. Remaining tracked detached
-process groups are reaped before the server exits.
+A small keepalive prevents a stdio bridge from exiting when stdin reaches EOF
+before an asynchronous subprocess registers an active handle. When that MCP
+connection closes, active Claude and Codex work receives a native interrupt
+where available, followed by bounded TERM/KILL fallback. Remaining tracked
+detached process groups are reaped before the bridge exits. The HTTP Codex host
+instead pools one lazy App Server runtime per canonical project root and reaps
+it after the configured idle period.
 
 ## License
 
