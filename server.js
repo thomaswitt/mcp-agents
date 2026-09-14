@@ -7978,14 +7978,16 @@ async function createCodexRuntime({
     }
     return config;
   };
-  const awaitTurn = async (turn, signal) => {
+  const awaitTurn = async (turn, signal, onDetach) => {
     const onAbort = () => void interruptTurn(turn, "MCP request canceled");
+    const detach = () => signal?.removeEventListener("abort", onAbort);
+    onDetach?.(detach);
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
     try {
       return await turn.completion;
     } finally {
-      signal?.removeEventListener("abort", onAbort);
+      detach();
     }
   };
   const awaitForegroundRound = async (turn, signal) => {
@@ -8002,12 +8004,20 @@ async function createCodexRuntime({
       resolveInteraction = resolvePromise;
     });
     turn.resolveForegroundInteraction = resolveInteraction;
+    let detachAbort;
     try {
       return await Promise.race([
-        awaitTurn(turn, signal).then((completed) => ({ kind: "complete", completed })),
+        awaitTurn(turn, signal, (detach) => { detachAbort = detach; })
+          .then((completed) => ({ kind: "complete", completed })),
         interactionReady.then((interaction) => ({ kind: "interaction", interaction })),
       ]);
     } finally {
+      // Stop listening when this request's round ends, not when the turn does.
+      // An input_required round hands the preserved turn back to the client,
+      // and over HTTP the request's signal is aborted as soon as that response
+      // is sent; a listener left behind would interrupt the very turn the next
+      // round is meant to answer.
+      detachAbort?.();
       if (turn.resolveForegroundInteraction === resolveInteraction) {
         turn.resolveForegroundInteraction = undefined;
       }

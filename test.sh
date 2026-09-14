@@ -3323,6 +3323,7 @@ const child = spawn(process.execPath, [
   "--http-token-file", tokenFile,
   "--http-runtime-idle-timeout", scenario === "pool" ? "10" : "0.15",
   "--codex-state-root", `${testDir}/state/mcp-agents/codex`,
+  ...(scenario === "foreground-question" ? ["--approval_policy", "on-request"] : []),
 ], {
   cwd: serverDir,
   detached: true,
@@ -3336,7 +3337,8 @@ const child = spawn(process.execPath, [
     MCP_STUB_APP_MODE: ["active", "active-request", "shutdown-active"].includes(scenario)
       ? "park"
       : scenario === "post-terminal-grace" ? "delayed"
-      : scenario === "uncertain-eviction" ? "die-first" : "normal",
+      : scenario === "uncertain-eviction" ? "die-first"
+      : scenario === "foreground-question" ? "question" : "normal",
     MCP_STUB_APP_WORKSPACE: `${testDir}/project-a`,
     MCP_STUB_CODEX_VERSION: "codex-cli 0.149.1",
   },
@@ -3418,14 +3420,26 @@ const countProjectRuntimes = () => {
     return 0;
   }
 };
-const openClient = async (projectRoot, era = "modern") => {
+const openClient = async (projectRoot, era = "modern", { elicit = false } = {}) => {
   const versionNegotiation = era === "modern"
     ? { mode: { pin: "2026-07-28" } }
     : { mode: "legacy" };
   const client = new Client(
     { name: `codex-http-${era}-test`, version: "0.0.0" },
-    { versionNegotiation },
+    {
+      versionNegotiation,
+      ...(elicit ? {
+        capabilities: { elicitation: { form: {} } },
+        inputRequired: { autoFulfill: true, maxRounds: 8 },
+      } : {}),
+    },
   );
+  if (elicit) {
+    client.setRequestHandler("elicitation/create", async () => ({
+      action: "accept",
+      content: { choice: "Ship" },
+    }));
+  }
   const transport = new StreamableHTTPClientTransport(
     new URL(`http://127.0.0.1:${port}/mcp`),
     {
@@ -3558,6 +3572,24 @@ try {
     }
     if (!await waitFor(() => readJsonl(`${testDir}/app-spawns.jsonl`).length === 2)) {
       throw new Error("request after eviction did not recreate the Codex runtime");
+    }
+  } else if (scenario === "foreground-question") {
+    // Round one returns input_required, and its per-request transport closes
+    // once that response is sent, aborting the request's signal. The preserved
+    // turn has to survive that abort so round two can answer it.
+    const client = await openClient(`${testDir}/project-a`, "modern", { elicit: true });
+    try {
+      assertToolText(await client.callTool({
+        name: "codex",
+        arguments: initialArgs(`${testDir}/project-a`, "foreground question"),
+      }), "INTERACTION_OK");
+    } finally {
+      await client.close();
+    }
+    const interrupts = readJsonl(`${testDir}/app-stdin.jsonl`)
+      .filter((message) => message.method === "turn/interrupt");
+    if (interrupts.length !== 0) {
+      throw new Error(`an HTTP input round interrupted its preserved turn: ${JSON.stringify(interrupts)}`);
     }
   } else if (scenario === "uncertain-eviction") {
     // The first App Server child dies right after accepting turn/start, so the
@@ -5498,6 +5530,8 @@ test_codex_http_case "Codex HTTP recreates runtimes after true idle eviction" \
   "eviction"
 test_codex_http_case "Codex HTTP evicts a runtime stranded by child death and frees its thread" \
   "uncertain-eviction"
+test_codex_http_case "Codex HTTP foreground questions survive their input_required round" \
+  "foreground-question"
 test_codex_http_case "Codex HTTP retains runtimes while background jobs are active" \
   "active"
 test_codex_http_case "Codex HTTP starts idle grace when a background job completes" \
