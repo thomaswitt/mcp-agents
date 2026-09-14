@@ -37,6 +37,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client declaring URL-mode elicitation alone was offered a form request the
   SDK then refused, wedging the turn instead of falling back to the
   background interaction queue.
+- Reclaim an idle HTTP Codex runtime after its App Server child dies
+  mid-turn. Records stranded by the lost generation pinned the runtime, and
+  their thread leases left every later operation on that thread
+  `codex_thread_busy` for the daemon's lifetime; those leases are now released
+  when the runtime shuts down and the lost process group is proven gone.
+- Keep a foreground Codex question over HTTP answerable. The request's abort
+  listener outlived its `input_required` round, and HTTP aborts that signal as
+  soon as the response is sent, so the question interrupted the turn it was
+  waiting on.
+- Cancel a blocking `claude` or `gemini` call, and kill its CLI process group,
+  when its MCP request is canceled or its HTTP client disconnects, instead of
+  letting the child run to its full timeout.
+- Refuse an HTTP Codex call, reply, or review whose workspace lies outside the
+  project root that routed the request, so its sessions and leases are not
+  recorded under another project's state.
+- Keep an idle HTTP Codex runtime until every finished background job has been
+  read or has passed its one-hour retention, instead of discarding unread
+  results about 50 minutes early.
+- Validate the HTTP bearer token through the opened descriptor without
+  following symlinks, and refuse a token whose directory is not private to the
+  current user on reads as well as on creation.
+- Refuse HTTP request bodies over 10 MiB with `413` before buffering them.
 
 ## [0.30.2] - 2026-09-16
 

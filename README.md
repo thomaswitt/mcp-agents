@@ -208,6 +208,16 @@ returns the `Authorization` header without storing the token in `.mcp.json`.
 The project-root header is required by the Codex provider so one daemon can
 isolate and pool runtimes by canonical project path.
 
+The root is also a boundary: a Codex call, reply, or review whose workspace
+resolves outside it is refused with `codex_workspace_outside_project`. Request
+bodies over 10 MiB, the same limit as a stdio frame, are refused with `413`. A
+blocking `claude` or `gemini` call is canceled, and its CLI process group
+killed, when its client disconnects. An idle runtime is reaped only after every
+finished background job has been read with `codex-status` or `codex-result`, or
+has passed its one-hour retention. `--http-runtime-idle-timeout 0` disables
+reaping entirely, so a runtime whose App Server child died mid-turn keeps its
+thread leases until the daemon stops.
+
 Service managers do not load interactive shell initialization. The examples
 below use the absolute path from `command -v mise` and a working directory
 whose `.tool-versions` contains `mcp-agents` and its provider CLI. Without
