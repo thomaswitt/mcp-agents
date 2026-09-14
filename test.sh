@@ -3645,6 +3645,38 @@ try {
     if (interrupts.length !== 0) {
       throw new Error(`an HTTP input round interrupted its preserved turn: ${JSON.stringify(interrupts)}`);
     }
+  } else if (scenario === "containment") {
+    // The project-root header selects the runtime and its durable state, so
+    // neither a new turn nor a reply may execute outside that root.
+    const routedA = await openClient(`${testDir}/project-a`);
+    try {
+      const escaped = await routedA.callTool({
+        name: "codex",
+        arguments: initialArgs(`${testDir}/project-b`, "run elsewhere"),
+      });
+      if (escaped.structuredContent?.code !== "codex_workspace_outside_project") {
+        throw new Error(`a turn ran outside its routed project root: ${JSON.stringify(escaped)}`);
+      }
+    } finally {
+      await routedA.close();
+    }
+    const routedB = await openClient(`${testDir}/project-b`);
+    try {
+      const reply = await routedB.callTool({
+        name: "codex-reply",
+        arguments: { threadId: "thread-1", prompt: "reply elsewhere" },
+      });
+      if (reply.structuredContent?.code !== "codex_workspace_outside_project") {
+        throw new Error(`a reply ran outside its routed project root: ${JSON.stringify(reply)}`);
+      }
+    } finally {
+      await routedB.close();
+    }
+    const turnStarts = readJsonl(`${testDir}/app-stdin.jsonl`)
+      .filter((message) => message.method === "turn/start");
+    if (turnStarts.length !== 0) {
+      throw new Error(`an unconfined workspace reached turn/start: ${JSON.stringify(turnStarts)}`);
+    }
   } else if (scenario === "uncertain-eviction") {
     // The first App Server child dies right after accepting turn/start, so the
     // turn's outcome is unknown. Stdio reclaimed that when the bridge exited;
@@ -5586,6 +5618,8 @@ test_codex_http_case "Codex HTTP evicts a runtime stranded by child death and fr
   "uncertain-eviction"
 test_codex_http_case "Codex HTTP foreground questions survive their input_required round" \
   "foreground-question"
+test_codex_http_case "Codex HTTP confines turns to the routed project root" \
+  "containment"
 test_codex_http_case "Codex HTTP retains runtimes while background jobs are active" \
   "active"
 test_codex_http_case "Codex HTTP starts idle grace when a background job completes" \
