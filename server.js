@@ -15,14 +15,16 @@ import { createServer as createNetServer } from "node:net";
 import {
   chmodSync,
   closeSync,
+  constants as fsConstants,
   copyFileSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
-  readFileSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -599,43 +601,9 @@ function defaultHttpTokenFile() {
   return join(stateHome, "mcp-agents", "http", "bearer-token");
 }
 
-function readHttpBearerToken(tokenFile) {
-  let stats;
-  try {
-    stats = lstatSync(tokenFile);
-  } catch (err) {
-    if (err?.code === "ENOENT") {
-      throw new Error(`HTTP bearer token file does not exist: ${tokenFile}`);
-    }
-    throw err;
-  }
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    throw new Error("HTTP bearer token path must be a regular file");
-  }
-  if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
-    throw new Error("HTTP bearer token file must be owned by the current user");
-  }
-  if ((stats.mode & 0o077) !== 0) {
-    throw new Error("HTTP bearer token file permissions must be 0600 or stricter");
-  }
-  const token = readFileSync(tokenFile, "utf8").trim();
-  if (!/^[a-f0-9]{64}$/u.test(token)) {
-    throw new Error("HTTP bearer token file is invalid");
-  }
-  return token;
-}
-
-function ensureHttpBearerToken(tokenFile) {
-  try {
-    return readHttpBearerToken(tokenFile);
-  } catch (err) {
-    if (!String(err?.message).startsWith("HTTP bearer token file does not exist:")) {
-      throw err;
-    }
-  }
-
-  const tokenDir = dirname(tokenFile);
-  mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
+// A token is only as private as the directory that holds it: anyone who can
+// write there can replace the file. Reads and creation enforce the same rule.
+function assertPrivateTokenDirectory(tokenDir) {
   const dirStats = lstatSync(tokenDir);
   if (!dirStats.isDirectory() || dirStats.isSymbolicLink()) {
     throw new Error("HTTP bearer token directory must be a regular directory");
@@ -651,6 +619,61 @@ function ensureHttpBearerToken(tokenFile) {
       "HTTP bearer token directory permissions must be 0700 or stricter",
     );
   }
+}
+
+function readHttpBearerToken(tokenFile) {
+  // Validate the descriptor that is actually read rather than the path, so the
+  // file cannot be swapped between the check and the read. O_NOFOLLOW refuses a
+  // symlink and O_NONBLOCK keeps a planted FIFO from hanging the open.
+  let fd;
+  try {
+    fd = openSync(
+      tokenFile,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+    );
+  } catch (err) {
+    if (err?.code === "ENOENT") {
+      throw new Error(`HTTP bearer token file does not exist: ${tokenFile}`);
+    }
+    if (err?.code === "ELOOP") {
+      throw new Error("HTTP bearer token path must be a regular file");
+    }
+    throw err;
+  }
+  try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) {
+      throw new Error("HTTP bearer token path must be a regular file");
+    }
+    if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+      throw new Error("HTTP bearer token file must be owned by the current user");
+    }
+    if ((stats.mode & 0o077) !== 0) {
+      throw new Error("HTTP bearer token file permissions must be 0600 or stricter");
+    }
+    assertPrivateTokenDirectory(dirname(tokenFile));
+    const token = readFileSync(fd, "utf8").trim();
+    if (!/^[a-f0-9]{64}$/u.test(token)) {
+      throw new Error("HTTP bearer token file is invalid");
+    }
+    return token;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function ensureHttpBearerToken(tokenFile) {
+  try {
+    return readHttpBearerToken(tokenFile);
+  } catch (err) {
+    if (!String(err?.message).startsWith("HTTP bearer token file does not exist:")) {
+      throw err;
+    }
+  }
+
+  const tokenDir = dirname(tokenFile);
+  mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
+  assertPrivateTokenDirectory(tokenDir);
 
   const token = randomBytes(32).toString("hex");
   let fd;

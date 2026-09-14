@@ -758,9 +758,40 @@ test_http_auth_headers_missing_token() {
   rm -rf "$tmpdir"
 }
 
+# ── Helper: verify token reads enforce the private-directory rule too ──
+test_http_token_read_directory_safety() {
+  local label="$1"
+  local tmpdir shared_dir stderr_output status
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  shared_dir="$tmpdir/shared"
+  mkdir "$shared_dir"
+  chmod 0755 "$shared_dir"
+  printf '%064d\n' 0 > "$shared_dir/bearer-token"
+  chmod 0600 "$shared_dir/bearer-token"
+  set +e
+  stderr_output=$($SERVER http-auth-headers \
+    --http-token-file "$shared_dir/bearer-token" 2>&1 >/dev/null)
+  status=$?
+  set -e
+
+  if [ "$status" -ne 0 ] &&
+    printf '%s' "$stderr_output" | grep -Fq "directory permissions"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (exit=$status)"
+    echo "  Stderr: $stderr_output"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 test_http_token_parent_safety() {
   local label="$1"
-  local tmpdir shared_dir stderr_output status mode
+  local tmpdir shared_dir stderr_output status mode port
 
   echo "--- $label ---"
   tmpdir=$(mktemp -d)
@@ -768,8 +799,9 @@ test_http_token_parent_safety() {
   mkdir "$shared_dir"
   chmod 0755 "$shared_dir"
   set +e
+  port=$(node -e 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close();});')
   stderr_output=$($TIMEOUT_CMD 2 $SERVER --provider gemini \
-    --transport http --http-port 18766 \
+    --transport http --http-port "$port" \
     --http-token-file "$shared_dir/bearer-token" 2>&1 >/dev/null)
   status=$?
   set -e
@@ -887,6 +919,8 @@ test_http_auth_headers_missing_token \
   "HTTP auth helper fails closed when its token file is absent"
 test_http_token_parent_safety \
   "HTTP token creation never chmods an existing shared parent"
+test_http_token_read_directory_safety \
+  "HTTP token reads reject a token under a shared directory"
 
 # ========== Protocol tests (fast) ==========
 
