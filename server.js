@@ -9249,7 +9249,17 @@ async function createCodexRuntime({
         [...provisionalTurns.values()].every((provisional) => provisional.generationLost) &&
         interactions.size === 0 &&
         !appStarting &&
-        [...jobs.values()].every((job) => isTerminalJob(job));
+        // Eviction discards connection-local job records, so a terminal job
+        // keeps its runtime until the client has read its outcome or the
+        // one-hour retention has lapsed, the same rule that frees retained
+        // job slots.
+        [...jobs.values()].every((job) =>
+          isTerminalJob(job) && (
+            job.expiresAt <= Date.now() ||
+            job.resultRead ||
+            (job.state !== "completed" && job.terminalRead)
+          )
+        );
     },
     lastUsedAt: () => lastUsedAt,
     touch,

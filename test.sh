@@ -3734,6 +3734,25 @@ try {
         throw new Error(`shared job was not running: ${JSON.stringify(status)}`);
       }
       await observer.callTool({ name: "codex-cancel", arguments: { jobId } });
+      if (!await waitFor(() => readJsonl(`${testDir}/app-stdin.jsonl`)
+        .some((message) => message.method === "turn/interrupt"))) {
+        throw new Error("canceling the shared job did not interrupt its turn");
+      }
+      await sleep(400);
+      if (reapCount() !== reapsBeforeActiveWait) {
+        throw new Error("runtime was reaped before the canceled job's outcome was read");
+      }
+      let terminalState;
+      const readDeadline = Date.now() + 3_000;
+      while (!terminalState && Date.now() < readDeadline) {
+        const status = await observer.callTool({
+          name: "codex-status",
+          arguments: { jobId, cursor: 0, wait_ms: 200 },
+        });
+        const state = status.structuredContent?.state;
+        if (["canceled", "failed", "completed"].includes(state)) terminalState = state;
+      }
+      if (!terminalState) throw new Error("canceled job never reported a terminal state");
     } finally {
       await observer.close();
     }
@@ -3741,7 +3760,7 @@ try {
       throw new Error("active same-root job did not retain one shared App Server");
     }
     if (!await waitFor(() => reapCount() > reapsBeforeActiveWait)) {
-      throw new Error("runtime was not reaped after its active job became terminal");
+      throw new Error("runtime was not reaped after its job's terminal state was read");
     }
   } else if (scenario === "post-terminal-grace") {
     const starter = await openClient(`${testDir}/project-a`);
@@ -3752,6 +3771,7 @@ try {
     if (!started.structuredContent?.jobId) {
       throw new Error(`Codex job did not start: ${JSON.stringify(started)}`);
     }
+    const jobId = started.structuredContent.jobId;
     await starter.close();
     const reapsBeforeCompletion = reapCount();
     await sleep(250);
@@ -3766,12 +3786,22 @@ try {
     if (reapCount() !== reapsBeforeCompletion) {
       throw new Error("runtime was reaped as soon as the background job completed");
     }
-    await sleep(100);
+    await sleep(400);
     if (reapCount() !== reapsBeforeCompletion) {
-      throw new Error("runtime did not receive a fresh idle grace period after completion");
+      throw new Error("runtime was reaped while its completed result was still unread");
+    }
+    const reader = await openClient(`${testDir}/project-a`);
+    try {
+      const read = await reader.callTool({
+        name: "codex-result",
+        arguments: { jobId, offset: 0 },
+      });
+      if (read.isError) throw new Error(`completed result was not readable: ${JSON.stringify(read)}`);
+    } finally {
+      await reader.close();
     }
     if (!await waitFor(() => reapCount() > reapsBeforeCompletion)) {
-      throw new Error("runtime was not reaped after its post-completion idle grace");
+      throw new Error("runtime was not reaped after its completed result was read");
     }
   } else if (scenario === "active-request" || scenario === "shutdown-active") {
     const client = await openClient(`${testDir}/project-a`);
@@ -5622,7 +5652,7 @@ test_codex_http_case "Codex HTTP confines turns to the routed project root" \
   "containment"
 test_codex_http_case "Codex HTTP retains runtimes while background jobs are active" \
   "active"
-test_codex_http_case "Codex HTTP starts idle grace when a background job completes" \
+test_codex_http_case "Codex HTTP keeps a runtime until its completed result is read" \
   "post-terminal-grace"
 test_codex_http_case "Codex HTTP retains runtimes while foreground requests are active" \
   "active-request"
