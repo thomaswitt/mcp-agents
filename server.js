@@ -79,6 +79,8 @@ const DEFAULT_CODEX_SESSION_RETENTION_DAYS = 30;
 const DEFAULT_CODEX_APP_INIT_TIMEOUT_MS = 300_000;
 const DEFAULT_HTTP_PORT = 8_765;
 const DEFAULT_HTTP_RUNTIME_IDLE_TIMEOUT_MS = 600_000;
+// Matches the stdio transport's per-frame read buffer limit.
+const MAX_HTTP_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
 const MINIMUM_CODEX_VERSION = "0.149.1";
 const CODEX_INTERACTION_TIMEOUT_MS = 10 * 60 * 1_000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
@@ -690,6 +692,47 @@ function ensureHttpBearerToken(tokenFile) {
   return readHttpBearerToken(tokenFile);
 }
 
+// The SDK adapter buffers a whole request body before parsing it, so without a
+// bound one authenticated POST could grow the daemon without limit. Resolves
+// with the body's chunks, or undefined once the declared or streamed size
+// exceeds the limit. Uses events rather than for-await so stopping early does
+// not destroy the socket before a 413 can be written.
+function readBoundedHttpBody(req, limit) {
+  return new Promise((resolveBody, rejectBody) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > limit) {
+      resolveBody(undefined);
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const settle = (value, error) => {
+      if (settled) return;
+      settled = true;
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      if (error) rejectBody(error);
+      else resolveBody(value);
+    };
+    const onData = (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        req.pause();
+        settle(undefined);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => settle(chunks);
+    const onError = (error) => settle(undefined, error);
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+  });
+}
+
 function hasValidHttpBearerToken(header, token) {
   if (typeof header !== "string") return false;
   const actual = Buffer.from(header, "utf8");
@@ -749,7 +792,25 @@ async function createHttpMcpHost({
       return;
     }
     if (validateRequest && !validateRequest(req, res)) return;
-    void nodeHandler(req, res).catch((error) => {
+    void (async () => {
+      const chunks = await readBoundedHttpBody(req, MAX_HTTP_REQUEST_BODY_BYTES);
+      if (chunks === undefined) {
+        writeHttpStatus(res, 413, "Request body too large", { Connection: "close" });
+        res.once("finish", () => req.destroy());
+        return;
+      }
+      // Hand the adapter a replay of the bytes already read; it only needs the
+      // method, URL, headers, pass-through auth, and an async-iterable body.
+      await nodeHandler({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        ...(req.auth !== undefined ? { auth: req.auth } : {}),
+        async *[Symbol.asyncIterator]() {
+          yield* chunks;
+        },
+      }, res);
+    })().catch((error) => {
       logErr(`[mcp-agents] HTTP request failed: ${error.message}`);
       writeHttpStatus(res, 500, "Internal server error");
     });

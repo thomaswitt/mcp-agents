@@ -507,6 +507,74 @@ try {
     } catch (error) {
       if (error?.code !== "ESRCH") throw error;
     }
+  } else if (scenario === "oversized-body") {
+    // One authenticated POST must not be able to grow the daemon without
+    // bound, whether the body declares its size or streams it chunked.
+    const postOversized = (chunked) => new Promise((resolve, reject) => {
+      const size = 11 * 1024 * 1024;
+      let answered = false;
+      const req = httpRequest({
+        host: "127.0.0.1",
+        port,
+        path: "/mcp",
+        method: "POST",
+        headers: {
+          Authorization: authorization,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...(chunked ? {} : { "Content-Length": String(size) }),
+        },
+      }, (response) => {
+        answered = true;
+        resolve(response.statusCode);
+        response.resume();
+      });
+      req.on("error", (error) => {
+        // The daemon closes the connection once its 413 is written.
+        if (!answered) reject(error);
+      });
+      const chunk = Buffer.alloc(1024 * 1024, 0x20);
+      let written = 0;
+      const pump = () => {
+        while (written < size && !req.destroyed) {
+          written += chunk.length;
+          if (!req.write(chunk)) {
+            req.once("drain", pump);
+            return;
+          }
+        }
+        if (!req.destroyed) req.end();
+      };
+      pump();
+    });
+    for (const chunked of [false, true]) {
+      const status = await postOversized(chunked);
+      if (status !== 413) {
+        throw new Error(
+          `oversized ${chunked ? "chunked" : "sized"} body returned ${status}, expected 413`,
+        );
+      }
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`HTTP daemon exited after an oversized body: ${stderr}`);
+    }
+    const client = new Client(
+      { name: "mcp-agents-http-body-cap-test", version: "0.0.0" },
+      { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+    );
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`),
+      { requestInit: { headers: { Authorization: authorization } } },
+    );
+    await client.connect(transport);
+    try {
+      const pong = await client.callTool({ name: "ping", arguments: {} });
+      if (pong.content?.[0]?.text !== "pong") {
+        throw new Error(`daemon stopped serving after an oversized body: ${JSON.stringify(pong)}`);
+      }
+    } finally {
+      await client.close().catch(() => {});
+    }
   } else if (scenario === "disconnect") {
     // A client that drops its connection mid-call has no bridge process of its
     // own to take the provider child down with it, so the daemon has to cancel
@@ -937,6 +1005,8 @@ test_http_daemon_case \
   "HTTP daemon drains an active provider child on shutdown" "shutdown"
 test_http_daemon_case \
   "HTTP daemon cancels a blocking provider call when its client disconnects" "disconnect"
+test_http_daemon_case \
+  "HTTP daemon refuses request bodies over the frame limit" "oversized-body"
 
 # ---------- MCP 2026-07-28 modern negotiation ----------
 test_modern_stdio_provider \
