@@ -332,7 +332,7 @@ const scenario = process.argv[2];
 const tmpdir = process.argv[3];
 const tokenFile = `${tmpdir}/bearer-token`;
 const projectRoot = process.cwd();
-if (scenario === "shutdown") {
+if (scenario === "shutdown" || scenario === "disconnect") {
   writeFileSync(`${tmpdir}/agy`, `#!/usr/bin/env node
 import { writeFileSync } from "node:fs";
 writeFileSync(process.env.MCP_STUB_PROVIDER_PID, String(process.pid));
@@ -506,6 +506,58 @@ try {
       throw new Error(`provider child ${providerPid} survived HTTP shutdown`);
     } catch (error) {
       if (error?.code !== "ESRCH") throw error;
+    }
+  } else if (scenario === "disconnect") {
+    // A client that drops its connection mid-call has no bridge process of its
+    // own to take the provider child down with it, so the daemon has to cancel
+    // the call when the request goes away.
+    const client = new Client(
+      { name: "mcp-agents-http-disconnect-test", version: "0.0.0" },
+      { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+    );
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`),
+      { requestInit: { headers: { Authorization: authorization } } },
+    );
+    await client.connect(transport);
+    const openCall = client.callTool({
+      name: "gemini",
+      arguments: { prompt: "stay active" },
+    }).catch((error) => ({ transportError: error.message }));
+    let providerPid;
+    const startDeadline = Date.now() + 2_000;
+    while (!providerPid && Date.now() < startDeadline) {
+      try {
+        providerPid = Number(readFileSync(`${tmpdir}/provider.pid`, "utf8").trim()) || undefined;
+      } catch {}
+      if (!providerPid) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!providerPid) throw new Error(`provider did not start: ${stderr}`);
+    await client.close().catch(() => {});
+    await Promise.race([
+      openCall,
+      new Promise((resolve) => setTimeout(resolve, 500)),
+    ]);
+    let providerGone = false;
+    const goneDeadline = Date.now() + 3_000;
+    while (Date.now() < goneDeadline) {
+      try {
+        process.kill(providerPid, 0);
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+        providerGone = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!providerGone) {
+      try { process.kill(-providerPid, "SIGKILL"); } catch {}
+      throw new Error(
+        `provider child ${providerPid} kept running after its HTTP client disconnected: ${stderr}`,
+      );
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`HTTP daemon exited after a client disconnect: ${stderr}`);
     }
   } else {
     const versionNegotiation = scenario === "modern"
@@ -849,6 +901,8 @@ test_http_daemon_case \
   "HTTP daemon preserves stateless legacy requests" "legacy"
 test_http_daemon_case \
   "HTTP daemon drains an active provider child on shutdown" "shutdown"
+test_http_daemon_case \
+  "HTTP daemon cancels a blocking provider call when its client disconnects" "disconnect"
 
 # ---------- MCP 2026-07-28 modern negotiation ----------
 test_modern_stdio_provider \
