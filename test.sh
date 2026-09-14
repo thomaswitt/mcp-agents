@@ -3335,7 +3335,8 @@ const child = spawn(process.execPath, [
     MCP_STUB_APP_CAPTURE_DIR: testDir,
     MCP_STUB_APP_MODE: ["active", "active-request", "shutdown-active"].includes(scenario)
       ? "park"
-      : scenario === "post-terminal-grace" ? "delayed" : "normal",
+      : scenario === "post-terminal-grace" ? "delayed"
+      : scenario === "uncertain-eviction" ? "die-first" : "normal",
     MCP_STUB_APP_WORKSPACE: `${testDir}/project-a`,
     MCP_STUB_CODEX_VERSION: "codex-cli 0.149.1",
   },
@@ -3557,6 +3558,39 @@ try {
     }
     if (!await waitFor(() => readJsonl(`${testDir}/app-spawns.jsonl`).length === 2)) {
       throw new Error("request after eviction did not recreate the Codex runtime");
+    }
+  } else if (scenario === "uncertain-eviction") {
+    // The first App Server child dies right after accepting turn/start, so the
+    // turn's outcome is unknown. Stdio reclaimed that when the bridge exited;
+    // the daemon must still evict the idle runtime and free the thread.
+    const first = await openClient(`${testDir}/project-a`);
+    let lost;
+    try {
+      lost = await first.callTool({
+        name: "codex",
+        arguments: initialArgs(`${testDir}/project-a`, "lose the generation"),
+      });
+    } finally {
+      await first.close();
+    }
+    if (lost.structuredContent?.code !== "codex_outcome_unknown") {
+      throw new Error(`child death did not surface as outcome unknown: ${JSON.stringify(lost)}`);
+    }
+    if (!await waitFor(() => reapCount() > 0, 5_000)) {
+      throw new Error(`runtime stranded by child death was never reaped: ${stderr}`);
+    }
+    const second = await openClient(`${testDir}/project-a`);
+    try {
+      const reply = await second.callTool({
+        name: "codex-reply",
+        arguments: { threadId: "thread-1", prompt: "after eviction" },
+      });
+      if (reply.structuredContent?.code === "codex_thread_busy") {
+        throw new Error(`eviction kept the stranded thread lease: ${JSON.stringify(reply)}`);
+      }
+      assertToolText(reply, "APP_SERVER_OK");
+    } finally {
+      await second.close();
     }
   } else if (scenario === "active") {
     const starter = await openClient(`${testDir}/project-a`);
@@ -5462,6 +5496,8 @@ test_codex_http_case "Codex HTTP pools by canonical root across MCP eras" \
   "pool"
 test_codex_http_case "Codex HTTP recreates runtimes after true idle eviction" \
   "eviction"
+test_codex_http_case "Codex HTTP evicts a runtime stranded by child death and frees its thread" \
+  "uncertain-eviction"
 test_codex_http_case "Codex HTTP retains runtimes while background jobs are active" \
   "active"
 test_codex_http_case "Codex HTTP starts idle grace when a background job completes" \
