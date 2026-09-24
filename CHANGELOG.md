@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.31.0] - 2026-09-24
 
 ### Added
 
@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   interactions now resume through signed, content-free `input_required`
   rounds; the raw `browser` and `codex-legacy` transport boundaries are
   unchanged.
+
+### Changed
+
+- Limit foreground Codex calls from legacy stdio clients to eight input or
+  approval rounds; calls requiring a ninth round return a tool error.
 
 ### Fixed
 

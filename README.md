@@ -678,6 +678,11 @@ requests are rejected rather than queued or logged. Interaction waiting does
 not trigger the idle watchdog, but the immutable hard call deadline continues
 to run.
 
+Legacy stdio clients can answer up to eight input or approval rounds per
+foreground Codex call; a form containing several questions counts as one round.
+A call requiring a ninth round returns a tool error. Use a background job for
+longer question sequences.
+
 </details>
 
 <details>
