@@ -2302,6 +2302,130 @@ test_codex_percall_write() {
   rm -rf "$probe_dir" "$state_dir"
 }
 
+test_codex_unload_reaps_project_mcp() {
+  local label="$1"
+  local fixture capture state_dir output_file status RESPONSE node_bin started pid
+  local result_ok app_alive
+  echo "--- $label ---"
+
+  # A git project whose .codex/config.toml starts a sentinel MCP server. A
+  # workspace-write turn makes real Codex auto-trust it, so the sentinel runs
+  # for that thread. Once the bridge releases the finished thread, Codex must
+  # unload it after thread_unload_delay (60 s) and stop the sentinel while the
+  # App Server itself keeps running. Before the fix the sentinel lived forever.
+  fixture=$(CDPATH='' cd -- "$(mktemp -d)" && pwd -P)
+  capture=$(CDPATH='' cd -- "$(mktemp -d)" && pwd -P)
+  state_dir=$(mktemp -d)
+  output_file=$(mktemp)
+  node_bin=$(command -v node)
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$fixture" init -q
+  mkdir -p "$fixture/.codex"
+  # Codex hands MCP servers a filtered environment, so every path is baked in.
+  cat >"$fixture/.codex/sentinel.mjs" <<EOF
+import fs from "node:fs";
+fs.writeFileSync("$capture/started-" + process.pid, "");
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    let message;
+    try { message = JSON.parse(line); } catch { continue; }
+    if (message.id === undefined) continue;
+    const result = message.method === "initialize"
+      ? {
+        protocolVersion: message.params?.protocolVersion ?? "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "sentinel", version: "0.0.1" },
+      }
+      : message.method === "tools/list" ? { tools: [] } : {};
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\n");
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+setInterval(() => {}, 1 << 30);
+EOF
+  cat >"$fixture/.codex/config.toml" <<EOF
+[mcp_servers.sentinel]
+command = "$node_bin"
+args = ["$fixture/.codex/sentinel.mjs"]
+EOF
+
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"codex\",\"arguments\":{\"prompt\":\"Reply with only OK. Do not run any commands.\",\"sandbox\":\"workspace-write\",\"cwd\":\"$fixture\"}}}"
+    for _ in $(seq 1 200); do
+      grep -q '"id":2' "$output_file" 2>/dev/null && break
+      sleep 0.5
+    done
+    sleep 3
+    for started in "$capture"/started-*; do
+      [ -e "$started" ] || continue
+      pid=${started##*-}
+      kill -0 "$pid" 2>/dev/null && echo "$pid" >>"$capture/alive-before"
+    done
+    sleep 75
+    for started in "$capture"/started-*; do
+      [ -e "$started" ] || continue
+      pid=${started##*-}
+      kill -0 "$pid" 2>/dev/null && echo "$pid" >>"$capture/alive-after"
+    done
+    for owner in "$state_dir"/projects/*/v1/bridges/*/owner.json; do
+      [ -e "$owner" ] || continue
+      pid=$(jq -r '.childPid // empty' "$owner" 2>/dev/null)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid" >>"$capture/app-alive"
+    done
+  } | $TIMEOUT_CMD 240 $SERVER --provider codex \
+    --codex-state-root "$state_dir" >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
+
+  result_ok=0
+  if echo "$RESPONSE" | jq -s -e '
+    ([.[] | select(.id == 2)] | length == 1) and
+    ([.[] | select(.id == 2)][0] |
+      (.error == null) and (.result | type == "object") and
+      (.result.isError != true) and
+      (.result.structuredContent.threadId | type == "string" and length > 0))
+  ' >/dev/null 2>&1; then
+    result_ok=1
+  fi
+  app_alive=0
+  [ -s "$capture/app-alive" ] && app_alive=1
+
+  if [ "$status" -eq 0 ] && [ "$result_ok" -eq 1 ] && [ -s "$capture/alive-before" ] &&
+    [ ! -s "$capture/alive-after" ] && [ "$app_alive" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label"
+    [ "$status" -eq 0 ] || echo "  server exited non-zero ($status)"
+    [ "$result_ok" -eq 1 ] || echo "  the workspace-write call did not return a successful result"
+    [ -s "$capture/alive-before" ] ||
+      echo "  control failed: the project sentinel MCP server never ran, so nothing was proven"
+    [ ! -s "$capture/alive-after" ] ||
+      echo "  sentinel MCP server still running after the unload delay: $(tr '\n' ' ' <"$capture/alive-after")"
+    [ "$app_alive" -eq 1 ] ||
+      echo "  the App Server had exited, so a reap could not be attributed to the thread unload"
+    echo "  Response: ${RESPONSE:0:4000}"
+    FAIL=$((FAIL + 1))
+  fi
+  for started in "$capture"/started-*; do
+    [ -e "$started" ] || continue
+    kill "${started##*-}" 2>/dev/null || true
+  done
+  rm -rf "$fixture" "$capture" "$state_dir"
+}
+
 write_codex_app_server_stub() {
   cat >"$1/codex" <<'EOF'
 #!/usr/bin/env node
@@ -2366,7 +2490,21 @@ let inputBuffer = "";
 let threadCounter = 0;
 let turnCounter = 0;
 let active = null;
+let turnStartFailed = false;
+let lateResume = null;
 const deletedThreads = new Set();
+const goals = new Map();
+const unsubscribedThreads = new Set();
+const timelineFile = `${captureDir}/app-timeline.jsonl`;
+const timeline = (dir, method, threadId, turnId) => {
+  if (typeof method !== "string") return;
+  fs.appendFileSync(timelineFile, `${JSON.stringify({
+    dir,
+    method,
+    threadId: threadId ?? null,
+    turnId: turnId ?? null,
+  })}\n`);
+};
 const now = () => Math.floor(Date.now() / 1000);
 const thread = (id = "thread-1", turns = []) => ({
   id,
@@ -2393,6 +2531,14 @@ const turn = (id, status = "inProgress", items = []) => ({
   items,
 });
 const send = (value, callback) => {
+  if (value.method && value.id === undefined) {
+    timeline(
+      "out",
+      value.method,
+      value.params?.threadId ?? value.params?.thread?.id,
+      value.params?.turn?.id ?? value.params?.turnId,
+    );
+  }
   const line = `${JSON.stringify(value)}\n`;
   if (mode === "split" && value.method === "turn/completed") {
     const midpoint = Math.floor(line.length / 2);
@@ -2440,10 +2586,32 @@ function completeActive(text = "APP_SERVER_OK", status = "completed") {
     threadId: current.threadId,
     turn: turn(current.turnId, status, [item]),
   });
+  if (mode === "goal-continuation" && goals.get(current.threadId)?.status === "active") {
+    // Codex keeps working on an active goal after the caller's turn: one
+    // continuation turn the bridge never asked for. The goal completes while
+    // that turn is still running, and the turn finishes afterwards.
+    setTimeout(() => {
+      notify("turn/started", { threadId: current.threadId, turn: turn("turn-goal-1") });
+    }, 30);
+    setTimeout(() => {
+      const goal = { ...goals.get(current.threadId), status: "complete", updatedAt: now() };
+      goals.set(current.threadId, goal);
+      notify("thread/goal/updated", { threadId: current.threadId, turnId: "turn-goal-1", goal });
+    }, 150);
+    setTimeout(() => {
+      notify("turn/completed", {
+        threadId: current.threadId,
+        turn: turn("turn-goal-1", "completed", [
+          { type: "agentMessage", id: "agent-goal-1", text: "GOAL_CONTINUATION" },
+        ]),
+      });
+    }, 450);
+  }
 }
 
 function startTurn(message, review = false, responseExtra = {}) {
-  const threadId = message.params.threadId;
+  // A detached review runs on its own thread, like real Codex.
+  const threadId = responseExtra.reviewThreadId ?? message.params.threadId;
   const turnId = `turn-${++turnCounter}`;
   const itemId = `agent-${turnCounter}`;
   active = { threadId, turnId, itemId, requestId: message.id };
@@ -2653,6 +2821,7 @@ function startTurn(message, review = false, responseExtra = {}) {
 
 function onMessage(message) {
   fs.appendFileSync(captureFile, `${JSON.stringify(message)}\n`);
+  timeline("in", message.method, message.params?.threadId);
 
   if (message.id === "approval-1" || message.id === "question-1" ||
       String(message.id).startsWith("approval-") ||
@@ -2707,6 +2876,30 @@ function onMessage(message) {
       break;
     }
     case "thread/resume":
+      if (mode === "resume-withheld") break;
+      if (mode === "goal-set-closed-canceled" &&
+          unsubscribedThreads.has(message.params.threadId)) {
+        notify("thread/closed", { threadId: message.params.threadId });
+        break;
+      }
+      if (mode === "goal-set-resume-late" &&
+          unsubscribedThreads.delete(message.params.threadId)) {
+        // The unload finishes (thread/closed), then the resume still loads and
+        // subscribes the thread, answering only after the caller gave up and
+        // the bridge released the thread again (see thread/unsubscribe).
+        notify("thread/closed", { threadId: message.params.threadId });
+        lateResume = { id: message.id, threadId: message.params.threadId };
+        break;
+      }
+      if (["resume-closing-once", "goal-set-closing"].includes(mode) &&
+          unsubscribedThreads.delete(message.params.threadId)) {
+        send({ id: message.id, error: {
+          code: -32600,
+          message: `thread ${message.params.threadId} is closing; retry thread/resume after the thread is closed`,
+        } });
+        notify("thread/closed", { threadId: message.params.threadId });
+        break;
+      }
       if (process.env.MCP_STUB_REQUIRE_SESSION === "1" &&
           !fs.existsSync(`${process.env.CODEX_HOME}/sessions/stub/${message.params.threadId}.jsonl`)) {
         send({ id: message.id, error: { code: -32000, message: "durable session missing" } });
@@ -2723,6 +2916,11 @@ function onMessage(message) {
       });
       break;
     case "turn/start":
+      if (mode === "turn-start-error" && !turnStartFailed) {
+        turnStartFailed = true;
+        send({ id: message.id, error: { code: -32000, message: "turn start exploded" } });
+        break;
+      }
       startTurn(message);
       break;
     case "turn/steer":
@@ -2742,34 +2940,63 @@ function onMessage(message) {
       }
       break;
     }
-    case "thread/goal/set":
-      respond(message.id, { goal: {
+    case "thread/goal/set": {
+      const previous = goals.get(message.params.threadId);
+      const goal = {
         threadId: message.params.threadId,
-        objective: message.params.objective ?? "existing objective",
-        status: message.params.status ?? "active",
-        tokenBudget: message.params.tokenBudget ?? null,
+        objective: message.params.objective ?? previous?.objective ?? "existing objective",
+        status: message.params.status ?? previous?.status ?? "active",
+        tokenBudget: message.params.tokenBudget ?? previous?.tokenBudget ?? null,
         tokensUsed: 12,
         timeUsedSeconds: 3,
-        createdAt: now(),
+        createdAt: previous?.createdAt ?? now(),
         updatedAt: now(),
-      } });
+      };
+      goals.set(message.params.threadId, goal);
+      respond(message.id, { goal });
       break;
+    }
     case "thread/goal/get":
-      respond(message.id, { goal: {
-        threadId: message.params.threadId,
-        objective: "existing objective", status: "active", tokenBudget: 500,
-        tokensUsed: 12, timeUsedSeconds: 3, createdAt: now(), updatedAt: now(),
-      } });
+      if (mode === "goal-get-error") {
+        send({ id: message.id, error: { code: -32603, message: "goal store exploded" } });
+        break;
+      }
+      respond(message.id, { goal: goals.get(message.params.threadId) ?? null });
       break;
     case "thread/goal/clear":
+      goals.delete(message.params.threadId);
       respond(message.id, { cleared: true });
+      break;
+    case "thread/unsubscribe":
+      unsubscribedThreads.add(message.params.threadId);
+      if (lateResume?.threadId === message.params.threadId) {
+        const answer = lateResume;
+        lateResume = null;
+        setTimeout(() => respond(answer.id, {
+          thread: thread(answer.threadId),
+          model: "gpt-6-astra",
+          modelProvider: "openai",
+          cwd: workspace,
+          approvalPolicy: "never",
+          approvalsReviewer: "user",
+          sandbox: { type: "readOnly" },
+        }), 20);
+      }
+      if (mode === "unsubscribe-withheld") break;
+      if (mode === "unsubscribe-error") {
+        send({ id: message.id, error: { code: -32000, message: "unsubscribe exploded" } });
+        break;
+      }
+      respond(message.id, {
+        status: mode === "goal-set-after-notloaded" ? "notLoaded" : "unsubscribed",
+      });
       break;
     case "review/start":
       startTurn(
         message,
         true,
         {
-          reviewThreadId: mode === "detached-review"
+          reviewThreadId: ["detached-review", "detached-review-release"].includes(mode)
             ? "thread-review-detached"
             : message.params.threadId,
         },
@@ -2832,6 +3059,12 @@ function onMessage(message) {
       }
       break;
     case "thread/read":
+      if (mode === "goal-set-read-notloaded") {
+        respond(message.id, {
+          thread: { ...thread(message.params.threadId), status: { type: "notLoaded" } },
+        });
+        break;
+      }
       respond(message.id, { thread: thread(message.params.threadId, message.params.includeTurns ? [turn("turn-read", "completed", [
         { type: "agentMessage", id: "agent-read", text: "READ_OK" },
         { type: "reasoning", id: "reasoning-read", summary: ["SECRET_REASONING"] },
@@ -2925,6 +3158,13 @@ const stubMode = {
   "approval-no-elicit": "approval",
   "stale-race": "park",
   "cancel-during-thread-start": "thread-start-withheld",
+  "resume-canceled": "resume-withheld",
+  "thread-start-late-cancel": "thread-start-delayed",
+  "thread-start-late-in-grace": "thread-start-delayed",
+  "thread-start-late-cancel-subagents": "thread-start-delayed",
+  "goal-set-resume-canceled": "resume-withheld",
+  "goal-set-resume-late-cancel": "goal-set-resume-late",
+  "goal-set-resume-late-timeout": "goal-set-resume-late",
   "init-timeout-empty": "delayed-initialize",
   "init-timeout-invalid": "delayed-initialize",
   "init-timeout-negative": "delayed-initialize",
@@ -2975,8 +3215,51 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
     ...(["turn-start-withheld", "archive-withheld"].includes(scenario)
       ? { MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS: "120" }
       : {}),
-    ...(["cancel-no-native", "cancel-during-thread-start"].includes(scenario)
+    ...(["cancel-no-native", "cancel-during-thread-start", "resume-canceled"].includes(scenario)
       ? { MCP_AGENTS_CODEX_CANCEL_GRACE_MS: "120" }
+      : {}),
+    ...([
+      "thread-start-late-cancel",
+      "thread-start-late-cancel-subagents",
+      "goal-set-resume-canceled",
+      "goal-set-closed-canceled",
+      "goal-set-resume-late-cancel",
+    ].includes(scenario)
+      ? { MCP_AGENTS_CODEX_CANCEL_GRACE_MS: "120" }
+      : {}),
+    ...(scenario === "goal-set-resume-late-timeout"
+      ? { MCP_AGENTS_TEST_CODEX_RESUME_TIMEOUT_MS: "150" }
+      : {}),
+    ...(scenario === "thread-start-late-in-grace"
+      ? { MCP_AGENTS_CODEX_CANCEL_GRACE_MS: "1500" }
+      : {}),
+    ...([
+      "goal-continuation",
+      "goal-held-clear",
+      "goal-stuck",
+      "subagents-held",
+      "detached-review-release",
+      "goal-set-resume",
+      "goal-set-closing",
+      "goal-get-error",
+      "thread-start-late-cancel",
+      "thread-start-late-in-grace",
+      "thread-start-late-cancel-subagents",
+      "goal-set-resume-canceled",
+      "goal-set-closed-canceled",
+      "goal-set-resume-late-cancel",
+      "goal-set-resume-late-timeout",
+    ].includes(scenario)
+      ? {
+        MCP_AGENTS_TEST_CODEX_THREAD_SWEEP_MS: "50",
+        MCP_AGENTS_TEST_CODEX_THREAD_IDLE_GRACE_MS: [
+          "goal-stuck",
+          "subagents-held",
+          "goal-set-resume",
+          "goal-set-closing",
+          "goal-get-error",
+        ].includes(scenario) ? "300" : "60000",
+      }
       : {}),
     ...(scenario === "interaction-timeout"
       ? { MCP_AGENTS_CODEX_INTERACTION_TIMEOUT_MS: "1500" }
@@ -3123,6 +3406,17 @@ const initialArgs = (prompt = "hello") => ({
   model: "gpt-6-astra",
   model_reasoning_effort: "high",
 });
+const unsubscribesNow = (threadId) => {
+  const file = `${stubDir}/app-stdin.jsonl`;
+  if (!fs.existsSync(file)) return 0;
+  return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).filter((line) => {
+    try {
+      const entry = JSON.parse(line);
+      return entry.method === "thread/unsubscribe" &&
+        (!threadId || entry.params?.threadId === threadId);
+    } catch { return false; }
+  }).length;
+};
 const data = {};
 
 try {
@@ -3275,6 +3569,163 @@ try {
     await sleep(1800);
     const jobId = data.started.result?.structuredContent?.jobId;
     data.cancel = await call("codex-cancel", { jobId });
+  } else if (scenario === "goal-continuation") {
+    await mcpInitialize();
+    data.call = await call("codex", { ...initialArgs("goal work"), goal: "ship" });
+    data.unsubscribesAtResult = unsubscribesNow("thread-1");
+    data.releasedAfterGoal = await waitFor(() => unsubscribesNow("thread-1") === 1, 3000);
+    data.peek = await call("codex-peek", {});
+  } else if (scenario === "goal-held-clear") {
+    await mcpInitialize();
+    data.call = await call("codex", { ...initialArgs("goal held"), goal: "ship" });
+    await sleep(300);
+    data.unsubscribesBeforeClear = unsubscribesNow("thread-1");
+    data.clear = await call("codex-goal-clear", { threadId: "thread-1" });
+    data.releasedAfterClear = await waitFor(() => unsubscribesNow("thread-1") === 1, 2000);
+  } else if (scenario === "goal-stuck") {
+    await mcpInitialize();
+    data.call = await call("codex", { ...initialArgs("goal never continued"), goal: "ship" });
+    data.unsubscribesAtResult = unsubscribesNow("thread-1");
+    data.releasedAfterGrace = await waitFor(() => unsubscribesNow("thread-1") === 1, 3000);
+  } else if (scenario === "subagents-held") {
+    await mcpInitialize();
+    data.call = await call("codex", { ...initialArgs("with workers"), allow_subagents: true });
+    await sleep(800);
+    data.unsubscribes = unsubscribesNow("thread-1");
+  } else if (scenario === "detached-review-release") {
+    await mcpInitialize();
+    data.review = await call("codex-review", {
+      threadId: "thread-review",
+      target: { type: "custom", instructions: "review and finish" },
+      delivery: "detached",
+    });
+    data.releasedBoth = await waitFor(() =>
+      unsubscribesNow("thread-review-detached") === 1 && unsubscribesNow("thread-review") === 1, 2000);
+  } else if (scenario === "goal-set-resume" || scenario === "goal-set-closing") {
+    await mcpInitialize();
+    data.first = await call("codex", initialArgs("finish first"));
+    data.goal = await call("codex-goal-set", {
+      threadId: "thread-1",
+      objective: "keep going",
+      status: "active",
+    });
+    data.releasedAgain = await waitFor(() => unsubscribesNow("thread-1") === 2, 3000);
+  } else if (scenario === "goal-get-error") {
+    await mcpInitialize();
+    data.call = await call("codex", initialArgs("goal unreadable"));
+    data.unsubscribesAtResult = unsubscribesNow("thread-1");
+    data.releasedAfterGrace = await waitFor(() => unsubscribesNow("thread-1") === 1, 3000);
+  } else if ([
+    "goal-set-after-notloaded",
+    "goal-set-after-archive",
+    "goal-set-read-notloaded",
+  ].includes(scenario)) {
+    await mcpInitialize();
+    data.first = await call("codex", initialArgs("finish first"));
+    await sleep(100);
+    if (scenario === "goal-set-after-archive") {
+      data.archive = await call("codex-thread-archive", { threadId: "thread-1" });
+    }
+    data.goal = await call("codex-goal-set", {
+      threadId: "thread-1",
+      objective: "keep going",
+      status: "active",
+    });
+  } else if (scenario === "goal-set-resume-late-timeout") {
+    await mcpInitialize();
+    data.first = await call("codex", initialArgs("finish first"));
+    data.goal = await call("codex-goal-set", {
+      threadId: "thread-1",
+      objective: "keep going",
+      status: "active",
+    });
+    data.releasedAfterLateAnswer = await waitFor(() => unsubscribesNow("thread-1") === 3, 3000);
+  } else if (scenario === "goal-set-resume-late-cancel") {
+    await mcpInitialize();
+    data.first = await call("codex", initialArgs("finish first"));
+    const callId = nextId;
+    const open = call("codex-goal-set", {
+      threadId: "thread-1",
+      objective: "keep going",
+      status: "active",
+    }).catch((error) => ({ driverError: error.message }));
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"thread/resume"'))) {
+      throw new Error("the goal-set resume was not captured before cancellation");
+    }
+    notify("notifications/cancelled", { requestId: callId, reason: "goal abandoned" });
+    data.releasedAfterLateAnswer = await waitFor(() => unsubscribesNow("thread-1") === 3, 3000);
+    await Promise.race([open, sleep(200)]);
+  } else if (scenario === "goal-set-resume-canceled" || scenario === "goal-set-closed-canceled") {
+    await mcpInitialize();
+    data.first = await call("codex", initialArgs("finish first"));
+    const callId = nextId;
+    const open = call("codex-goal-set", {
+      threadId: "thread-1",
+      objective: "keep going",
+      status: "active",
+    }).catch((error) => ({ driverError: error.message }));
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"thread/resume"'))) {
+      throw new Error("the goal-set resume was not captured before cancellation");
+    }
+    notify("notifications/cancelled", { requestId: callId, reason: "goal abandoned" });
+    data.releasedAgain = await waitFor(() => unsubscribesNow("thread-1") === 2, 3000);
+    await Promise.race([open, sleep(200)]);
+  } else if ([
+    "thread-start-late-cancel",
+    "thread-start-late-in-grace",
+    "thread-start-late-cancel-subagents",
+  ].includes(scenario)) {
+    await mcpInitialize();
+    const callId = nextId;
+    const open = call("codex", {
+      ...initialArgs("canceled while starting"),
+      ...(scenario === "thread-start-late-cancel-subagents" ? { allow_subagents: true } : {}),
+    }).catch((error) => ({ driverError: error.message }));
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"thread/start"'))) {
+      throw new Error("thread/start was not captured before cancellation");
+    }
+    notify("notifications/cancelled", { requestId: callId, reason: "start abandoned" });
+    data.released = await waitFor(() => unsubscribesNow("thread-1") === 1, 3000);
+    await Promise.race([open, sleep(200)]);
+  } else if (scenario === "resume-canceled") {
+    await mcpInitialize();
+    const callId = nextId;
+    const open = call("codex-reply", { threadId: "thread-cold", prompt: "never resumed" })
+      .catch((error) => ({ driverError: error.message }));
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"thread/resume"'))) {
+      throw new Error("thread/resume was not captured before cancellation");
+    }
+    notify("notifications/cancelled", { requestId: callId, reason: "resume abandoned" });
+    data.released = await waitFor(() => unsubscribesNow("thread-cold") === 1, 2000);
+    await Promise.race([open, sleep(200)]);
+  } else if (scenario === "release-job") {
+    await mcpInitialize();
+    data.started = await call("codex-start", initialArgs("background release"));
+    const jobId = data.started.result?.structuredContent?.jobId;
+    let cursor = 0;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      data.status = await call("codex-status", { jobId, cursor, wait_ms: 1000 });
+      const state = data.status.result?.structuredContent?.state;
+      cursor = data.status.result?.structuredContent?.cursor ?? cursor;
+      if (state && state !== "running" && state !== "starting") break;
+    }
+    data.released = await waitFor(() => unsubscribesNow("thread-1") === 1, 1500);
+  } else if ([
+    "reply-after-release",
+    "resume-closing-once",
+    "unsubscribe-error",
+    "unsubscribe-withheld",
+    "turn-start-error",
+  ].includes(scenario)) {
+    await mcpInitialize();
+    const firstStartedAt = Date.now();
+    data.first = await call("codex", initialArgs("first"));
+    data.firstElapsedMs = Date.now() - firstStartedAt;
+    data.reply = await call("codex-reply", { threadId: "thread-1", prompt: "again" });
   } else if (scenario === "idle") {
     await mcpInitialize();
     data.call = await call("codex", initialArgs("idle forever"));
@@ -3431,6 +3882,7 @@ process.stdout.write(`${JSON.stringify({
   data,
   appRequests: readJsonl(`${stubDir}/app-stdin.jsonl`),
   appSpawns: readJsonl(`${stubDir}/app-spawns.jsonl`),
+  appTimeline: readJsonl(`${stubDir}/app-timeline.jsonl`),
   stderr,
   parseTail: parseBuffer,
 })}\n`, () => process.exit(0));
@@ -3773,8 +4225,37 @@ try {
       if (reply.structuredContent?.code !== "codex_workspace_outside_project") {
         throw new Error(`a reply ran outside its routed project root: ${JSON.stringify(reply)}`);
       }
+      // An active goal would make Codex start work in the thread, so goal-set
+      // must refuse a thread outside the routed root before any goal change —
+      // and before any resume could load it (checked with a non-loading read).
+      const resumesBeforeGoal = readJsonl(`${testDir}/app-stdin.jsonl`)
+        .filter((message) => message.method === "thread/resume").length;
+      const readsBeforeGoal = readJsonl(`${testDir}/app-stdin.jsonl`)
+        .filter((message) => message.method === "thread/read").length;
+      const goal = await routedB.callTool({
+        name: "codex-goal-set",
+        arguments: { threadId: "thread-1", objective: "escape the root", status: "active" },
+      });
+      if (goal.structuredContent?.code !== "codex_workspace_outside_project") {
+        throw new Error(`a goal was set outside its routed project root: ${JSON.stringify(goal)}`);
+      }
+      const afterGoal = readJsonl(`${testDir}/app-stdin.jsonl`);
+      if (afterGoal.filter((message) => message.method === "thread/resume").length !==
+          resumesBeforeGoal) {
+        throw new Error("goal-set resumed an out-of-root thread before refusing it");
+      }
+      if (afterGoal.filter((message) => message.method === "thread/read").length !==
+          readsBeforeGoal + 1) {
+        throw new Error("goal-set did not check the thread workspace with thread/read first");
+      }
     } finally {
       await routedB.close();
+    }
+    const escapedGoals = readJsonl(`${testDir}/app-stdin.jsonl`)
+      .filter((message) => message.method === "thread/goal/set" &&
+        message.params?.objective === "escape the root");
+    if (escapedGoals.length !== 0) {
+      throw new Error(`an out-of-root goal reached App Server: ${JSON.stringify(escapedGoals)}`);
     }
     const turnStarts = readJsonl(`${testDir}/app-stdin.jsonl`)
       .filter((message) => message.method === "turn/start");
@@ -5752,7 +6233,7 @@ test_codex_http_case "Codex HTTP evicts a runtime stranded by child death and fr
   "uncertain-eviction"
 test_codex_http_case "Codex HTTP foreground questions survive their input_required round" \
   "foreground-question"
-test_codex_http_case "Codex HTTP confines turns to the routed project root" \
+test_codex_http_case "Codex HTTP confines turns and goal changes to the routed project root" \
   "containment"
 test_codex_http_case "Codex HTTP retains runtimes while background jobs are active" \
   "active"
@@ -6163,6 +6644,192 @@ test_codex_app_case "Thread tools map to stable history and lifecycle methods" \
    (.data.read.result.structuredContent | tostring | contains("READ_OK")) and
    (.data.read.result.structuredContent | tostring | contains("reasoning") | not) and
    (.data.read.result.structuredContent | tostring | contains("SECRET_REASONING") | not)'
+
+# Thread release: a finished thread is unsubscribed so Codex can unload it and
+# stop its per-thread MCP servers; an active goal keeps it loaded.
+test_codex_app_case "A finished thread is released only after its turn completed" \
+  "normal" \
+  '([.appRequests[] | select(.method == "thread/unsubscribe") | .params] ==
+      [{threadId:"thread-1"}]) and
+   ([.appTimeline[] | "\(.dir) \(.method) \(.threadId)"] |
+      index("out turn/completed thread-1") as $done |
+      index("in thread/goal/get thread-1") as $goal |
+      index("in thread/unsubscribe thread-1") as $release |
+      ($done != null) and ($goal != null) and ($release != null) and
+      ($done < $goal) and ($goal < $release)) and
+   (.data.call.result.content[0].text == "APP_SERVER_OK")'
+
+test_codex_app_case "A goal continuation keeps its thread loaded until that turn completes" \
+  "goal-continuation" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.data.unsubscribesAtResult == 0) and
+   (.data.releasedAfterGoal == true) and
+   ([.appTimeline[] | "\(.dir) \(.method) \(.threadId) \(.turnId)"] |
+      index("out thread/goal/updated thread-1 turn-goal-1") as $goalDone |
+      index("out turn/completed thread-1 turn-goal-1") as $turnDone |
+      index("in thread/unsubscribe thread-1 null") as $release |
+      ($goalDone != null) and ($turnDone != null) and ($release != null) and
+      ($goalDone < $turnDone) and ($turnDone < $release)) and
+   (.data.peek.result.structuredContent.turns | length == 0)'
+
+test_codex_app_case "Clearing a held goal lets its thread be released" \
+  "goal-held-clear" \
+  '(.data.unsubscribesBeforeClear == 0) and
+   (.data.clear.result.isError != true) and
+   (.data.releasedAfterClear == true)'
+
+test_codex_app_case "A thread whose active goal is not continued is released after the idle grace" \
+  "goal-stuck" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.data.unsubscribesAtResult == 0) and
+   (.data.releasedAfterGrace == true)'
+
+test_codex_app_case "Threads started with allow_subagents stay loaded" \
+  "subagents-held" \
+  '(.data.call.result.isError != true) and
+   (.data.unsubscribes == 0)'
+
+test_codex_app_case "Detached reviews release the review thread and its source" \
+  "detached-review-release" \
+  '(.data.review.result.isError != true) and
+   (.data.releasedBoth == true)'
+
+test_codex_app_case "Setting an active goal re-subscribes a released thread and releases it later" \
+  "goal-set-resume" \
+  '(.data.goal.result.isError != true) and
+   (.data.releasedAgain == true) and
+   ([.appRequests[] | select(.params.threadId == "thread-1" and
+      (.method == "thread/unsubscribe" or .method == "thread/resume" or
+       .method == "thread/goal/set")) | .method] ==
+      ["thread/unsubscribe","thread/resume","thread/goal/set","thread/unsubscribe"])'
+
+test_codex_app_case "A goal set while Codex is unloading the thread still ends in a release" \
+  "goal-set-closing" \
+  '(.data.goal.result.isError != true) and
+   ([.appRequests[] | select(.method == "thread/resume")] | length == 2) and
+   (.data.releasedAgain == true)'
+
+test_codex_app_case "A thread whose goal cannot be read is released after the idle grace" \
+  "goal-get-error" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.data.unsubscribesAtResult == 0) and
+   (.data.releasedAfterGrace == true)'
+
+test_codex_app_case "A thread started by a canceled call is still released" \
+  "thread-start-late-cancel" \
+  '(.data.released == true)'
+
+test_codex_app_case "A canceled start answered within the cancel grace is still released" \
+  "thread-start-late-in-grace" \
+  '(.data.released == true)'
+
+test_codex_app_case "A canceled start with allow_subagents is released like any idle thread" \
+  "thread-start-late-cancel-subagents" \
+  '(.data.released == true)'
+
+test_codex_app_case "A goal-set whose resume is canceled still releases the thread" \
+  "goal-set-resume-canceled" \
+  '(.data.releasedAgain == true)'
+
+test_codex_app_case "A goal set after Codex reported the thread unloaded does not load it" \
+  "goal-set-after-notloaded" \
+  '(.data.goal.result.isError != true) and
+   ([.appRequests[] | select(.method == "thread/resume")] | length == 0)'
+
+test_codex_app_case "A goal-set resume dropped by thread/closed and then canceled still releases" \
+  "goal-set-closed-canceled" \
+  '(.data.releasedAgain == true)'
+
+test_codex_app_case "A canceled resume answered late after thread/closed is released again" \
+  "goal-set-resume-late-cancel" \
+  '(.data.releasedAfterLateAnswer == true)'
+
+test_codex_app_case "A timed-out resume answered late after thread/closed is released again" \
+  "goal-set-resume-late-timeout" \
+  '(.data.goal.result.isError == true) and
+   (.data.releasedAfterLateAnswer == true)'
+
+test_codex_app_case "A goal set on a released thread Codex no longer has loaded does not load it" \
+  "goal-set-read-notloaded" \
+  '(.data.goal.result.isError != true) and
+   ([.appRequests[] | select(.method == "thread/read")] | length == 1) and
+   ([.appRequests[] | select(.method == "thread/resume")] | length == 0)'
+
+test_codex_app_case "A goal set after archiving the thread does not load it" \
+  "goal-set-after-archive" \
+  '(.data.archive.result.isError != true) and
+   ([.appRequests[] | select(.method == "thread/resume")] | length == 0)'
+
+test_codex_app_case "A canceled resume still releases its thread" \
+  "resume-canceled" \
+  '(.data.released == true)'
+
+test_codex_app_case "A fork is released once it is created" \
+  "threads" \
+  '([.appRequests[] | select(.method == "thread/unsubscribe") | .params.threadId] ==
+      ["thread-forked"])'
+
+test_codex_app_case "A background job releases its thread when the turn completes" \
+  "release-job" \
+  '(.data.status.result.structuredContent.state == "completed") and
+   (.data.released == true) and
+   ([.appRequests[] | select(.method == "thread/unsubscribe") | .params.threadId] ==
+      ["thread-1"])'
+
+test_codex_app_case "Inline reviews release the reviewed thread" \
+  "review" \
+  '(.data.review.result.content[0].text == "REVIEW_OK") and
+   ([.appRequests[] | select(.method == "thread/unsubscribe") | .params.threadId] ==
+      ["thread-review"])'
+
+test_codex_app_case "Interrupted turns release their thread; unfinished ones never do" \
+  "cancel" \
+  '([.appRequests[] | select(.method == "thread/unsubscribe") | .params.threadId] ==
+      ["thread-1"]) and
+   ([.appRequests[].method] |
+      index("turn/interrupt") as $interrupt |
+      index("thread/unsubscribe") as $release |
+      ($interrupt != null) and ($release != null) and ($interrupt < $release))'
+
+test_codex_app_case "A turn whose native completion never arrives keeps its thread" \
+  "cancel-no-native" \
+  '([.appRequests[] | select(.method == "thread/unsubscribe")] | length == 0)'
+
+test_codex_app_case "A reply re-subscribes a released thread and releases it again" \
+  "reply-after-release" \
+  '(.data.reply.result.isError != true) and
+   ([.appRequests[] | select(.params.threadId == "thread-1" and
+      (.method == "turn/start" or .method == "thread/unsubscribe" or
+       .method == "thread/resume")) | .method] ==
+      ["turn/start","thread/unsubscribe","thread/resume","turn/start","thread/unsubscribe"])'
+
+test_codex_app_case "A reply retries a thread that Codex is still unloading" \
+  "resume-closing-once" \
+  '(.data.reply.result.isError != true) and
+   (.data.reply.result.content[0].text == "APP_SERVER_OK") and
+   ([.appRequests[] | select(.method == "thread/resume")] | length == 2)'
+
+test_codex_app_case "A failing unsubscribe never changes results or the generation" \
+  "unsubscribe-error" \
+  '(.data.first.result.content[0].text == "APP_SERVER_OK") and
+   (.data.reply.result.isError != true) and
+   (.appSpawns | length == 1) and
+   (.stderr | contains("unsubscribe failed")) and
+   (.stderr | contains("UnhandledRejection") | not)'
+
+test_codex_app_case "An unanswered unsubscribe never delays the caller" \
+  "unsubscribe-withheld" \
+  '(.data.first.result.content[0].text == "APP_SERVER_OK") and
+   (.data.firstElapsedMs < 1000) and
+   (.data.reply.result.isError != true) and
+   (.appSpawns | length == 1)'
+
+test_codex_app_case "A thread whose turn never started is released" \
+  "turn-start-error" \
+  '(.data.first.result.isError == true) and
+   (.data.reply.result.isError != true) and
+   ([.appRequests[] | select(.method == "thread/unsubscribe") | .params.threadId] ==
+      ["thread-1","thread-1"])'
 
 test_codex_app_case "An unacknowledged archive remains outcome-unknown and leased" \
   "archive-withheld" \
@@ -6972,6 +7639,7 @@ else
   test_codex_app_discovery "codex wrapper-owned App Server discovery"
   test_codex_isolated_runtime "codex real read-only App Server turn uses isolated state"
   test_codex_percall_write "codex real App Server workspace-write grants writes"
+  test_codex_unload_reaps_project_mcp "codex real App Server stops a released thread's project MCP server"
 fi
 
 . "$TEST_REPO_ROOT/test-codex-legacy.sh"

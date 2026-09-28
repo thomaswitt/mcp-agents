@@ -108,6 +108,21 @@ const MAX_CODEX_COMMENTARY_BYTES = 1024 * 1024;
 const MAX_ACTIVE_CODEX_JOBS = 8;
 const MAX_RETAINED_CODEX_JOBS = 32;
 const MAX_EARLY_CODEX_COMPLETIONS = 32;
+// Releasing a finished thread asks Codex for its goal first; neither request may
+// hold a caller's result for long, and neither ever terminates a generation.
+const CODEX_THREAD_RELEASE_TIMEOUT_MS = 5_000;
+// Threads the bridge could not release at once (active goal, native turn still
+// running, work in flight) are re-checked on this cadence.
+const CODEX_THREAD_SWEEP_MS = 10_000;
+// A held thread idle this long is released even while its goal reads active:
+// Codex continues a live goal within moments of going idle, so a longer silence
+// means nothing is continuing it, and the goal resumes at the next reply.
+const CODEX_THREAD_IDLE_GRACE_MS = 30_000;
+// A failed unsubscribe is retried by the sweep this many times in total.
+const CODEX_THREAD_UNSUBSCRIBE_ATTEMPTS = 3;
+// A reply that lands while Codex is unloading a released thread gets "is closing"
+// until the unload finishes (Codex allows its shutdown up to 10 s).
+const CODEX_RESUME_CLOSING_RETRY_MS = 15_000;
 // `codex-reply` takes no cwd — a reply inherits the workspace of the thread it
 // continues — so the only way codex-peek can name a reply's workspace is to
 // remember where each thread was opened. Bounded FIFO; losing an old mapping
@@ -6043,6 +6058,18 @@ async function createCodexRuntime({
       Math.min(MAX_TIMER_DELAY_MS, appMutationTimeoutMs + cancelGraceMs),
     ),
   );
+  const threadSweepMs = testTunableMs(
+    "MCP_AGENTS_TEST_CODEX_THREAD_SWEEP_MS",
+    CODEX_THREAD_SWEEP_MS,
+  );
+  const threadIdleGraceMs = testTunableMs(
+    "MCP_AGENTS_TEST_CODEX_THREAD_IDLE_GRACE_MS",
+    CODEX_THREAD_IDLE_GRACE_MS,
+  );
+  const resumeTimeoutMs = Math.min(
+    MAX_TIMER_DELAY_MS,
+    testTunablePositiveInteger("MCP_AGENTS_TEST_CODEX_RESUME_TIMEOUT_MS", 30_000),
+  );
   const interactionTimeoutMs = testTunableMs(
     "MCP_AGENTS_CODEX_INTERACTION_TIMEOUT_MS",
     CODEX_INTERACTION_TIMEOUT_MS,
@@ -6219,6 +6246,8 @@ async function createCodexRuntime({
   const activeTurns = new Map();
   const activeTurnsByThread = new Map();
   const provisionalTurns = new Map();
+  let threadSweepTimer;
+  let threadSweepRunning = false;
   // Leases held by operations whose App Server generation died before their
   // outcome was known. A stdio bridge released these for free when its process
   // exited; a pooled runtime outlives that, so they are kept here and released
@@ -6682,7 +6711,7 @@ async function createCodexRuntime({
     method,
     params = {},
     timeoutMs = 30_000,
-    { mutating = false, onOutcomeUnknown, signal, deadlineAt } = {},
+    { mutating = false, onOutcomeUnknown, onLateResult, signal, deadlineAt } = {},
   ) => {
     if (!generationState?.alive || app !== generationState) {
       return Promise.reject(appError(
@@ -6734,6 +6763,9 @@ async function createCodexRuntime({
         }
         generationState.pending.delete(id);
         detachAbort(pending);
+        if (pending.onLateResult && pending.dispatched) {
+          generationState.lateResultHooks.set(id, pending.onLateResult);
+        }
         rejectRequest(appError(
           deadlineLimited ? "codex_hard_timeout" : "codex_app_server_timeout",
           deadlineLimited
@@ -6748,6 +6780,7 @@ async function createCodexRuntime({
         dispatched: false,
         outcomeUnknown: false,
         onOutcomeUnknown,
+        onLateResult,
         resolve: resolveRequest,
         reject: rejectRequest,
         timer,
@@ -6767,6 +6800,9 @@ async function createCodexRuntime({
         pending.cancelTimer = setTimeout(() => {
           if (generationState.pending.get(id) !== pending) return;
           generationState.pending.delete(id);
+          if (pending.onLateResult && pending.dispatched) {
+            generationState.lateResultHooks.set(id, pending.onLateResult);
+          }
           detachAbort(pending);
           const error = appError(
             "codex_turn_interrupted",
@@ -6878,6 +6914,7 @@ async function createCodexRuntime({
       } catch (err) {
         if (!isNativeThreadNotFound(err)) throw err;
       }
+      forgetThreadState(generationState, threadId);
       try { unlinkSync(retentionJournalPath); } catch {}
       logErr(`[mcp-agents] expired durable Codex thread ${threadId}`);
       return true;
@@ -7111,7 +7148,7 @@ async function createCodexRuntime({
         completed.error?.message || `Codex turn ${status}`,
       ));
     }
-    if (turn.abandoned) queueMicrotask(() => forgetTurn(turn));
+    if (turn.abandoned) queueMicrotask(() => { forgetTurn(turn).catch(() => {}); });
   };
   const registerTurn = ({
     generationState,
@@ -7207,7 +7244,140 @@ async function createCodexRuntime({
     }
     return turn;
   };
-  const forgetTurn = (turn) => {
+  // Every thread/start, thread/resume, thread/fork and detached review/start
+  // subscribes this connection, and Codex keeps a subscribed thread loaded —
+  // with its per-thread MCP servers and exec sessions running — for as long as
+  // the App Server lives. The bridge therefore tracks the threads it holds and
+  // unsubscribes each one once nothing needs it, so Codex unloads it after
+  // thread_unload_delay and stops those processes; trust and config are
+  // untouched. A thread stays held while any in-process operation owns it,
+  // while Codex is running a native turn on it (a goal continuation), and while
+  // its native goal is still active — until it has been idle for the grace
+  // period, after which nothing is continuing it. Finished work releases its
+  // thread at once; the sweep below re-checks everything else, so a missed
+  // notification can delay a release but never strand a thread.
+  // `except` is the caller's own provisional record. A provisional left in
+  // outcome_unknown pins nothing: if its native turn is really running, the
+  // native-activity tracking keeps the thread held.
+  const threadInUse = (threadId, except) =>
+    [...activeTurns.values()].some((turn) =>
+      turn.threadId === threadId ||
+      turn.sourceThreadId === threadId ||
+      turn.reviewThreadId === threadId) ||
+    [...provisionalTurns.values()].some((provisional) =>
+      provisional !== except &&
+      provisional.threadId === threadId &&
+      provisional.state !== "outcome_unknown" &&
+      !provisional.generationLost);
+  const scheduleThreadSweep = () => {
+    if (threadSweepTimer || threadSweepRunning || shuttingDown || !app?.heldThreads?.size) return;
+    threadSweepTimer = setTimeout(() => {
+      threadSweepTimer = undefined;
+      threadSweepRunning = true;
+      runThreadSweep().catch(() => {}).finally(() => {
+        threadSweepRunning = false;
+        scheduleThreadSweep();
+      });
+    }, threadSweepMs);
+    threadSweepTimer.unref?.();
+  };
+  const holdThread = (generationState, threadId) => {
+    if (!threadId || generationState.heldThreads.has(threadId)) return;
+    generationState.heldThreads.set(threadId, { idleSince: Date.now() });
+    if (app === generationState) scheduleThreadSweep();
+  };
+  const noteThreadActivity = (generationState, threadId, active) => {
+    if (typeof threadId !== "string") return;
+    if (active) {
+      generationState.nativeActive.add(threadId);
+      return;
+    }
+    generationState.nativeActive.delete(threadId);
+    const held = generationState.heldThreads.get(threadId);
+    if (held) held.idleSince = Date.now();
+  };
+  const noGoalError = (err) =>
+    /goals feature is disabled|state db unavailable|does not support goals/iu
+      .test(err?.message ?? "");
+  // Unsubscribes threadId when nothing needs it any more; otherwise keeps it
+  // held for the sweep. The final checks and the unsubscribe frame run in one
+  // synchronous step, and any later resume queues behind the unsubscribe in
+  // Codex's per-thread order, so no newer operation loses its subscription.
+  const releaseThread = async (generationState, threadId) => {
+    const live = () =>
+      Boolean(generationState?.alive && generationState.initialized && app === generationState);
+    if (!threadId || !live()) return;
+    if (generationState.subagentThreads.has(threadId)) {
+      generationState.heldThreads.delete(threadId);
+      return;
+    }
+    holdThread(generationState, threadId);
+    if (threadInUse(threadId) || generationState.nativeActive.has(threadId)) return;
+    let active;
+    try {
+      const result = await requestApp(
+        generationState,
+        "thread/goal/get",
+        { threadId },
+        CODEX_THREAD_RELEASE_TIMEOUT_MS,
+      );
+      active = result?.goal?.status === "active";
+    } catch (err) {
+      // Unreadable goals stay held; the idle grace still releases them.
+      active = noGoalError(err) ? false : undefined;
+    }
+    if (!live()) return;
+    const held = generationState.heldThreads.get(threadId);
+    if (!held || threadInUse(threadId) || generationState.nativeActive.has(threadId)) return;
+    if (active !== false && Date.now() - held.idleSince < threadIdleGraceMs) return;
+    const failures = held.unsubscribeFailures ?? 0;
+    generationState.heldThreads.delete(threadId);
+    generationState.releasedThreads.add(threadId);
+    requestApp(
+      generationState,
+      "thread/unsubscribe",
+      { threadId },
+      CODEX_THREAD_RELEASE_TIMEOUT_MS,
+    ).then((answer) => {
+      if (answer?.status === "notLoaded") generationState.releasedThreads.delete(threadId);
+    }, (err) => {
+      const retry = failures + 1 < CODEX_THREAD_UNSUBSCRIBE_ATTEMPTS && live() &&
+        !generationState.heldThreads.has(threadId);
+      if (retry) {
+        generationState.releasedThreads.delete(threadId);
+        generationState.heldThreads.set(threadId, {
+          idleSince: Date.now(),
+          unsubscribeFailures: failures + 1,
+        });
+        scheduleThreadSweep();
+      }
+      logErr(
+        `[mcp-agents] Codex thread ${threadId} stays loaded; unsubscribe failed` +
+          `${retry ? " (will retry)" : ""}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  };
+  const runThreadSweep = async () => {
+    const generationState = app;
+    if (!generationState?.alive || !generationState.initialized) return;
+    for (const threadId of [...generationState.heldThreads.keys()]) {
+      if (app !== generationState || !generationState.alive) return;
+      // Released or closed since the snapshot: never hold it again from here.
+      if (!generationState.heldThreads.has(threadId)) continue;
+      await releaseThread(generationState, threadId);
+    }
+  };
+  const forgetThreadState = (generationState, threadId) => {
+    if (!generationState || typeof threadId !== "string") return;
+    generationState.heldThreads.delete(threadId);
+    generationState.nativeActive.delete(threadId);
+    generationState.releasedThreads.delete(threadId);
+    generationState.subagentThreads.delete(threadId);
+  };
+  const liveGenerationFor = (turn) =>
+    app?.alive && app.initialized && app.generation === turn.generation ? app : undefined;
+
+  const forgetTurn = async (turn) => {
     if (!turn) return;
     for (const timerName of [
       "idleTimer",
@@ -7228,6 +7398,16 @@ async function createCodexRuntime({
     }
     if (turn.sourceThreadId && activeTurnsByThread.get(turn.sourceThreadId) === turn) {
       activeTurnsByThread.delete(turn.sourceThreadId);
+    }
+    const generationState = turn.generationLost ? undefined : liveGenerationFor(turn);
+    if (generationState) {
+      // Released while this turn's lease is still held. A detached review's
+      // source is held separately and released by the sweep, idle from now.
+      if (turn.sourceThreadId && turn.sourceThreadId !== turn.threadId) {
+        const source = generationState.heldThreads.get(turn.sourceThreadId);
+        if (source) source.idleSince = Date.now();
+      }
+      try { await releaseThread(generationState, turn.threadId); } catch {}
     }
     try { turn.releaseLease?.(); } catch {}
     writeBridgeState();
@@ -7606,10 +7786,22 @@ async function createCodexRuntime({
   const handleAppNotification = (generationState, method, params = {}) => {
     if (app !== generationState || !generationState.alive) return;
     if (method === "turn/completed") {
+      noteThreadActivity(generationState, params.threadId, false);
       const turnId = params.turn?.id;
       const turn = activeTurns.get(turnId);
       if (turn) finishTurn(turn, params);
       else if (turnId) rememberEarlyCompletion(generationState, turnId, params);
+      return;
+    }
+    // Native activity decides when a held thread may be released: a goal
+    // continuation is a turn the bridge never started.
+    if (method === "turn/started") {
+      noteThreadActivity(generationState, params.threadId, true);
+    } else if (method === "thread/status/changed") {
+      noteThreadActivity(generationState, params.threadId, params.status?.type === "active");
+    } else if (method === "thread/closed") {
+      // A resume that follows re-holds the thread itself (resumeThread).
+      forgetThreadState(generationState, params.threadId);
       return;
     }
     const turn = activeTurns.get(params.turnId) ??
@@ -7766,8 +7958,28 @@ async function createCodexRuntime({
     }
     if (Object.hasOwn(message, "id") && typeof message.method !== "string") {
       const pending = generationState.pending.get(message.id);
-      if (!pending || pending.generation !== generationState.generation) return;
-      if (pending.outcomeUnknown || pending.canceled) return;
+      if (!pending) {
+        const lateHook = generationState.lateResultHooks.get(message.id);
+        if (lateHook) {
+          generationState.lateResultHooks.delete(message.id);
+          if (!message.error) {
+            try { lateHook(message.result); } catch {}
+          }
+        }
+        return;
+      }
+      if (pending.generation !== generationState.generation) return;
+      if (pending.outcomeUnknown || pending.canceled) {
+        // The caller gave up, but Codex still acted; let it record what the
+        // late answer created (e.g. a thread that must still be released).
+        // Consumed here, so the cancel timer does not keep it any longer.
+        const lateHook = pending.onLateResult;
+        pending.onLateResult = undefined;
+        if (!message.error) {
+          try { lateHook?.(message.result); } catch {}
+        }
+        return;
+      }
       generationState.pending.delete(message.id);
       clearTimeout(pending.timer);
       pending.detachAbort?.();
@@ -7892,6 +8104,22 @@ async function createCodexRuntime({
       cleaned: false,
       pending: new Map(),
       deferredRequests: new Map(),
+      // Threads this generation's connection subscribes to and has not yet
+      // released, with when each last went idle; and threads Codex is
+      // currently running a turn on.
+      heldThreads: new Map(),
+      nativeActive: new Set(),
+      // Threads this connection unsubscribed that Codex may still have loaded,
+      // until a confirmed resume, a notLoaded unsubscribe answer or
+      // thread/read, thread/closed, archive, retention delete, or an
+      // unsubscribe retry: a goal set there must re-subscribe first.
+      releasedThreads: new Set(),
+      // Threads started with allow_subagents stay loaded for this generation:
+      // a cold resume would drop the opt-in, and their spawned workers are not
+      // released either. A new generation starts with none.
+      subagentThreads: new Set(),
+      // Canceled setup requests whose late answer may still name a thread.
+      lateResultHooks: new Map(),
       buffer: Buffer.alloc(0),
       noiseLines: 0,
     };
@@ -8093,6 +8321,72 @@ async function createCodexRuntime({
       );
     }
   };
+  // A released thread that Codex is still unloading rejects thread/resume with
+  // "is closing; retry …" until its shutdown finishes; retry that one refusal
+  // with a bounded backoff, then the resume loads it fresh.
+  const resumeThread = async (generationState, threadId, { signal, deadlineAt }) => {
+    const retryUntil = Math.min(
+      deadlineAt ?? Infinity,
+      Date.now() + CODEX_RESUME_CLOSING_RETRY_MS,
+    );
+    let delayMs = 50;
+    for (;;) {
+      // Belt and braces: every outcome below re-holds the thread (success, the
+      // catch, and a late answer), because a thread/closed from the unload a
+      // retry waits out drops the hold and an abandoned attempt may still
+      // subscribe it. Holding before each attempt as well keeps the intent
+      // explicit.
+      holdThread(generationState, threadId);
+      try {
+        const resumed = await requestApp(
+          generationState,
+          "thread/resume",
+          { threadId },
+          resumeTimeoutMs,
+          {
+            signal,
+            deadlineAt,
+            // Answered after this call gave up (and possibly after a
+            // thread/closed dropped the hold): Codex subscribed it anyway.
+            onLateResult: () => holdThread(generationState, threadId),
+          },
+        );
+        // The unload a retry waited out broadcast thread/closed, which drops
+        // the hold; a successful resume subscribes again, so hold again. Only
+        // a confirmed resume ends the thread's released-but-loaded state.
+        generationState.releasedThreads.delete(threadId);
+        holdThread(generationState, threadId);
+        return resumed;
+      } catch (err) {
+        holdThread(generationState, threadId);
+        const closing = err?.appServerCode === -32600 &&
+          /\bis closing; retry\b/iu.test(err?.message ?? "");
+        if (!closing || Date.now() + delayMs >= retryUntil) throw err;
+        if (signal?.aborted) {
+          throw appError(
+            "codex_turn_interrupted",
+            "Codex call was canceled while waiting for thread/resume",
+          );
+        }
+        await new Promise((resolveDelay) => {
+          const timer = setTimeout(done, delayMs);
+          function done() {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", done);
+            resolveDelay();
+          }
+          signal?.addEventListener("abort", done, { once: true });
+        });
+        if (signal?.aborted) {
+          throw appError(
+            "codex_turn_interrupted",
+            "Codex call was canceled while waiting for thread/resume",
+          );
+        }
+        delayMs = Math.min(delayMs * 2, 1_000);
+      }
+    }
+  };
   const threadStartConfig = (args) => {
     const config = {
       model_reasoning_effort: args.model_reasoning_effort ?? resolvedEffort,
@@ -8163,7 +8457,9 @@ async function createCodexRuntime({
       return outcome;
     } finally {
       if (!preserveTurn) {
-        if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
+        // Awaited so the lease (and the thread's release) settle before the
+        // caller sees the result; an immediate codex-reply is never busy.
+        if (turn.terminal || turn.safeToRelease) await forgetTurn(turn);
         else turn.abandoned = true;
       }
     }
@@ -8182,6 +8478,7 @@ async function createCodexRuntime({
     const generationState = await awaitSetupBoundary(ensureApp(), signal, deadlineAt);
     let releaseLease;
     let turn;
+    let threadSubscribed = false;
     const provisional = beginProvisionalTurn({
       generationState,
       threadId,
@@ -8196,13 +8493,11 @@ async function createCodexRuntime({
     try {
       if (reply) {
         releaseLease = acquireThreadLease(threadId, "turn");
-        const resumed = await requestApp(
-          generationState,
-          "thread/resume",
-          { threadId },
-          30_000,
-          { signal, deadlineAt },
-        );
+        // Held before the resume is awaited: a resume canceled or timed out
+        // after dispatch may still subscribe, and must still be released.
+        threadSubscribed = true;
+        holdThread(generationState, threadId);
+        const resumed = await resumeThread(generationState, threadId, { signal, deadlineAt });
         workspace ??= {
           cwd: resumed?.thread?.cwd,
           sandbox: resumed?.thread?.sandbox,
@@ -8236,12 +8531,23 @@ async function createCodexRuntime({
             ephemeral: false,
           },
           appMutationTimeoutMs,
-          mutationOptions(provisional, { signal, deadlineAt }),
+          {
+            ...mutationOptions(provisional, { signal, deadlineAt }),
+            // Canceled after dispatch: the new thread still exists, subscribed.
+            onLateResult: (late) => {
+              // No turn ever ran on it, so it is released like any idle thread.
+              const lateId = late?.thread?.id;
+              if (typeof lateId === "string") holdThread(generationState, lateId);
+            },
+          },
         );
         threadId = started?.thread?.id;
         if (!threadId) {
           throw appError("codex_protocol_error", "thread/start returned no thread ID");
         }
+        threadSubscribed = true;
+        if (args.allow_subagents === true) generationState.subagentThreads.add(threadId);
+        holdThread(generationState, threadId);
         updateProvisionalTurn(provisional, { threadId });
         rememberThreadWorkspace(threadId, args.cwd, args.sandbox);
         releaseLease = acquireThreadLease(threadId, "turn");
@@ -8303,8 +8609,13 @@ async function createCodexRuntime({
       }
     } catch (err) {
       if (!isUncertainMutationError(err)) {
-        try { releaseLease?.(); } catch {}
+        // The thread was started or resumed but no turn runs on it (a goal,
+        // turn/start or containment failure): release it like a finished one.
         forgetProvisionalTurn(provisional);
+        if (threadSubscribed) {
+          try { await releaseThread(generationState, threadId); } catch {}
+        }
+        try { releaseLease?.(); } catch {}
       } else {
         retainUncertainLease(releaseLease, generationState);
       }
@@ -8322,7 +8633,7 @@ async function createCodexRuntime({
       const completed = await awaitTurn(turn);
       return { threadId, content: completed.content };
     } finally {
-      if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
+      if (turn.terminal || turn.safeToRelease) await forgetTurn(turn);
       else turn.abandoned = true;
     }
   };
@@ -8350,15 +8661,12 @@ async function createCodexRuntime({
     let releaseTurnLease;
     let turn;
     let reviewThreadId;
+    let sourceSubscribed = false;
     try {
       releaseSourceLease = acquireThreadLease(args.threadId, "review");
-      const resumed = await requestApp(
-        generationState,
-        "thread/resume",
-        { threadId: args.threadId },
-        30_000,
-        { signal, deadlineAt },
-      );
+      sourceSubscribed = true;
+      holdThread(generationState, args.threadId);
+      const resumed = await resumeThread(generationState, args.threadId, { signal, deadlineAt });
       workspace ??= {
         cwd: resumed?.thread?.cwd,
         sandbox: resumed?.thread?.sandbox,
@@ -8379,7 +8687,15 @@ async function createCodexRuntime({
           delivery: args.delivery ?? "inline",
         },
         appMutationTimeoutMs,
-        mutationOptions(provisional, { signal, deadlineAt }),
+        {
+          ...mutationOptions(provisional, { signal, deadlineAt }),
+          onLateResult: (late) => {
+            const lateReviewId = late?.reviewThreadId;
+            if (typeof lateReviewId === "string" && lateReviewId !== args.threadId) {
+              holdThread(generationState, lateReviewId);
+            }
+          },
+        },
       );
       const turnId = response?.turn?.id;
       reviewThreadId = response?.reviewThreadId;
@@ -8402,6 +8718,9 @@ async function createCodexRuntime({
           await generationState.gone;
           throw err;
         }
+        // The detached review thread arrives subscribed; the source stays held
+        // too and is released by the sweep once the review no longer uses it.
+        holdThread(generationState, reviewThreadId);
         releaseSourceLease();
         releaseSourceLease = undefined;
       } else {
@@ -8437,9 +8756,14 @@ async function createCodexRuntime({
       }
     } catch (err) {
       if (!isUncertainMutationError(err)) {
+        // The source was resumed but no review runs on it: release it while
+        // its lease is still held.
+        forgetProvisionalTurn(provisional);
+        if (sourceSubscribed && releaseSourceLease) {
+          try { await releaseThread(generationState, args.threadId); } catch {}
+        }
         try { releaseSourceLease?.(); } catch {}
         try { releaseTurnLease?.(); } catch {}
-        forgetProvisionalTurn(provisional);
       } else {
         retainUncertainLease(releaseSourceLease, generationState);
         retainUncertainLease(releaseTurnLease, generationState);
@@ -8462,7 +8786,7 @@ async function createCodexRuntime({
       const completed = await awaitTurn(turn);
       return { threadId: args.threadId, reviewThreadId, content: completed.content };
     } finally {
-      if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
+      if (turn.terminal || turn.safeToRelease) await forgetTurn(turn);
       else turn.abandoned = true;
     }
   };
@@ -9093,6 +9417,46 @@ async function createCodexRuntime({
               if (Object.hasOwn(args, field)) request[field] = args[field];
             }
           }
+          if (
+            params.name === "codex-goal-set" &&
+            (args.status === undefined || args.status === "active")
+          ) {
+            // An active goal on a loaded thread makes Codex continue at once.
+            // A thread this connection released may still be loaded;
+            // re-subscribe it so the continuation Codex starts there is tracked
+            // and released when done. An unloaded thread only stores the goal
+            // until the next codex-reply, exactly as before.
+            let resubscribe = generationState.releasedThreads.has(args.threadId) &&
+              !threadInUse(args.threadId, provisional);
+            if (confineWorkspaceToProject || resubscribe) {
+              // thread/read does not load the thread. Over HTTP it proves the
+              // thread belongs to this project before anything can run in it;
+              // for a released thread it confirms Codex still has it loaded.
+              const read = await requestApp(generationState, "thread/read", {
+                threadId: args.threadId,
+                includeTurns: false,
+              });
+              if (confineWorkspaceToProject) {
+                assertWorkspaceOutsideState(read?.thread?.cwd);
+                assertWorkspaceInsideProject(read?.thread?.cwd, { required: true });
+              }
+              if (resubscribe && read?.thread?.status?.type === "notLoaded") {
+                generationState.releasedThreads.delete(args.threadId);
+                resubscribe = false;
+              }
+            }
+            if (resubscribe) {
+              // Belt and braces: resumeThread holds the thread around every
+              // attempt, since a canceled or timed-out resume may still
+              // subscribe it and the sweep must still find it.
+              holdThread(generationState, args.threadId);
+              const resumed = await resumeThread(generationState, args.threadId, {
+                signal: ctx.mcpReq.signal,
+              });
+              assertWorkspaceOutsideState(resumed?.thread?.cwd);
+              assertWorkspaceInsideProject(resumed?.thread?.cwd, { required: true });
+            }
+          }
           const result = await requestApp(
             generationState,
             method,
@@ -9100,6 +9464,10 @@ async function createCodexRuntime({
             mutating ? appMutationTimeoutMs : 30_000,
             mutating ? mutationOptions(provisional) : undefined,
           );
+          // A goal change restarts a held thread's idle clock, so a sweep
+          // cannot release it before a continuation it just caused begins.
+          const heldForGoal = generationState.heldThreads.get(args.threadId);
+          if (heldForGoal && mutating) heldForGoal.idleSince = Date.now();
           return toolResult(
             params.name === "codex-goal-clear" ? "Codex thread goal cleared." :
               JSON.stringify(result?.goal ?? result ?? null),
@@ -9172,6 +9540,17 @@ async function createCodexRuntime({
             mutationOptions(provisional),
           );
           const thread = sanitizeThread(result?.thread);
+          // A fork arrives loaded and subscribed with no turn on it. Release it
+          // now unless something else already uses it; the sweep covers that.
+          if (method === "thread/fork" && typeof result?.thread?.id === "string") {
+            if (generationState.subagentThreads.has(args.threadId)) {
+              generationState.subagentThreads.add(result.thread.id);
+            }
+            holdThread(generationState, result.thread.id);
+            try { await releaseThread(generationState, result.thread.id); } catch {}
+          }
+          // Archiving unloads the thread without a thread/closed broadcast.
+          if (method === "thread/archive") forgetThreadState(generationState, args.threadId);
           return toolResult(
             params.name === "codex-thread-archive" ? "Codex thread archived." :
               params.name === "codex-thread-unarchive" ? "Codex thread restored." :
@@ -9261,6 +9640,8 @@ async function createCodexRuntime({
       if (ownerHeartbeat) clearInterval(ownerHeartbeat);
       if (retentionTimer) clearInterval(retentionTimer);
       if (retentionStartupTimer) clearTimeout(retentionStartupTimer);
+      if (threadSweepTimer) clearTimeout(threadSweepTimer);
+      threadSweepTimer = undefined;
       for (const interaction of [...interactions.values()]) {
         settleInteraction(
           interaction,
@@ -9298,7 +9679,7 @@ async function createCodexRuntime({
       let keptLeases = 0;
       for (const turn of [...activeTurns.values()]) {
         if (!turn.generationLost) continue;
-        if (lostGroupGone(turn.lostChildPid)) forgetTurn(turn);
+        if (lostGroupGone(turn.lostChildPid)) forgetTurn(turn).catch(() => {});
         else keptLeases += 1;
       }
       for (const entry of uncertainLeases.splice(0)) {
