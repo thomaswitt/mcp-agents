@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.32.0] - 2026-09-28
+
+### Fixed
+
+- Release each Codex thread once nothing needs it. App Server kept every
+  thread the bridge had started, resumed, or forked loaded for the life of the
+  process, so a trusted project's per-thread MCP servers, background terminals,
+  and code-mode sessions accumulated without bound; one long session carried
+  dozens of MCP server processes. The bridge now unsubscribes right after a
+  completed turn, a setup failure, or a fork, and re-checks held threads every
+  10 seconds: a thread stays loaded while Codex is running a turn on it or its
+  native goal is active, and is released once the goal ends or the thread has
+  been idle for 30 seconds. App Server then unloads it after its unload delay.
+  Trust and project configuration are unchanged, so project `AGENTS.md`
+  instructions still load. Threads started with `allow_subagents` stay loaded.
+- Retry a reply that reaches a thread App Server is still unloading instead of
+  failing with `is closing`.
+
+### Changed
+
+- A goal set with `codex-goal-set` on a thread App Server has already unloaded
+  now continues at the next `codex-reply` instead of immediately. A released
+  thread that is still loaded is re-subscribed first, so its continuation
+  starts at once and stays tracked.
+- Over HTTP, `codex-goal-set` refuses a thread whose workspace lies outside the
+  served project before any work can start in it.
+
 ## [0.31.0] - 2026-09-24
 
 ### Added

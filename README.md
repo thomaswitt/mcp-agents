@@ -645,6 +645,14 @@ the SQLite home, copies authentication and the model cache, writes a minimal
 config, strips external MCP servers and unrelated preferences, and selectively
 mirrors an explicit Fast-mode opt-in.
 
+The minimal config strips the MCP servers of the user's own Codex config. A
+served project's `.codex/config.toml` is a separate layer: once Codex trusts the
+project (App Server trusts a git project on its first write-capable thread),
+that project's MCP servers, hooks, and rules load for its threads, and every
+loaded thread runs its own MCP server processes. The bridge therefore releases
+each thread whose work is finished; see
+[Progress, cancellation, and jobs](#codex-app-server-backed-mcp).
+
 Fast mode is inherited only when both of these settings are present in the
 source Codex config:
 
@@ -709,6 +717,27 @@ While the MCP connection remains open, elapsed time alone never releases
 ownership: native completion or generation termination must prove the writer
 stopped. Client disconnect cancels connection-local jobs and open turns, then
 reaps the private App Server process group within a bounded grace period.
+
+Once the bridge no longer needs a thread it unsubscribes, and App Server
+unloads it after `thread_unload_delay_secs` (60 seconds by default), stopping
+that thread's MCP servers, background terminals, and code-mode session. That
+happens right after a turn completes and its result is captured, after a fork,
+and when a thread was started or resumed but its turn never began. A thread
+stays loaded while Codex is still running a turn on it (such as a goal
+continuation) and while its native goal is `active`; the bridge re-checks held
+threads every 10 seconds and releases them once the goal has completed, paused,
+blocked, hit a limit, or been cleared, or once the thread has been idle for 30
+seconds (nothing is continuing the goal then, and it resumes at the next
+`codex-reply`). A later `codex-reply` resumes a released thread normally; after
+the unload it pays the thread's startup cost again, and a reply that arrives
+while the unload is still finishing is retried. `codex-goal-set` re-subscribes a
+released thread that App Server still has loaded before setting an active goal,
+so a continuation Codex starts there stays tracked; on a thread App Server has
+already unloaded, an active goal is stored and continues at the next
+`codex-reply`. Over HTTP, `codex-goal-set` checks that the thread belongs to the
+served project before it can start anything. Threads started with
+`allow_subagents` stay loaded for the life of the App Server, as their spawned
+workers do.
 
 </details>
 
