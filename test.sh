@@ -2600,6 +2600,7 @@ fs.appendFileSync(spawnFile, `${JSON.stringify({
   homeMode: fileMode(process.env.CODEX_HOME),
   authMode: fileMode(`${process.env.CODEX_HOME}/auth.json`),
   configMode: fileMode(`${process.env.CODEX_HOME}/config.toml`),
+  config: fs.readFileSync(`${process.env.CODEX_HOME}/config.toml`, "utf8"),
   modelsMode: fileMode(`${process.env.CODEX_HOME}/models_cache.json`),
   storage: {
     sessions: linkInfo(`${process.env.CODEX_HOME}/sessions`),
@@ -3567,6 +3568,117 @@ try {
     await mcpInitialize();
     data.first = await call("codex", initialArgs("first generation"));
     data.second = await call("codex", initialArgs("fresh generation"));
+  } else if (scenario === "project-trust") {
+    const { createRequire } = await import("node:module");
+    const { parse } = createRequire(`${serverDir}/package.json`)("smol-toml");
+    const { default: assert } = await import("node:assert/strict");
+    const source = `${stubDir}/real-codex-home/config.toml`;
+    const spawns = () => fs.existsSync(`${stubDir}/app-spawns.jsonl`)
+      ? fs.readFileSync(`${stubDir}/app-spawns.jsonl`, "utf8").trim().split("\n").map(JSON.parse)
+      : [];
+    const workspace = `${stubDir}/workspace`;
+    const sibling = `${stubDir}/sibling`;
+    fs.mkdirSync(sibling);
+    const expected = {
+      [workspace]: { trust_level: "trusted" },
+      [sibling]: { trust_level: "untrusted" },
+      '/literal .#[] path': { trust_level: "trusted" },
+      '/escaped "quote" \\ path': { trust_level: "untrusted" },
+    };
+    const original = [
+      'large_integer = 9223372036854775807',
+      'instructions = """',
+      '[projects."/fake-string"]',
+      'trust_level = "trusted"',
+      '"""',
+      '# projects."/fake-comment".trust_level = "trusted"',
+      '[mcp_servers.private]',
+      'command = "DO_NOT_INHERIT"',
+      '[agents.private]',
+      'config_file = "DO_NOT_INHERIT"',
+      `[projects.${JSON.stringify(workspace)}]`,
+      'trust_level = "trusted"',
+      'unrelated = "DO_NOT_INHERIT"',
+      `[projects.${JSON.stringify(sibling)}]`,
+      "trust_level = 'untrusted'",
+      '[projects]',
+      "'/literal .#[] path' = { trust_level = 'trusted', unrelated = 'DO_NOT_INHERIT' }",
+      `${JSON.stringify('/escaped "quote" \\ path')}.trust_level = "untrusted"`,
+      '"/undecided" = { unrelated = "DO_NOT_INHERIT" }',
+    ].join("\n");
+    const list = () => call("codex-thread-list", {});
+    const checkGeneration = async (projects) => {
+      const result = await list();
+      assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+      const captured = spawns().at(-1);
+      const config = JSON.parse(JSON.stringify(parse(captured.config)));
+      assert.deepEqual(config.projects ?? {}, projects);
+      assert.equal(config.mcp_servers, undefined);
+      assert.deepEqual(config.agents, { enabled: false });
+      assert.equal(captured.config.includes("DO_NOT_INHERIT"), false);
+      assert.equal(captured.configMode, "600");
+      assert.equal(captured.homeMode, "700");
+    };
+    const stopGeneration = async () => {
+      process.kill(spawns().at(-1).pid, "SIGTERM");
+      assert.equal(await waitFor(() => readSidecars().every((s) => s.childPid === null)), true);
+    };
+    fs.writeFileSync(source, original);
+    await mcpInitialize();
+    await checkGeneration(expected);
+    for (const cwd of [workspace, sibling]) {
+      const result = await call("codex", { ...initialArgs(), cwd });
+      assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+    }
+    assert.equal(spawns().length, 1);
+
+    fs.writeFileSync(source, `[projects.${JSON.stringify(workspace)}]\ntrust_level = "untrusted"\n`);
+    await checkGeneration(expected);
+    assert.equal(spawns().length, 1);
+    await stopGeneration();
+    await checkGeneration({ [workspace]: { trust_level: "untrusted" } });
+    await stopGeneration();
+
+    const invalidConfigs = [
+      'SECRET_CONFIG_CONTENT = "unterminated',
+      'projects = "SECRET_CONFIG_CONTENT"',
+      '[projects]\n"/bad" = "SECRET_CONFIG_CONTENT"',
+      '[projects."/bad"]\ntrust_level = "SECRET_CONFIG_CONTENT"',
+      '[projects."/bad"]\ntrust_level = false',
+      '[projects."/bad"]\ntrust_level = "trusted"\ntrust_level = "untrusted"',
+    ];
+    for (const config of invalidConfigs) {
+      fs.writeFileSync(source, config);
+      const result = await list();
+      assert.equal(result.result?.isError, true);
+      assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable");
+      assert.equal(JSON.stringify(result).includes("SECRET_CONFIG_CONTENT"), false);
+      assert.equal(spawns().length, 2);
+      const discovery = await request("tools/list");
+      assert.ok(discovery.result.tools.length > 0);
+      await request("ping");
+    }
+    // A directory at the config path deterministically exercises a read error,
+    // including when the suite runs with privileges that bypass file modes.
+    fs.unlinkSync(source);
+    fs.mkdirSync(source);
+    const unreadable = await list();
+    assert.equal(unreadable.result?.structuredContent?.code, "codex_app_server_unavailable");
+    assert.equal(spawns().length, 2);
+    fs.rmdirSync(source);
+    fs.writeFileSync(source, original);
+    await checkGeneration(expected);
+    await stopGeneration();
+    fs.writeFileSync(source, '[projects."/undecided"]\nunrelated = true\n');
+    await checkGeneration({});
+    await stopGeneration();
+    fs.writeFileSync(source, 'model = "ignored"\n');
+    await checkGeneration({});
+    await stopGeneration();
+    fs.unlinkSync(source);
+    await checkGeneration({});
+    assert.equal(stderr.includes("SECRET_CONFIG_CONTENT"), false);
+    data.trustVerified = true;
   } else if (scenario === "turn-start-withheld") {
     await mcpInitialize();
     data.first = await call("codex", initialArgs("accepted but unacknowledged"));
@@ -4039,13 +4151,22 @@ test_codex_http_case() {
   MCP_AGENTS_TEST_HTTP_DIR="$tmpdir" \
     "$TIMEOUT_CMD" 20 node --input-type=module - \
       "$scenario" "$(pwd)" >"$output_file" 2>&1 <<'EOF'
-import { appendFileSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { spawn } from "node:child_process";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { parse as parseToml } from "smol-toml";
 
 const [scenario, serverDir] = process.argv.slice(2);
 const testDir = process.env.MCP_AGENTS_TEST_HTTP_DIR;
+if (scenario === "pool") {
+  writeFileSync(`${testDir}/real-codex-home/config.toml`, [
+    `[projects.${JSON.stringify(`${testDir}/project-a`)}]`,
+    'trust_level = "trusted"',
+    `[projects.${JSON.stringify(`${testDir}/project-b`)}]`,
+    'trust_level = "untrusted"',
+  ].join("\n"));
+}
 const tokenFile = `${testDir}/bearer-token`;
 const port = await new Promise((resolve, reject) => {
   const probe = createServer();
@@ -4277,6 +4398,14 @@ try {
     await waitFor(() => readJsonl(`${testDir}/app-spawns.jsonl`).length === 2);
     if (readJsonl(`${testDir}/app-spawns.jsonl`).length !== 2) {
       throw new Error("same-root requests did not share one child or projects were not isolated");
+    }
+    for (const captured of readJsonl(`${testDir}/app-spawns.jsonl`)) {
+      const { projects } = parseToml(captured.config);
+      if (Object.keys(projects ?? {}).length !== 2 ||
+          projects[`${testDir}/project-a`]?.trust_level !== "trusted" ||
+          projects[`${testDir}/project-b`]?.trust_level !== "untrusted") {
+        throw new Error("each HTTP project runtime must inherit the complete trust registry");
+      }
     }
     if (countProjectRuntimes() !== 2) {
       throw new Error(`expected two isolated runtimes, got ${countProjectRuntimes()}`);
@@ -5999,6 +6128,7 @@ test_browser_npx_resolution() {
     "$package_dir/node_modules/@modelcontextprotocol/server"
   ln -s "$(pwd)/node_modules/@modelcontextprotocol/node" \
     "$package_dir/node_modules/@modelcontextprotocol/node"
+  ln -s "$(pwd)/node_modules/smol-toml" "$package_dir/node_modules/smol-toml"
   write_browser_mcp_stub "$tmpdir"
   write_browser_lease_stub "$tmpdir"
   write_browser_npx_stub "$tmpdir/bin"
@@ -6368,9 +6498,12 @@ test_claude_job \
 
 
 # App Server adapter contract tests (fast — no real Codex needed).
+test_codex_app_case "Codex inherits project trust per generation and refuses invalid source config" \
+  "project-trust" '(.data.trustVerified == true)' "" "20"
+
 test_codex_http_case "Codex HTTP rejects invalid project roots before MCP dispatch" \
   "roots"
-test_codex_http_case "Codex HTTP pools by canonical root across MCP eras" \
+test_codex_http_case "Codex HTTP pools by canonical root and inherits trust across MCP eras" \
   "pool"
 test_codex_http_case "Codex HTTP recreates runtimes after true idle eviction" \
   "eviction"

@@ -651,11 +651,31 @@ Each App Server generation receives an isolated `CODEX_HOME` and
 `CODEX_SQLITE_HOME`. The bridge links only the durable native goal files into
 the SQLite home, copies authentication and the model cache, writes a minimal
 config, strips external MCP servers and unrelated preferences, and selectively
-mirrors an explicit Fast-mode opt-in.
+mirrors an explicit Fast-mode opt-in and project trust decisions.
+
+Before starting each App Server generation, the bridge reads the source
+`$CODEX_HOME/config.toml` (default: `~/.codex/config.toml`) and copies only
+`projects.<path>.trust_level` entries into the private config. Both `trusted`
+and `untrusted` decisions are preserved for all projects and worktrees; Codex
+applies its own path matching. For example, an existing source entry such as
+this now survives bridge restarts:
+
+```toml
+[projects."/absolute/path/to/project"]
+trust_level = "trusted"
+```
+
+Source trust changes take effect in the next generation; restart the bridge
+when idle to apply them immediately. Runtime trust changes are never written
+back to the source config. A missing source config or absent trust decision
+adds no trust. An unreadable or malformed source config, or invalid project
+trust settings, refuses child startup with `codex_app_server_unavailable`;
+MCP initialization and discovery remain available, and a later call retries
+after the source is corrected. Error messages never include config contents.
 
 The minimal config strips the MCP servers of the user's own Codex config. A
 served project's `.codex/config.toml` is a separate layer: once Codex trusts the
-project (App Server trusts a git project on its first write-capable thread),
+project (through inherited trust or its native trust behavior),
 that project's MCP servers, hooks, and rules load for its threads, and every
 loaded thread runs its own MCP server processes. The bridge therefore releases
 each thread whose work is finished; see
@@ -671,10 +691,10 @@ service_tier = "fast"
 fast_mode = true
 ```
 
-All other normal `~/.codex/config.toml` settings remain private to the user's
-regular Codex sessions. Native subagents stay off unless the initial call sets
-`allow_subagents: true`; even then they are Codex-only in-process workers and
-cannot re-enter this MCP bridge.
+Apart from project trust and explicit Fast mode, normal source config settings
+remain private to the user's regular Codex sessions. Native subagents stay off
+unless the initial call sets `allow_subagents: true`; even then they are
+Codex-only in-process workers and cannot re-enter this MCP bridge.
 
 Workspace-write network access defaults to `true` so commands can reach local
 services. Codex does not provide a localhost-only switch: enabling it permits

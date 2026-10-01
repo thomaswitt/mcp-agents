@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.33.1] - 2026-10-01
+
+### Fixed
+
+- Preserve explicit trusted and untrusted project decisions from the source
+  Codex config in every isolated App Server generation, so trusted project
+  config loads after bridge restarts. New generations re-read those decisions.
+  Invalid or unreadable source configuration refuses child startup with a
+  redacted error while MCP initialization and discovery remain available.
+
 ## [0.33.0] - 2026-10-01
 
 ### Added

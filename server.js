@@ -35,6 +35,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
 import {
   CLIENT_CAPABILITIES_META_KEY,
@@ -2972,6 +2973,47 @@ function readCodexFastModeOptIn(codexHome) {
 }
 
 /**
+ * Read only explicit project trust decisions; never recover a partial registry.
+ * @param {string} codexHome
+ * @returns {Record<string, { trust_level: "trusted" | "untrusted" }>}
+ */
+function readCodexProjectTrust(codexHome) {
+  let source;
+  try {
+    source = readFileSync(join(codexHome, "config.toml"), "utf8");
+  } catch (err) {
+    if (err?.code === "ENOENT") return {};
+    throw new Error("Cannot read source Codex config.toml; check its path and permissions");
+  }
+
+  let config;
+  try {
+    config = parseToml(source, { integersAsBigInt: "asNeeded" });
+  } catch {
+    // Parser errors can quote secrets from unrelated settings in the source.
+    throw new Error("Source Codex config.toml contains invalid TOML; correct it before retrying");
+  }
+  if (!Object.hasOwn(config, "projects")) return {};
+  const isTable = (value) => value !== null && typeof value === "object" &&
+    (Object.getPrototypeOf(value) === null || Object.getPrototypeOf(value) === Object.prototype);
+  const invalidTrust = () => new Error(
+    "Source Codex config.toml has invalid project trust settings; " +
+    "projects must be tables with trust_level set to trusted or untrusted when present",
+  );
+  if (!isTable(config.projects)) throw invalidTrust();
+  const entries = [];
+  for (const [path, project] of Object.entries(config.projects)) {
+    if (!isTable(project)) throw invalidTrust();
+    if (!Object.hasOwn(project, "trust_level")) continue;
+    if (project.trust_level !== "trusted" && project.trust_level !== "untrusted") {
+      throw invalidTrust();
+    }
+    entries.push([path, { trust_level: project.trust_level }]);
+  }
+  return Object.fromEntries(entries);
+}
+
+/**
  * Probe the installed codex binary's version once at bridge startup.
  * @returns {{ major: number, minor: number, patch: number } | undefined}
  */
@@ -3026,7 +3068,7 @@ function toTomlString(value) {
 
 /**
  * Build the minimal config for the isolated Codex bridge runtime.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }> }} opts
  * @returns {string}
  */
 function buildCodexBridgeConfig({
@@ -3037,6 +3079,7 @@ function buildCodexBridgeConfig({
   workspaceNetworkAccess,
   fastModeEnabled,
   agentsEnabledKeySupported,
+  projectTrust,
 }) {
   return [
     `model = ${toTomlString(model)}`,
@@ -3072,6 +3115,7 @@ function buildCodexBridgeConfig({
     // codexSupportsAgentsEnabledKey), and the feature flag still gates the
     // collab tools on those versions.
     ...(agentsEnabledKeySupported ? ["[agents]", "enabled = false", ""] : []),
+    ...(Object.keys(projectTrust).length ? [stringifyToml({ projects: projectTrust })] : []),
   ].join("\n");
 }
 
@@ -3098,7 +3142,7 @@ function prepareIsolatedCodexHomesRoot(
 
 /**
  * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
- * @param {{ homesRoot: string, sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean }} opts
+ * @param {{ homesRoot: string, sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }> }} opts
  * @returns {string}
  */
 function createIsolatedCodexHome({
@@ -3111,6 +3155,7 @@ function createIsolatedCodexHome({
   workspaceNetworkAccess,
   fastModeEnabled,
   agentsEnabledKeySupported,
+  projectTrust,
 }) {
   const codexHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-"));
   // If auth copy or config write throws after the dir exists, remove the
@@ -3150,6 +3195,7 @@ function createIsolatedCodexHome({
         workspaceNetworkAccess,
         fastModeEnabled,
         agentsEnabledKeySupported,
+        projectTrust,
       }),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -8060,6 +8106,12 @@ async function createCodexRuntime({
   };
 
   const prepareGenerationStorage = () => {
+    let projectTrust;
+    try {
+      projectTrust = readCodexProjectTrust(sourceCodexHome);
+    } catch (err) {
+      throw appError("codex_app_server_unavailable", err.message);
+    }
     const homesRoot = prepareIsolatedCodexHomesRoot(durableRuntime);
     let swept = 0;
     try {
@@ -8092,6 +8144,7 @@ async function createCodexRuntime({
       workspaceNetworkAccess: resolvedNetwork,
       fastModeEnabled,
       agentsEnabledKeySupported,
+      projectTrust,
     });
     const sqliteHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-sqlite-"));
     chmodSync(sqliteHome, 0o700);
