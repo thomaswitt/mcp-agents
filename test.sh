@@ -335,6 +335,7 @@ const projectRoot = process.cwd();
 if (scenario === "shutdown" || scenario === "disconnect") {
   writeFileSync(`${tmpdir}/agy`, `#!/usr/bin/env node
 import { writeFileSync } from "node:fs";
+if (process.argv[2] === "--version") { console.log("1.1.21"); process.exit(0); }
 writeFileSync(process.env.MCP_STUB_PROVIDER_PID, String(process.pid));
 setInterval(() => {}, 1000);
 `);
@@ -1231,6 +1232,10 @@ test_provider_shutdown_kills_child() {
 
   cat >"$tmpdir/claude" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' '9.8.7 (Claude Code)'
+  exit 0
+fi
 printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 printf '%s' "$$" > "$MCP_AGENTS_TEST_PID_FILE"
 sleep 30
@@ -1288,6 +1293,128 @@ EOF
     PASS=$((PASS + 1))
   fi
 
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: verify startup logs mcp-agents and the provider CLI version ──
+# The stub starts a background helper with redirected stdio (which must be
+# gone as soon as the probe settles), optionally a detached holder of its
+# stdout (which keeps runCli from settling), then prints $MCP_STUB_CLI_VERSION
+# for --version, or hangs when it is empty. Stdin closes only once the awaited line appears, so a slow
+# startup cannot race the probe. With no expected version line, it waits for
+# the initialize response instead: given a probe timeout above the 4s wait, a
+# probe that blocks the event loop until it times out fails the deadline.
+test_provider_cli_version_log() {
+  local label="$1" provider="$2" command="$3" stub_version="$4" expected="$5"
+  local probe_timeout_ms="${6:-3000}" detached_holder="${7:-}"
+  local tmpdir err_file out_file pid_file helper_pid_file holder_pid_file status pkg_version
+  local listening_line version_line wait_file wait_for
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  err_file="$tmpdir/stderr.txt"
+  out_file="$tmpdir/stdout.txt"
+  pid_file="$tmpdir/stub.pid"
+  helper_pid_file="$tmpdir/helper.pid"
+  holder_pid_file="$tmpdir/holder.pid"
+  pkg_version=$(node -p 'require("./package.json").version')
+
+  cat >"$tmpdir/$command" <<'EOF'
+#!/usr/bin/env bash
+printf '%s' "$$" > "$MCP_STUB_CLI_PID_FILE"
+sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s' "$!" > "$MCP_STUB_CLI_HELPER_PID_FILE"
+if [ -n "$MCP_STUB_CLI_DETACHED_HOLDER" ]; then
+  node -e 'const c = require("child_process").spawn("sleep", ["30"], { detached: true, stdio: ["ignore", "inherit", "ignore"] }); require("fs").writeFileSync(process.argv[1], String(c.pid)); c.unref();' "$MCP_STUB_CLI_HOLDER_PID_FILE"
+fi
+if [ -n "$MCP_STUB_CLI_VERSION" ]; then
+  printf '%s\n' "$MCP_STUB_CLI_VERSION"
+  exit 0
+fi
+exec sleep 30
+EOF
+  chmod +x "$tmpdir/$command"
+
+  if [ -n "$expected" ]; then
+    wait_file="$err_file"
+    wait_for="provider CLI version ($expected"
+  else
+    wait_file="$out_file"
+    wait_for='"id":1'
+  fi
+
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+    for _ in $(seq 1 40); do
+      if grep -qF "$wait_for" "$wait_file" 2>/dev/null; then
+        : >"$tmpdir/seen"
+        for _ in $(seq 1 20); do
+          if [ ! -s "$helper_pid_file" ] || ! kill -0 "$(cat "$helper_pid_file")" 2>/dev/null; then
+            : >"$tmpdir/helper-reaped"
+            break
+          fi
+          sleep 0.05
+        done
+        break
+      fi
+      sleep 0.1
+    done
+  } | PATH="$tmpdir:$PATH" MCP_STUB_CLI_PID_FILE="$pid_file" \
+    MCP_STUB_CLI_HELPER_PID_FILE="$helper_pid_file" \
+    MCP_STUB_CLI_HOLDER_PID_FILE="$holder_pid_file" \
+    MCP_STUB_CLI_DETACHED_HOLDER="$detached_holder" \
+    MCP_STUB_CLI_VERSION="$stub_version" \
+    MCP_AGENTS_TEST_CLI_VERSION_PROBE_TIMEOUT_MS="$probe_timeout_ms" \
+    $TIMEOUT_CMD 8 $SERVER --provider "$provider" >"$out_file" 2>"$err_file"
+  status=$?
+  set -e
+
+  listening_line=$(grep -nF "listening (provider: $provider," "$err_file" | head -1 | cut -d: -f1 || true)
+  version_line=$(grep -nF "provider CLI version (" "$err_file" | head -1 | cut -d: -f1 || true)
+
+  if [ "$status" -ne 0 ]; then
+    red "FAIL: $label (exit $status)"
+    cat "$err_file"
+    FAIL=$((FAIL + 1))
+  elif ! grep -Fq "starting (mcp_agents=$pkg_version, provider=$provider, transport=stdio, node=" "$err_file"; then
+    red "FAIL: $label (missing starting banner)"
+    cat "$err_file"
+    FAIL=$((FAIL + 1))
+  elif [ ! -e "$tmpdir/seen" ] || ! grep -Fq '"id":1' "$out_file"; then
+    red "FAIL: $label (initialize or '$wait_for' did not arrive within 4s)"
+    cat "$err_file"
+    FAIL=$((FAIL + 1))
+  elif [ -n "$expected" ] && { ! grep -Fq "provider CLI version ($expected" "$err_file" ||
+    [ -z "$listening_line" ] || [ "$listening_line" -ge "$version_line" ]; }; then
+    red "FAIL: $label (expected 'provider CLI version ($expected' after the listening line)"
+    cat "$err_file"
+    FAIL=$((FAIL + 1))
+  elif [ -n "$detached_holder" ] && [ ! -s "$holder_pid_file" ]; then
+    red "FAIL: $label (the detached stdout holder never started)"
+    FAIL=$((FAIL + 1))
+  elif [ -n "$expected" ] && [ ! -e "$tmpdir/helper-reaped" ]; then
+    red "FAIL: $label (version probe helper outlived the settled probe)"
+    FAIL=$((FAIL + 1))
+  elif [ -z "$expected" ] && [ -n "$version_line" ]; then
+    red "FAIL: $label (version logged before initialize was answered or after shutdown)"
+    cat "$err_file"
+    FAIL=$((FAIL + 1))
+  elif [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    red "FAIL: $label (version probe still running: $(cat "$pid_file"))"
+    FAIL=$((FAIL + 1))
+  elif [ -s "$helper_pid_file" ] && kill -0 "$(cat "$helper_pid_file")" 2>/dev/null; then
+    red "FAIL: $label (version probe helper outlived the probe: $(cat "$helper_pid_file"))"
+    FAIL=$((FAIL + 1))
+  else
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  fi
+
+  terminate_test_child "$(cat "$holder_pid_file" 2>/dev/null || true)"
+  terminate_test_child "$(cat "$helper_pid_file" 2>/dev/null || true)"
+  terminate_test_child "$(cat "$pid_file" 2>/dev/null || true)"
   rm -rf "$tmpdir"
 }
 
@@ -1555,6 +1682,10 @@ EOF
 write_claude_job_stub() {
   cat >"$1/claude" <<'EOF'
 #!/usr/bin/env node
+if (process.argv[2] === "--version") {
+  process.stdout.write("9.8.7 (Claude Code)\n");
+  process.exit(0);
+}
 const fs = require("fs");
 const path = require("path");
 
@@ -4158,6 +4289,10 @@ try {
         `modern=${modernReadyCount} legacy=${legacyReadyCount}`,
       );
     }
+    const { version } = JSON.parse(readFileSync(`${serverDir}/package.json`, "utf8"));
+    if (!stderr.includes(`, mcp_agents=${version}, codex=0.149.1, app-server lazy, `)) {
+      throw new Error("adapter readiness did not log the mcp-agents and codex versions");
+    }
   } else if (scenario === "eviction") {
     const first = await openClient(`${testDir}/project-a`);
     assertToolText(await first.callTool({
@@ -5935,6 +6070,16 @@ test_no_registered_child_leaks() {
 }
 
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
+test_provider_cli_version_log "claude startup logs mcp-agents and claude versions" \
+  claude claude "9.8.7 (Claude Code)" "claude=9.8.7)"
+test_provider_cli_version_log "gemini startup logs mcp-agents and agy versions" \
+  gemini agy "1.1.21" "agy=1.1.21)"
+test_provider_cli_version_log "a hung --version probe times out with a bounded reason" \
+  claude claude "" "claude=unknown, reason=timed out after 150ms)" 150
+test_provider_cli_version_log "initialize is answered while a hung --version probe is pending" \
+  claude claude "" "" 6000
+test_provider_cli_version_log "a detached holder of the probe's stdout cannot keep it pending" \
+  claude claude "9.8.7 (Claude Code)" "claude=unknown, reason=timed out after 1500ms)" 1500 1
 test_closed_stderr_shutdown "closed stderr exits without an EPIPE shutdown spin"
 test_oversized_frame_shutdown "an over-limit frame shuts down instead of orphaning the bridge"
 

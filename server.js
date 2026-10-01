@@ -64,6 +64,7 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 900_000;
 const DEFAULT_CLAUDE_JOB_TIMEOUT_MS = 7_200_000;
 const DEFAULT_CODEX_TIMEOUT_MS = 7_200_000;
+const CLI_VERSION_PROBE_TIMEOUT_MS = 3_000;
 const DEFAULT_CODEX_MODEL = "gpt-6-astra";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
@@ -1892,6 +1893,61 @@ function runCli(command, args, opts = {}) {
       done(null);
     });
   });
+}
+
+/**
+ * Read a provider CLI's `--version` for the startup log. Runs through runCli
+ * so it resolves the binary exactly like a tool call. Never throws, and always
+ * settles (and calls opts.onSettled once) within its timeout plus one second.
+ * @param {string} command
+ * @param {{ timeoutMs?: number, onSpawn?: Function, onSettled?: Function }} [opts]
+ * @returns {Promise<{ version: string, reason?: string }>}
+ */
+function probeCliVersion(command, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? CLI_VERSION_PROBE_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const timedOut = { version: "unknown", reason: `timed out after ${timeoutMs}ms` };
+  let spawned;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    opts.onSettled?.(spawned?.pid);
+  };
+  const run = runCli(command, ["--version"], {
+    timeoutMs,
+    onSpawn: (info) => {
+      spawned = info;
+      opts.onSpawn?.(info);
+    },
+    onSettled: () => {
+      // Nothing a `--version` run starts may outlive it. Past the deadline
+      // runCli has already killed the group, whose id may since be reused.
+      if (Date.now() - startedAt < timeoutMs) spawned?.killGroup();
+      release();
+    },
+  }).then(({ output }) => {
+    // Cap before matching: the pattern backtracks quadratically on long digit
+    // runs, and this match runs on the event loop after the child is gone.
+    const version = /\d+\.\d+\.\d+/.exec(output.slice(0, 1_000))?.[0];
+    return version
+      ? { version }
+      : { version: "unknown", reason: "no x.y.z in --version output" };
+  }, (err) => (Date.now() - startedAt >= timeoutMs ? timedOut : {
+    version: "unknown",
+    reason: String(err instanceof Error ? err.message : err).slice(0, 200).split("\n")[0],
+  }));
+  // runCli settles on `close`, which a helper outside the killed group can
+  // hold off forever by keeping the output pipe open.
+  let graceTimer;
+  const grace = new Promise((resolve) => {
+    graceTimer = setTimeout(() => {
+      release();
+      resolve(timedOut);
+    }, timeoutMs + 1_000);
+    graceTimer.unref();
+  });
+  return Promise.race([run, grace]).finally(() => clearTimeout(graceTimer));
 }
 
 function buildClaudeReviewArgs() {
@@ -9622,7 +9678,8 @@ async function createCodexRuntime({
     if (!announcedMcpEras.has(era)) {
       announcedMcpEras.add(era);
       logErr(
-        `[mcp-agents] Codex MCP adapter ready (era=${era}, app-server lazy, ` +
+        `[mcp-agents] Codex MCP adapter ready (era=${era}, mcp_agents=${VERSION}, ` +
+          `codex=${versionText}, app-server lazy, ` +
           `model=${resolvedModel}, effort=${resolvedEffort}, sandbox=${resolvedSandbox}, ` +
           `approval=${resolvedApproval}, retention_days=${resolvedRetentionDays}, ` +
           `state=${durableRoot})`,
@@ -10033,6 +10090,11 @@ async function main() {
     return;
   }
 
+  logErr(
+    `[mcp-agents] starting (mcp_agents=${VERSION}, provider=${providerName}, ` +
+      `transport=${transport}, node=${process.versions.node})`,
+  );
+
   if (providerName === "codex") {
     const codexOptions = {
       model,
@@ -10191,6 +10253,34 @@ async function main() {
       isShuttingDown: () => shutdownStarted,
     });
   }
+
+  // Never awaited: a slow `--version` must not delay the transport or the
+  // protocol-era negotiation. Registered like a tool call so shutdown reaps it,
+  // and started only once the transport is up: a failed HTTP bind exits
+  // without draining activeChildren and would orphan a hung probe.
+  const startCliVersionProbe = () => {
+    void probeCliVersion(backend.command, {
+      timeoutMs: testTunableMs(
+        "MCP_AGENTS_TEST_CLI_VERSION_PROBE_TIMEOUT_MS",
+        CLI_VERSION_PROBE_TIMEOUT_MS,
+      ),
+      onSpawn: ({ pid, killGroup }) => {
+        if (!pid) return;
+        activeChildren.set(pid, killGroup);
+      },
+      onSettled: (pid) => {
+        if (!pid) return;
+        activeChildren.delete(pid);
+        maybeFinalizeShutdown();
+      },
+    }).then(({ version, reason }) => {
+      if (shutdownStarted) return;
+      logErr(
+        `[mcp-agents] provider CLI version (${backend.command}=${version}` +
+          `${reason ? `, reason=${reason}` : ""})`,
+      );
+    });
+  };
 
   const properties = {
     prompt: {
@@ -10479,6 +10569,7 @@ async function main() {
         beginShutdown(sig, 128 + SIGNAL_CODES[sig]);
       });
     }
+    startCliVersionProbe();
     return;
   }
 
@@ -10505,6 +10596,7 @@ async function main() {
   logErr(
     `[mcp-agents] listening (provider: ${providerName}, awaiting protocol era)`,
   );
+  startCliVersionProbe();
 
   // Prevent premature exit when stdin EOF arrives before async
   // request handlers (tools/call -> execFile) register active handles.
