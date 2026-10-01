@@ -169,6 +169,14 @@ era)` once the transport accepts input, then `[mcp-agents] ready (provider:
 logs the same pair as `[mcp-agents] Codex MCP adapter listening` and
 `[mcp-agents] Codex MCP adapter ready`. Wait for the listening line, not the
 ready line, to know the bridge accepts traffic. stdout remains MCP-only.
+
+Every provider first logs `[mcp-agents] starting (mcp_agents=<version>,
+provider=<name>, transport=<stdio|http>, node=<version>)`, and the Codex ready
+line carries `mcp_agents=` and `codex=`. The `claude` and `gemini` providers
+run `claude --version` / `agy --version` once in the background and log
+`[mcp-agents] provider CLI version (<claude|agy>=<x.y.z>)`; the probe never
+delays the transport and reports `unknown` with a reason within four seconds
+(a three-second timeout plus a one-second grace).
 Use the Quickstart configuration above if you prefer this mode.
 
 ### Shared HTTP daemon

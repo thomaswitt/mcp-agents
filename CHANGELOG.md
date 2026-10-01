@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.33.0] - 2026-10-01
+
+### Added
+
+- Startup logs now name the versions in use. Every provider first logs
+  `[mcp-agents] starting (mcp_agents=…, provider=…, transport=…, node=…)`.
+  The `Codex MCP adapter ready` line, which an HTTP daemon repeats for every
+  project runtime it creates, now carries `mcp_agents=` and `codex=`. The
+  `claude` and `gemini` providers run `--version` once in the background and
+  log `[mcp-agents] provider CLI version (claude=…)` or `(agy=…)`; a missing,
+  failing, or hung CLI reports `unknown` with a reason within four seconds
+  and never delays the transport.
+
 ## [0.32.0] - 2026-09-28
 
 ### Fixed
