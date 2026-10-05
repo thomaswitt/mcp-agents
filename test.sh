@@ -1690,6 +1690,7 @@ const fs = require("fs");
 const path = require("path");
 
 const captureDir = process.env.MCP_STUB_CLAUDE_CAPTURE_DIR;
+const { spawn } = require("child_process");
 const base = path.join(captureDir, String(process.pid));
 const argv = process.argv.slice(2);
 const streaming = argv.includes("stream-json");
@@ -1699,6 +1700,7 @@ fs.writeFileSync(`${base}.json`, JSON.stringify({
   argv,
   cwd: process.cwd(),
   streaming,
+  startedAt: Date.now(),
 }));
 
 let input = "";
@@ -1727,9 +1729,139 @@ const promptText = (message) => {
     .map((part) => part.text)
     .join("");
 };
+const quotaResponse = () => {
+  if (!prompt.startsWith("QUOTA_")) return false;
+  const model = argv[argv.indexOf("--model") + 1];
+  const attemptFile = path.join(captureDir, "quota-attempt-count");
+  let attempt = 0;
+  try { attempt = Number(fs.readFileSync(attemptFile, "utf8")); } catch {}
+  fs.writeFileSync(attemptFile, String(++attempt));
+  const error = {
+    type: "result", subtype: "success", is_error: true,
+    api_error: "model_requires_usage_credits", api_error_status: 429,
+    terminal_reason: "api_error", num_turns: 1, duration_api_ms: 0,
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 0, output_tokens: 0,
+      cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+      cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+      server_tool_use: { web_search_requests: 0, web_fetch_requests: 0 },
+    },
+    modelUsage: {}, subagent_stats: { spawned: 0 },
+    result: "SENTINEL_QUOTA_PROVIDER_ERROR",
+  };
+  let payload = error;
+  let code = prompt.includes("EXIT0") ? 0 : 1;
+  const apiError = {
+    type: "assistant", is_api_error_message: true,
+    api_error: "model_requires_usage_credits",
+    message: { role: "assistant", content: [
+      { type: "text", text: "SENTINEL_QUOTA_PROVIDER_ERROR" },
+    ] },
+  };
+  if (prompt.includes("WORK")) error.usage.output_tokens = 12;
+  if (prompt.includes("MISSING")) delete error.usage.cache_read_input_tokens;
+  if (prompt.includes("SUBAGENT")) error.subagent_stats.spawned = 1;
+  if (prompt.includes("MODEL_USAGE")) error.modelUsage.opus = { inputTokens: 1 };
+  if (prompt.includes("API_TIME")) error.duration_api_ms = 1;
+  if (prompt.includes("COST")) error.total_cost_usd = 0.01;
+  if (prompt.includes("CACHE_USAGE")) error.usage.cache_creation.ephemeral_5m_input_tokens = 1;
+  if (prompt.includes("SECOND_TURN")) error.num_turns = 2;
+  if (prompt.includes("SERVER_TOOL")) error.usage.server_tool_use.web_search_requests = 1;
+  if (prompt.includes("EXIT2")) code = 2;
+  if (prompt.includes("OVERSIZE")) error.result = "O".repeat((10 * 1024 * 1024) + 1024);
+  if (prompt.includes("WRONG_CODE")) error.api_error = "rate_limit_error";
+  if (prompt.includes("AUTH")) error.api_error = "authentication_error";
+  if (prompt.includes("ARRAY")) {
+    payload = [{ type: "system", subtype: "init" }, apiError, error];
+  }
+  if (prompt === "QUOTA_TOOL") {
+    payload = [{ type: "assistant", message: {
+      content: [{ type: "tool_use", name: "Bash" }],
+    } }, error];
+  }
+  if (prompt.includes("ASSISTANT")) {
+    payload = [{ type: "assistant", message: {
+      content: [{ type: "text", text: "SENTINEL_MODEL_WORK" }],
+    } }, error];
+  }
+  if (prompt.includes("MALFORMED")) payload = "model_requires_usage_credits";
+  if (prompt.includes("TEXT")) {
+    payload = { type: "result", is_error: false,
+      result: "model_requires_usage_credits" };
+    code = 0;
+  }
+  if (prompt.includes("SUCCESS_DRAIN")) {
+    payload = { type: "result", is_error: false, result: "QUOTA_DEFAULT_OK" };
+    code = 0;
+  }
+  if (model === "default" && !prompt.includes("REPEAT")) {
+    payload = { type: "result", is_error: false, result: "QUOTA_DEFAULT_OK" };
+    code = 0;
+    if (prompt.includes("EMPTY_AFTER") &&
+        (attempt === (prompt.includes("EMPTY_BEFORE") ? 3 : 2) ||
+          prompt.includes("TWICE"))) payload.result = "";
+  }
+  if (prompt.includes("EMPTY_BEFORE") && attempt === 1) {
+    payload = {
+      ...(prompt.includes("SAFE") ? error : { type: "result" }),
+      is_error: false, result: "",
+    };
+    code = 0;
+  }
+  const deliver = () => {
+    if (prompt.includes("LATE_DESCENDANT") && model !== "default") {
+      const holder = spawn(process.execPath, ["-e", `
+        const startedAt = Date.now();
+        const waitForParentExit = () => {
+          try { process.kill(Number(process.argv[2]), 0); }
+          catch (error) {
+            if (error.code !== "ESRCH") process.exit(2);
+            setTimeout(() => process.stdout.write(process.argv[1] + "\\n"), 25);
+            return;
+          }
+          if (Date.now() - startedAt > 1000) process.exit(2);
+          setTimeout(waitForParentExit, 5);
+        };
+        waitForParentExit();
+        setInterval(() => {}, 1000);
+      `, JSON.stringify(payload), String(process.pid)], {
+        stdio: ["ignore", process.stdout, process.stderr],
+      });
+      fs.writeFileSync(`${base}.holder`, String(holder.pid));
+      fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${holder.pid}\n`);
+      holder.unref();
+      process.exit(code);
+    }
+    if (streaming) {
+      if (Array.isArray(payload)) payload.forEach(emit);
+      else {
+        if (payload?.is_error === true) emit(apiError);
+        emit(payload);
+      }
+    } else emit(payload);
+    fs.writeFileSync(`${base}.delivered`, "ready");
+    if (prompt.includes("DESCENDANT") && model !== "default") {
+      const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        stdio: ["ignore", process.stdout, process.stderr],
+      });
+      fs.writeFileSync(`${base}.holder`, String(holder.pid));
+      fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${holder.pid}\n`);
+      holder.unref();
+    }
+    if (prompt.includes("HOLD")) return;
+    later(10, () => {
+      if (prompt.includes("SIGNAL") && model !== "default") process.kill(process.pid, "SIGKILL");
+      else process.exit(code);
+    });
+  };
+  later(20, deliver);
+  return true;
+};
 const finishReview = () => {
   if (started) return;
   started = true;
+  if (quotaResponse()) return;
   if (prompt.startsWith("TIMEOUT") || prompt.startsWith("HANG")) {
     emit({ type: "system", subtype: "init", session_id: `stub-${process.pid}` });
     return;
@@ -1844,6 +1976,7 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => {
   if (streaming) return;
   prompt = input;
+  if (quotaResponse()) return;
   emit({
     type: "result",
     subtype: "success",
@@ -1878,10 +2011,10 @@ const child = spawn("node", ["server.js", "--provider", "claude"], {
     PATH: `${stubDir}:${process.env.PATH}`,
     MCP_STUB_CLAUDE_CAPTURE_DIR: captureDir,
     MCP_AGENTS_TEST_CLAUDE_JOB_TIMEOUT_MS:
-      scenario === "timeout" ? "400" : "4000",
+      scenario === "timeout" || scenario.includes("DEADLINE") ? "400" : "4000",
     MCP_AGENTS_TEST_CLAUDE_JOB_RETENTION_MS:
       scenario === "retention" ? "80" : "3600000",
-    MCP_AGENTS_TEST_CLAUDE_CANCEL_TERM_MS: "35",
+    MCP_AGENTS_TEST_CLAUDE_CANCEL_TERM_MS: scenario.includes("DEADLINE") ? "500" : "35",
     MCP_AGENTS_TEST_CLAUDE_CANCEL_KILL_MS: "35",
     MCP_AGENTS_TEST_CLAUDE_MAX_ACTIVE_JOBS:
       scenario === "capacity" ? "2" : "8",
@@ -1993,6 +2126,13 @@ const waitForCaptureCount = async (expected) => {
   }
   throw new Error(`expected ${expected} Claude captures`);
 };
+const waitForQuotaResult = async () => {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (readdirSync(captureDir).some((name) => name.endsWith(".delivered"))) return;
+    await delay(2);
+  }
+  throw new Error("expected quota result before stopping the request");
+};
 const capturedPidForPrompt = (expectedPrompt) => {
   for (const name of readdirSync(captureDir).filter((item) => item.endsWith(".stdin"))) {
     const base = `${captureDir}/${name.slice(0, -6)}`;
@@ -2059,7 +2199,49 @@ try {
   }, 1);
   send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
-  if (scenario === "lifecycle") {
+  if (scenario.startsWith("quota-blocking-")) {
+    const prompt = scenario.slice("quota-blocking-".length);
+    const quotaRequestId = "quota-blocking-request";
+    const quotaStartedAt = Date.now();
+    const quotaRequest = callTool("claude_code", {
+      prompt, timeout_ms: prompt.includes("SUCCESS_DRAIN") ? 400 :
+        prompt.includes("DEADLINE") ? 150 : 2_000,
+    }, quotaRequestId).then((frame) => {
+      data.quotaResult = frame;
+      data.quotaDurationMs = Date.now() - quotaStartedAt;
+    });
+    if (prompt.includes("CANCEL") || prompt.includes("SHUTDOWN")) {
+      quotaRequest.catch(() => {});
+      await waitForQuotaResult();
+      if (prompt.includes("SHUTDOWN")) child.stdin.end();
+      else {
+        send({ jsonrpc: "2.0", method: "notifications/cancelled",
+          params: { requestId: quotaRequestId, reason: "cancel after quota result" } });
+        await delay(120);
+        await ping();
+      }
+    } else {
+      await quotaRequest;
+      await ping();
+    }
+  } else if (scenario.startsWith("quota-background-")) {
+    const prompt = scenario.slice("quota-background-".length);
+    const job = await startJob(prompt);
+    data.quotaJobId = job.jobId;
+    if (prompt.includes("CANCEL") || prompt.includes("SHUTDOWN")) {
+      await waitForQuotaResult();
+      if (prompt.includes("SHUTDOWN")) child.stdin.end();
+      else await cancel(job.jobId);
+    }
+    if (!prompt.includes("SHUTDOWN")) {
+      data.quotaTerminal = await statusUntilTerminal(job.jobId, job.cursor);
+      data.quotaResult = await result(job.jobId);
+      const next = await startJob("NORMAL AFTER QUOTA");
+      data.followupTerminal = await statusUntilTerminal(next.jobId, next.cursor);
+      data.followupResult = await result(next.jobId);
+      await ping();
+    }
+  } else if (scenario === "lifecycle") {
     const job = await startJob("NORMAL");
     const immediate = await status(job.jobId, 0, 0);
     const terminal = await statusUntilTerminal(
@@ -2286,8 +2468,13 @@ const captures = readdirSync(captureDir)
       process.kill(meta.pid, 0);
       alive = true;
     } catch {}
-    return { meta, rawStdin, stdinParsed, signals, alive };
-  });
+    let holderPid;
+    try { holderPid = Number(readFileSync(`${base}.holder`, "utf8")); } catch {}
+    return {
+      meta, rawStdin, stdinParsed, signals, alive,
+      holderPid, holderAlive: pidIsAlive(holderPid),
+    };
+  }).sort((left, right) => left.meta.startedAt - right.meta.startedAt);
 
 if (scenario === "paging") {
   const pageMetrics = (frame) => {
@@ -6214,6 +6401,127 @@ test_closed_stderr_shutdown "closed stderr exits without an EPIPE shutdown spin"
 test_oversized_frame_shutdown "an over-limit frame shuts down instead of orphaning the bridge"
 
 # Stub-based Claude one-shot review tests (fast — no real Claude needed).
+# Claude quota fallback regressions.
+for quota_path in blocking background; do
+  quota_followup=0
+  [ "$quota_path" = background ] && quota_followup=1
+  for quota_variant in NORMAL EXIT0 ARRAY DESCENDANT LATE_DESCENDANT SUCCESS_DRAIN_DESCENDANT EMPTY_AFTER EMPTY_AFTER_TWICE REPEAT WORK MISSING SUBAGENT TOOL ASSISTANT MODEL_USAGE API_TIME COST CACHE_USAGE SECOND_TURN SERVER_TOOL EXIT2 SIGNAL OVERSIZE WRONG_CODE AUTH AUTH_EXIT0 MALFORMED TEXT EMPTY_BEFORE SAFE_EMPTY_BEFORE EMPTY_BEFORE_EMPTY_AFTER; do
+    if [ "$quota_path" = background ]; then
+      case "$quota_variant" in LATE_DESCENDANT|SUCCESS_DRAIN_DESCENDANT) continue ;; esac
+    fi
+    quota_attempts=2
+    quota_success=true
+    quota_models='["claude-fable-5-1","default"]'
+    case "$quota_variant" in
+      EMPTY_AFTER|EMPTY_AFTER_TWICE)
+        quota_attempts=3
+        quota_models='["claude-fable-5-1","default","default"]'
+        [ "$quota_variant" = EMPTY_AFTER_TWICE ] && quota_success=false ;;
+      REPEAT) quota_success=false ;;
+      WORK|MISSING|SUBAGENT|TOOL|ASSISTANT|MODEL_USAGE|API_TIME|COST|CACHE_USAGE|SECOND_TURN|SERVER_TOOL|EXIT2|SIGNAL)
+        if [ "$quota_path" = blocking ]; then
+          quota_attempts=1
+          quota_success=false
+          quota_models='["claude-fable-5-1"]'
+        fi ;;
+      WRONG_CODE|AUTH|AUTH_EXIT0|MALFORMED|OVERSIZE)
+        quota_attempts=1
+        quota_success=false
+        quota_models='["claude-fable-5-1"]' ;;
+      TEXT)
+        quota_attempts=1
+        quota_models='["claude-fable-5-1"]' ;;
+      SUCCESS_DRAIN_DESCENDANT)
+        quota_attempts=1
+        quota_models='["claude-fable-5-1"]' ;;
+      EMPTY_BEFORE|SAFE_EMPTY_BEFORE|EMPTY_BEFORE_EMPTY_AFTER)
+        quota_attempts=3
+        quota_models='["claude-fable-5-1","claude-fable-5-1","default"]'
+        if [ "$quota_path" = blocking ] && [ "$quota_variant" != SAFE_EMPTY_BEFORE ]; then
+          quota_attempts=2
+          quota_success=false
+          quota_models='["claude-fable-5-1","claude-fable-5-1"]'
+        fi
+        [ "$quota_variant" = EMPTY_BEFORE_EMPTY_AFTER ] && quota_success=false ;;
+    esac
+    test_claude_job \
+      "Claude $quota_path quota fallback: $quota_variant" \
+      "quota-$quota_path-QUOTA_$quota_variant" \
+      'def arg_after($argv; $flag): $argv[(($argv | index($flag)) + 1)];
+       def stable_args:
+         . as $args | [range(0; length) as $i |
+           select((["--model", "--fallback-model"] | index($args[$i])) == null) |
+           select($i == 0 or
+             (["--model", "--fallback-model"] | index($args[$i - 1])) == null) |
+           $args[$i]];
+       . as $summary | .captures[0:'"$quota_attempts"'] as $attempts |
+       (.captures | length == '"$((quota_attempts + quota_followup))"') and
+       (.captures | all(.alive == false and .holderAlive == false)) and
+       ($attempts[0].meta.cwd == "'"$(pwd)"'") and
+       (if ("'"$quota_variant"'" | contains("DESCENDANT")) then
+          $attempts[0].holderPid | type == "number" else true end) and
+       (if "'"$quota_variant"'" == "LATE_DESCENDANT" then
+          .data.quotaDurationMs < 1000
+        elif "'"$quota_variant"'" == "SUCCESS_DRAIN_DESCENDANT" then
+          .data.quotaDurationMs >= 350 and .data.quotaDurationMs < 1300
+        else true end) and
+       ([$attempts[].meta.argv | arg_after(.; "--model")] == '"$quota_models"') and
+       ($attempts | all(
+         (.meta.cwd == $attempts[0].meta.cwd) and
+         ((.meta.argv | stable_args) == ($attempts[0].meta.argv | stable_args)) and
+         (.rawStdin == $attempts[0].rawStdin) and
+         (arg_after(.meta.argv; "--effort") == "xhigh") and
+         (if arg_after(.meta.argv; "--model") == "default"
+          then (.meta.argv | index("--fallback-model") == null)
+          else arg_after(.meta.argv; "--fallback-model") == "claude-opus-5" end))) and
+       ((.data.quotaResult.result.isError != true) == '"$quota_success"') and
+       (if '"$quota_success"' then
+          .data.quotaResult.result.content[0].text ==
+            (if "'"$quota_variant"'" == "TEXT" then "model_requires_usage_credits"
+             else "QUOTA_DEFAULT_OK" end)
+        else true end) and
+       (if "'"$quota_path:$quota_variant"'" == "blocking:AUTH_EXIT0" then
+          .data.quotaResult.result.content[0].text == "SENTINEL_QUOTA_PROVIDER_ERROR"
+        else ((.frames | tostring) | contains("SENTINEL_") | not) end) and
+       (.stderr | contains("SENTINEL_") | not) and
+       (if ('"$quota_models"' | index("default")) != null then
+          ((if '"$quota_followup"' == 1 then .frames | tostring else .stderr end) |
+            contains("Fable credits exhausted; retrying with the default model"))
+        else true end) and
+       (.data.pings[-1].result.content[0].text == "pong") and
+       (if '"$quota_followup"' == 1 then
+          (.data.quotaTerminal.result.structuredContent.jobId == .data.quotaJobId) and
+          (.data.quotaResult.result.structuredContent.jobId == .data.quotaJobId) and
+          ([.data.statuses[].result.structuredContent |
+             select(.jobId == $summary.data.quotaJobId) | .cursor] as $cursors |
+            $cursors == ($cursors | sort)) and
+          (arg_after(.captures[-1].meta.argv; "--model") == "claude-fable-5-1") and
+          (.data.followupResult.result.content[0].text == "CLAUDE_REVIEW_OK")
+        else true end)'
+  done
+
+  for quota_stop in CANCEL SHUTDOWN DEADLINE; do
+    quota_stop_followup=$quota_followup
+    [ "$quota_stop" = SHUTDOWN ] && quota_stop_followup=0
+    test_claude_job \
+      "Claude $quota_path quota transition respects $quota_stop" \
+      "quota-$quota_path-QUOTA_HOLD_$quota_stop" \
+      '(.captures | length == '"$((1 + quota_stop_followup))"') and
+       (.captures | all(.alive == false and .holderAlive == false)) and
+       (.captures[0].meta.argv | index("default") == null) and
+       ((.frames | tostring) | contains("SENTINEL_") | not) and
+       (.stderr | contains("SENTINEL_") | not) and
+       (if "'"$quota_stop"'" == "SHUTDOWN" then true
+        elif "'"$quota_path"'" == "background" then
+          (.data.quotaTerminal.result.structuredContent.state ==
+            (if "'"$quota_stop"'" == "CANCEL" then "canceled" else "failed" end)) and
+          (.data.followupResult.result.content[0].text == "CLAUDE_REVIEW_OK")
+        elif "'"$quota_stop"'" == "DEADLINE" then .data.quotaResult.result.isError == true
+        else .data.pings[-1].result.content[0].text == "pong" end)'
+  done
+done
+# End Claude quota fallback regressions.
+
 test_claude_job \
   "Claude background review isolates the leaf CLI and parses fragmented stream-json" \
   "lifecycle" \

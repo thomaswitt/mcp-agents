@@ -205,6 +205,13 @@ const STALE_CODEX_HOME_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
 const DEFAULT_CLAUDE_MODEL = "claude-fable-5-1";
 const DEFAULT_CLAUDE_FALLBACK_MODEL = "claude-opus-5";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
+const CLAUDE_QUOTA_FALLBACK_MESSAGE =
+  "Claude: Fable credits exhausted; retrying with the default model";
+const CLAUDE_QUOTA_DEFAULT_ERROR =
+  "Claude: the default model also requires usage credits; no further retry";
+const CLAUDE_QUOTA_UNSAFE_ERROR =
+  "Claude: Fable credits exhausted; automatic retry withheld because " +
+  "absence of model or tool work could not be established";
 const CODEX_PER_SESSION_MODEL_ARG = "model";
 const CODEX_PER_SESSION_MODELS = [DEFAULT_CODEX_MODEL, "gpt-5.6-terra"];
 const CODEX_PER_SESSION_MODEL_SET = new Set(CODEX_PER_SESSION_MODELS);
@@ -399,15 +406,10 @@ const CLI_BACKENDS = {
     command: "claude",
     toolName: "claude_code",
     description:
-      `Run Claude Code CLI with a prompt (via stdin), pinned to ${DEFAULT_CLAUDE_MODEL} at effort ${DEFAULT_CLAUDE_EFFORT} with automatic fallback to ${DEFAULT_CLAUDE_FALLBACK_MODEL}. Supports prompt + optional timeout_ms only; other arguments (model/effort/config) are ignored.`,
+      `Run Claude Code CLI with a prompt (via stdin), pinned to ${DEFAULT_CLAUDE_MODEL} at effort ${DEFAULT_CLAUDE_EFFORT} with availability fallback to ${DEFAULT_CLAUDE_FALLBACK_MODEL}. Exhausted Fable credits trigger one retry on Claude's default model only when no model or tool work is reported; startup hooks may rerun. Supports prompt + optional timeout_ms only; other arguments (model/effort/config) are ignored.`,
     stdinPrompt: true,
-    buildArgs: () => [
-      "--model",
-      DEFAULT_CLAUDE_MODEL,
-      "--fallback-model",
-      DEFAULT_CLAUDE_FALLBACK_MODEL,
-      "--effort",
-      DEFAULT_CLAUDE_EFFORT,
+    buildArgs: ({ quotaFallback = false } = {}) => [
+      ...buildClaudeModelArgs(quotaFallback),
       "--no-session-persistence",
       "-p",
       "--output-format",
@@ -487,7 +489,7 @@ function toStringArg(value) {
  * `type:"result"` entry holds the answer; both are supported.
  * @param {string} provider
  * @param {string} output
- * @returns {{ text: string, isError: boolean }}
+ * @returns {{ text: string, isError: boolean, quotaExhausted?: boolean, noModelWork?: boolean }}
  */
 function normalizeToolOutput(provider, output) {
   if (provider !== "claude") return { text: output, isError: false };
@@ -515,6 +517,7 @@ function normalizeToolOutput(provider, output) {
       return {
         text: toStringArg(result.result),
         isError: result.is_error === true,
+        ...classifyClaudeResult(result, Array.isArray(parsed) ? parsed : []),
       };
     }
   } catch {
@@ -522,6 +525,73 @@ function normalizeToolOutput(provider, output) {
   }
 
   return { text: output, isError: false };
+}
+
+/**
+ * Classify provider quota failures without exposing their payloads.
+ * Zero usage proves no model work, not absence of startup-hook side effects.
+ * @param {object} result Terminal Claude result event.
+ * @param {object[]} [events] Events accompanying a JSON result.
+ * @returns {{ quotaExhausted: boolean, noModelWork: boolean }}
+ */
+function classifyClaudeResult(result, events = []) {
+  const zeroCounts = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || Array.isArray(value) || depth > 8) {
+      return false;
+    }
+    return Object.values(value).every((count) =>
+      count === 0 || (typeof count === "object" && zeroCounts(count, depth + 1))
+    );
+  };
+  const usage = result.usage;
+  const modelUsage = result.modelUsage;
+  const tokenFields = [
+    "input_tokens", "output_tokens",
+    "cache_creation_input_tokens", "cache_read_input_tokens",
+  ];
+  const hasWorkEvent = events.some((event) =>
+    event?.parent_tool_use_id != null ||
+    (event?.type === "result" && event !== result) ||
+    ["tool_progress", "tool_use_summary", "stream_event"].includes(event?.type) ||
+    (event?.type === "assistant" && (
+      (Array.isArray(event.message?.content) &&
+        event.message.content.some((part) => part?.type === "tool_use")) ||
+      event.is_api_error_message !== true
+    )) ||
+    (event?.type === "user" && Array.isArray(event.message?.content) &&
+      event.message.content.some((part) => part?.type === "tool_result"))
+  );
+  return {
+    quotaExhausted: result.type === "result" && result.is_error === true &&
+      result.api_error === "model_requires_usage_credits",
+    noModelWork: result.num_turns === 1 && result.duration_api_ms === 0 &&
+      (result.total_cost_usd === undefined || result.total_cost_usd === 0) &&
+      tokenFields.every((key) => usage?.[key] === 0) &&
+      modelUsage != null && typeof modelUsage === "object" &&
+      !Array.isArray(modelUsage) && Object.keys(modelUsage).length === 0 &&
+      (usage.server_tool_use === undefined || zeroCounts(usage.server_tool_use)) &&
+      (usage.output_tokens_details === undefined || zeroCounts(usage.output_tokens_details)) &&
+      (usage.cache_creation === undefined || zeroCounts(usage.cache_creation)) &&
+      (usage.iterations === undefined ||
+        (Array.isArray(usage.iterations) && usage.iterations.length === 0)) &&
+      (result.subagent_stats === undefined || zeroCounts(result.subagent_stats)) &&
+      (result.permission_denials === undefined ||
+        (Array.isArray(result.permission_denials) && result.permission_denials.length === 0)) &&
+      !hasWorkEvent,
+  };
+}
+
+/**
+ * Select Claude's runtime default only after a quota rejection.
+ * @param {boolean} quotaFallback Whether this request exhausted Fable credits.
+ * @returns {string[]} Model and effort arguments.
+ */
+function buildClaudeModelArgs(quotaFallback = false) {
+  return [
+    "--model", quotaFallback ? "default" : DEFAULT_CLAUDE_MODEL,
+    ...(quotaFallback ? [] : ["--fallback-model", DEFAULT_CLAUDE_FALLBACK_MODEL]),
+    "--effort", DEFAULT_CLAUDE_EFFORT,
+  ];
 }
 
 /**
@@ -1782,6 +1852,7 @@ function peekResponseId(prefix) {
  *   cwd?: string,
  *   onSpawn?: (childInfo: { pid?: number, killGroup: () => void }) => void,
  *   onSettled?: (pid?: number) => void,
+ *   onExit?: (info: { output: string, killGroup: () => void }) => void,
  *   signal?: AbortSignal,
  * }} [opts]
  * @returns {Promise<{ output: string, stdoutBytes: number, stderrBytes: number, durationMs: number }>}
@@ -1805,6 +1876,8 @@ function runCli(command, args, opts = {}) {
     let stdoutLen = 0;
     let stderrLen = 0;
     let settled = false;
+    let timedOut = false;
+    let exited = false;
 
     const child = spawn(command, args, {
       cwd,
@@ -1856,6 +1929,9 @@ function runCli(command, args, opts = {}) {
         done(new Error(`${command} stdout maxBuffer exceeded`));
       } else {
         stdout += chunk;
+        if (exited && !settled && !timedOut) {
+          opts.onExit?.({ output: stdout, killGroup });
+        }
       }
     });
 
@@ -1871,12 +1947,18 @@ function runCli(command, args, opts = {}) {
 
     // Kill entire process group on timeout (prevents orphan processes).
     const timer = setTimeout(() => {
+      timedOut = true;
       killGroup();
     }, timeoutMs);
     timer.unref();
 
     child.on("error", (err) => {
       done(new Error(`Failed to start ${command}: ${err.message}`));
+    });
+
+    child.on("exit", () => {
+      exited = true;
+      if (!settled && !timedOut) opts.onExit?.({ output: stdout, killGroup });
     });
 
     child.on("close", (code, signal) => {
@@ -1888,7 +1970,11 @@ function runCli(command, args, opts = {}) {
         ]
           .filter(Boolean)
           .join("\n");
-        done(new Error(details));
+        const error = new Error(details);
+        Object.defineProperty(error, "cliFailure", {
+          value: { output: stdout.trimEnd(), code, signal, timedOut },
+        });
+        done(error);
         return;
       }
       done(null);
@@ -1951,14 +2037,14 @@ function probeCliVersion(command, opts = {}) {
   return Promise.race([run, grace]).finally(() => clearTimeout(graceTimer));
 }
 
-function buildClaudeReviewArgs() {
+/**
+ * Build one-shot review arguments without relaxing isolation on a retry.
+ * @param {boolean} quotaFallback Whether Fable credits were exhausted.
+ * @returns {string[]} Claude CLI arguments.
+ */
+function buildClaudeReviewArgs(quotaFallback = false) {
   return [
-    "--model",
-    DEFAULT_CLAUDE_MODEL,
-    "--fallback-model",
-    DEFAULT_CLAUDE_FALLBACK_MODEL,
-    "--effort",
-    DEFAULT_CLAUDE_EFFORT,
+    ...buildClaudeModelArgs(quotaFallback),
     "--no-session-persistence",
     "-p",
     "--input-format",
@@ -1987,6 +2073,7 @@ function claudeJobTools(jobTimeoutMs) {
       name: "claude-start",
       description:
         `Start a one-shot, read-only Claude review in the background. ` +
+        "Exhausted Fable credits trigger one retry on Claude's default model. " +
         `The server-owned deadline is ${jobTimeoutMs}ms; poll claude-status ` +
         "until terminal, then call claude-result.",
       inputSchema: {
@@ -2339,6 +2426,7 @@ function createClaudeJobRuntime({
       const resultBytes = Buffer.byteLength(resultText, "utf8");
       job.attemptResult = {
         isError: event.is_error === true,
+        quotaExhausted: classifyClaudeResult(event).quotaExhausted,
         tooLarge: resultBytes > MAX_BUFFER_BYTES,
         text: resultBytes > MAX_BUFFER_BYTES ? "" : resultText,
       };
@@ -2367,7 +2455,7 @@ function createClaudeJobRuntime({
     job.stdoutBuffer = Buffer.alloc(0);
     let child;
     try {
-      child = spawn(command, buildClaudeReviewArgs(), {
+      child = spawn(command, buildClaudeReviewArgs(job.quotaFallback), {
         cwd: job.cwd,
         detached: true,
         stdio: ["pipe", "pipe", "pipe"],
@@ -2459,6 +2547,20 @@ function createClaudeJobRuntime({
         );
         return;
       }
+      if (attemptResult?.quotaExhausted) {
+        if (Date.now() >= job.deadlineAt) {
+          transitionTerminal(job, "failed", "Claude: timed out before retry");
+          return;
+        }
+        if (job.quotaFallback) {
+          transitionTerminal(job, "failed", CLAUDE_QUOTA_DEFAULT_ERROR);
+          return;
+        }
+        job.quotaFallback = true;
+        setStatus(job, "running", CLAUDE_QUOTA_FALLBACK_MESSAGE);
+        spawnAttempt(job);
+        return;
+      }
       if (attemptResult?.isError) {
         transitionTerminal(job, "failed", "Claude: provider returned an error");
         return;
@@ -2474,9 +2576,13 @@ function createClaudeJobRuntime({
       }
       if (
         attemptResult &&
-        job.attempt < CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS &&
-        Date.now() < job.deadlineAt
+        job.emptyRetries < CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS - 1
       ) {
+        if (Date.now() >= job.deadlineAt) {
+          transitionTerminal(job, "failed", "Claude: timed out before retry");
+          return;
+        }
+        job.emptyRetries += 1;
         setStatus(job, "running", "Claude: retrying after an empty result");
         spawnAttempt(job);
         return;
@@ -2530,6 +2636,8 @@ function createClaudeJobRuntime({
       child: undefined,
       stopRequested: undefined,
       attempt: 0,
+      emptyRetries: 0,
+      quotaFallback: false,
       attemptResult: undefined,
       stdoutBuffer: Buffer.alloc(0),
       waiters: new Set(),
@@ -10457,10 +10565,8 @@ async function main() {
       extraOpts[key] = rawArgs[key] ?? backend.extraProperties[key].default;
     }
 
-    const cliArgs = backend.stdinPrompt
-      ? backend.buildArgs(extraOpts)
-      : backend.buildArgs(prompt, extraOpts);
     let isolatedWorkdir;
+    let reapCliAttempt = () => {};
     const buildCliOpts = (attemptTimeoutMs) => (
       {
         timeoutMs: attemptTimeoutMs,
@@ -10468,9 +10574,15 @@ async function main() {
         ...(backend.stdinPrompt ? { stdinData: prompt } : {}),
         ...(isolatedWorkdir ? { cwd: isolatedWorkdir } : {}),
         onSpawn: ({ pid, killGroup }) => {
+          reapCliAttempt = killGroup;
           if (!pid) return;
           activeChildren.set(pid, killGroup);
         },
+        ...(providerName === "claude" ? {
+          onExit: ({ output, killGroup }) => {
+            if (normalizeToolOutput("claude", output).quotaExhausted) killGroup();
+          },
+        } : {}),
         onSettled: (pid) => {
           if (!pid) return;
           activeChildren.delete(pid);
@@ -10507,82 +10619,98 @@ async function main() {
       }
 
       const startedAt = Date.now();
-      const maxAttempts = providerName === "claude"
-        ? CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS
-        : 1;
-      let lastResult;
-      let lastNormalized = { text: "", isError: false };
+      let attempts = 0;
+      let emptyRetries = 0;
+      let quotaFallback = false;
+      let priorAttemptsWithoutWork = true;
+      const checkRequest = () => {
+        if (ctx.mcpReq.signal?.aborted) {
+          throw new Error(`${backend.command} was canceled by the MCP client`);
+        }
+        if (shutdownStarted) throw new Error("Server is shutting down");
+      };
+      const checkDeadline = () => {
+        const remainingMs = timeoutMs - (Date.now() - startedAt);
+        if (remainingMs <= 0) {
+          throw new Error(`${backend.command} failed: timeout budget exhausted before retry`);
+        }
+        return remainingMs;
+      };
 
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const elapsedMs = Date.now() - startedAt;
-        const remainingMs = timeoutMs - elapsedMs;
-
-        if (remainingMs <= 0) break;
-
-        const result = await runCli(
-          backend.command,
-          cliArgs,
-          buildCliOpts(remainingMs),
-        );
-        lastResult = result;
+      while (true) {
+        checkRequest();
+        const remainingMs = checkDeadline();
+        const cliArgs = backend.stdinPrompt
+          ? backend.buildArgs({ ...extraOpts, quotaFallback })
+          : backend.buildArgs(prompt, extraOpts);
+        attempts += 1;
+        let result;
+        try {
+          result = await runCli(backend.command, cliArgs, buildCliOpts(remainingMs));
+        } catch (err) {
+          checkRequest();
+          const failure = err.cliFailure;
+          if (providerName !== "claude" || !failure || failure.signal ||
+              failure.timedOut || ![0, 1].includes(failure.code) ||
+              !normalizeToolOutput("claude", failure.output).quotaExhausted) {
+            throw err;
+          }
+          result = { output: failure.output };
+        }
+        checkRequest();
         const normalized = normalizeToolOutput(providerName, result.output);
-        lastNormalized = normalized;
+
+        if (normalized.quotaExhausted) {
+          reapCliAttempt();
+          checkDeadline();
+          if (quotaFallback || !priorAttemptsWithoutWork || !normalized.noModelWork) {
+            const message = quotaFallback
+              ? CLAUDE_QUOTA_DEFAULT_ERROR : CLAUDE_QUOTA_UNSAFE_ERROR;
+            logErr(`[mcp-agents] ${message}`);
+            return { content: [{ type: "text", text: message }], isError: true };
+          }
+          quotaFallback = true;
+          logErr(`[mcp-agents] ${CLAUDE_QUOTA_FALLBACK_MESSAGE}`);
+          continue;
+        }
 
         if (normalized.isError) {
           const msg = normalized.text.trim() || `${backend.command} returned is_error=true`;
           logErr(
             `[mcp-agents] tools/call: provider returned error payload (provider=${providerName})`,
           );
-          return {
-            content: [{ type: "text", text: msg }],
-            isError: true,
-          };
+          return { content: [{ type: "text", text: msg }], isError: true };
         }
 
         if (normalized.text.trim()) {
           logErr("[mcp-agents] tools/call: done");
-          return {
-            content: [{ type: "text", text: normalized.text }],
-          };
+          return { content: [{ type: "text", text: normalized.text }] };
         }
 
-        if (attempt < maxAttempts) {
+        priorAttemptsWithoutWork &&= normalized.noModelWork === true;
+        if (providerName === "claude" &&
+            emptyRetries < CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS - 1) {
+          emptyRetries += 1;
           logErr(
             "[mcp-agents] tools/call: empty output; retrying " +
-              `(provider=${providerName}, attempt=${attempt}/${maxAttempts}, ` +
+              `(provider=${providerName}, attempt=${attempts}, ` +
               `duration_ms=${result.durationMs}, timeout_ms=${timeoutMs}, ` +
               `stdout_bytes=${result.stdoutBytes}, stderr_bytes=${result.stderrBytes})`,
           );
+          continue;
         }
-      }
 
-      if (lastResult && !lastNormalized.text.trim()) {
-        const elapsedMs = Date.now() - startedAt;
         const emptyMsg = providerName === "claude"
           ? "claude returned empty output twice (exit 0); treated as failure"
           : `${backend.command} returned empty output (exit 0); treated as failure`;
-
         logErr(
           "[mcp-agents] tools/call: empty output after retries " +
-            `(provider=${providerName}, attempts=${maxAttempts}, ` +
-            `elapsed_ms=${elapsedMs}, timeout_ms=${timeoutMs}, ` +
-            `stdout_bytes=${lastResult.stdoutBytes}, stderr_bytes=${lastResult.stderrBytes})`,
+            `(provider=${providerName}, attempts=${attempts}, ` +
+            `elapsed_ms=${Date.now() - startedAt}, timeout_ms=${timeoutMs}, ` +
+            `stdout_bytes=${result.stdoutBytes}, stderr_bytes=${result.stderrBytes})`,
         );
-        return {
-          content: [{ type: "text", text: emptyMsg }],
-          isError: true,
-        };
+        return { content: [{ type: "text", text: emptyMsg }], isError: true };
       }
-
-      const timeoutMsg = `${backend.command} failed: timeout budget exhausted before retry`;
-      logErr(
-        "[mcp-agents] tools/call: timeout budget exhausted " +
-          `(provider=${providerName}, timeout_ms=${timeoutMs})`,
-      );
-      return {
-        content: [{ type: "text", text: timeoutMsg }],
-        isError: true,
-      };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logErr(msg);

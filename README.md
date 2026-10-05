@@ -323,7 +323,7 @@ A LaunchAgent starts at login and stays running for that user's session.
 | Provider | Best for | Under the hood | State model |
 | --- | --- | --- | --- |
 | `codex` | Implementation, reviews, steering, goals, and resumable sessions | Wrapper-owned MCP adapter over `codex app-server --stdio` | Durable threads and native goals |
-| `claude` | One-shot help and independent read-only reviews | Claude Code CLI, pinned to Fable 5.1 at `xhigh` effort with Opus 5 fallback | Blocking calls and connection-local review jobs |
+| `claude` | One-shot help and independent read-only reviews | Claude Code CLI, Fable 5.1 at `xhigh` effort with Opus 5 availability fallback and guarded default-model quota retry | Blocking calls and connection-local review jobs |
 
 ### Also supported
 
@@ -853,9 +853,19 @@ one hour, pages results at 32,768 Unicode code points, and rejects a final
 result over 10 MiB. Background reviews have a bridge-owned two-hour deadline;
 operators can replace it with `--timeout <seconds>` at server startup.
 
-Claude is pinned to `claude-fable-5-1` at effort `xhigh`, falls back to
-`claude-opus-5` when that model is overloaded or unavailable, and runs as a
-leaf reviewer. It keeps project instructions and repository context but disables
+Each Claude call starts with `claude-fable-5-1` at effort `xhigh` and keeps the
+CLI's native `claude-opus-5` fallback for overload or unavailability. If Claude
+returns the structured error `model_requires_usage_credits`, the bridge can
+retry once with `--model default`, letting Claude resolve the account's current
+default instead of pinning an Opus version. Other rate limits and errors do not
+trigger this switch. Background reviews restart with the same prompt, working
+directory, job ID, and deadline. Blocking calls use the stricter guard below.
+The quota switch and one empty-result retry allow at most three CLI attempts
+within the original timeout; later attempts stay on default after the switch.
+Each independent call starts with Fable again.
+
+Background reviews run as leaf reviewers. They keep project instructions and
+repository context but disable
 hooks, subagents, skills, slash commands, external MCP servers, and mutation
 tools. Only `Read`, `Glob`, `Grep`, and plan-mode read-only `Bash` inspection
 are available. The leaf instruction also forbids test execution, installs,
@@ -875,6 +885,14 @@ are exposed.
 Additional `tools/call` arguments such as `model`, `effort`, or `config` are
 ignored. Calls run with `--output-format json`; the bridge returns the assistant
 `result` text or an MCP error when `is_error=true`.
+
+Blocking quota retries require explicit first-turn metadata showing zero API
+duration and token usage, empty model usage, and no reported tool or subagent
+activity. Missing or contradictory evidence, or model work in an earlier
+attempt, withholds automatic replay and returns a sanitized quota error.
+Blocking calls preserve their hooks and MCP integrations: startup hooks and MCP
+initialization may run again even when no model work occurred. Cancellation,
+shutdown, output limits, and the original deadline take precedence over retry.
 
 </details>
 

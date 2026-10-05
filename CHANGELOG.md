@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.33.2] - 2026-10-05
+
+### Fixed
+
+- Retry Claude once with the account's current default model when Fable returns
+  `model_requires_usage_credits`, while preserving the native Opus 5 fallback
+  for overload or unavailability. Background reviews retain their job identity
+  and deadline; blocking calls require explicit evidence of no model work and
+  report a sanitized quota error when replay is withheld. Blocking startup
+  hooks and MCP initialization may repeat. Retries share the original timeout.
+
 ## [0.33.1] - 2026-10-01
 
 ### Fixed
