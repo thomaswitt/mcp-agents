@@ -7880,7 +7880,7 @@ test_codex_app_case "A deferred foreground question never strands its turn rejec
    (.data.ping.result.content[0].text == "pong") and
    ([.frames[] | select(.method == "elicitation/create")] | length == 1) and
    (.stderr | contains("UnhandledRejection") | not) and
-   (.stderr | contains("(stdin-end)"))' \
+   (.stderr | test("shutting down Codex App Server runtime \\((stdin-end|transport-close)\\)"))' \
   "--approval_policy on-request"
 
 test_codex_app_case "Foreground interactions stay out of the background queue" \

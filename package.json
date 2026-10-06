@@ -1,6 +1,6 @@
 {
   "name": "mcp-agents",
-  "version": "0.33.2",
+  "version": "0.34.0",
   "description": "MCP server that wraps AI CLI tools and proxies Chrome DevTools MCP to remote browser leases",
   "type": "module",
   "scripts": {

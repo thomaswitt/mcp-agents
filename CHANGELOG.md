@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.34.0] - 2026-10-06
+
+### Added
+
+- Codex run results now say which model and reasoning effort were requested
+  and which Codex reported, in `structuredContent.modelSettings`: a
+  `reportedBy` source plus `requested`, `reported`, and a `status` of
+  `confirmed`, `mismatch`, `unreported`, `inherited`, or `rerouted` per field.
+  The same object appears on `codex-start`, `codex-status`, `codex-result`,
+  and on the error result of a turn that started and then failed. The
+  read-back is Codex's session configuration, not per-turn telemetry, and a
+  mismatch never fails the call. Each turn logs
+  `[mcp-agents] Codex turn started (…)`, prefixed `WARNING:` on a mismatch,
+  and a mid-turn model reroute is logged and reported.
+- `codex-thread-read`, `codex-thread-list`, and `codex-thread-fork` pass
+  through a thread's configured `reasoningEffort`.
+
+### Fixed
+
+- A `codex`, `codex-reply`, or `codex-review` call canceled while Codex was
+  still answering `turn/start` or `review/start` no longer leaves the new turn
+  running with its thread locked (`codex_thread_busy`). The bridge now waits
+  for the answer and interrupts the turn, retrying while Codex has not yet
+  activated it. A canceled `codex-steer` no longer makes its turn
+  uninterruptible. A canceled request that Codex never answers terminates its
+  App Server generation, like any unanswered request that changes state.
+
+### Changed
+
+- Update the MCP SDK packages to 2.3.1 (`@modelcontextprotocol/node` 2.1.1). On
+  client EOF the Codex shutdown log may now read `(transport-close)` instead of
+  `(stdin-end)`; shutdown itself is unchanged.
+
 ## [0.33.2] - 2026-10-05
 
 ### Fixed
