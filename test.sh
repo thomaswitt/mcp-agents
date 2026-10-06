@@ -1189,6 +1189,8 @@ EOF
     ([.[] | select(.id == 2)][0].result |
       (.isError != true) and
       (.structuredContent.threadId | type == "string" and length > 0) and
+      (.structuredContent.modelSettings.reasoningEffort ==
+        {requested:"max",reported:"max",status:"confirmed"}) and
       (.structuredContent.content | type == "string" and contains("OK"))) and
     ([.[] | select(
       .method == "codex/event" or
@@ -2810,6 +2812,9 @@ let threadCounter = 0;
 let turnCounter = 0;
 let active = null;
 let turnStartFailed = false;
+let startHeld = false;
+let heldTurnId = null;
+let heldTurnActive = false;
 let lateResume = null;
 const deletedThreads = new Set();
 const goals = new Map();
@@ -2833,6 +2838,7 @@ const thread = (id = "thread-1", turns = []) => ({
   cwd: workspace,
   ephemeral: false,
   modelProvider: "openai",
+  reasoningEffort: "medium",
   preview: "stub preview",
   projectId: null,
   sessionId: `session-${id}`,
@@ -2885,6 +2891,16 @@ function completeActive(text = "APP_SERVER_OK", status = "completed") {
     `${JSON.stringify({ threadId: current.threadId, turnId: current.turnId })}\n`,
   );
   const item = { type: "agentMessage", id: current.itemId, text };
+  if (mode.startsWith("model-rerouted")) {
+    notify("model/rerouted", {
+      threadId: current.threadId,
+      // A reroute of a turn the bridge never started, e.g. a goal continuation.
+      turnId: mode === "model-rerouted-foreign" ? "turn-goal-1" : current.turnId,
+      fromModel: "gpt-6-astra",
+      toModel: "gpt-5.6-terra",
+      reason: "highRiskCyberActivity",
+    });
+  }
   notify("item/started", {
     threadId: current.threadId,
     turnId: current.turnId,
@@ -2938,7 +2954,14 @@ function startTurn(message, review = false, responseExtra = {}) {
 
   const announce = () => {
     respond(message.id, { turn: turn(turnId), ...responseExtra });
-    notify("turn/started", { threadId, turn: turn(turnId) });
+    // Like real Codex, a held turn activates shortly after turn/start is
+    // answered and refuses turn/interrupt until then.
+    if (turnId === heldTurnId) {
+      setTimeout(() => {
+        heldTurnActive = true;
+        notify("turn/started", { threadId, turn: turn(turnId) });
+      }, 60);
+    } else notify("turn/started", { threadId, turn: turn(turnId) });
 
     if ((mode === "die" || mode === "die-first") &&
         (mode === "die" || spawnOrdinal === 1)) {
@@ -2988,8 +3011,11 @@ function startTurn(message, review = false, responseExtra = {}) {
     }
     if (mode === "noise") process.stdout.write("codex diagnostic on stdout\n");
     if (mode === "peek-reply" && turnCounter > 1) return;
+    // A held start's turn runs until the bridge interrupts it; later turns finish.
+    if (turnId === heldTurnId) return;
     if ([
       "park",
+      "steer-held",
       "cancel-no-native",
       "approval",
       "question",
@@ -3056,7 +3082,8 @@ function startTurn(message, review = false, responseExtra = {}) {
     }
     setTimeout(
       () => completeActive(review ? "REVIEW_OK" : "APP_SERVER_OK"),
-      mode === "delayed" ? 400 : 25,
+      // A reroute must not share a stdout chunk with the turn/start answer.
+      mode === "delayed" ? 400 : mode.startsWith("model-rerouted") ? 250 : 25,
     );
   };
 
@@ -3138,6 +3165,41 @@ function startTurn(message, review = false, responseExtra = {}) {
   else announce();
 }
 
+// Holds an answer until the driver writes `${captureDir}/${name}`, so a test
+// can cancel the request first and then choose what Codex says.
+function whenReleased(name, callback) {
+  const poll = setInterval(() => {
+    if (!fs.existsSync(`${captureDir}/${name}`)) return;
+    clearInterval(poll);
+    callback(fs.readFileSync(`${captureDir}/${name}`, "utf8").trim());
+  }, 5);
+}
+
+// The first turn/start or review/start answers on release: "answer" starts the
+// turn, "error" refuses it, "complete-first" reports it finished in the same
+// stdout chunk as the answer.
+function holdStart(message, review, responseExtra = {}) {
+  whenReleased("release-start", (release) => {
+    if (release === "error") {
+      send({ id: message.id, error: { code: -32000, message: "turn start refused" } });
+    } else if (release === "complete-first") {
+      const threadId = responseExtra.reviewThreadId ?? message.params.threadId;
+      const turnId = `turn-${++turnCounter}`;
+      const item = { type: "agentMessage", id: `agent-${turnCounter}`, text: "HELD_DONE" };
+      process.stdout.write(
+        `${JSON.stringify({ method: "turn/completed", params: {
+          threadId, turn: turn(turnId, "completed", [item]),
+        } })}\n${JSON.stringify({ id: message.id, result: {
+          turn: turn(turnId), ...responseExtra,
+        } })}\n`,
+      );
+    } else {
+      heldTurnId = `turn-${turnCounter + 1}`;
+      startTurn(message, review, responseExtra);
+    }
+  });
+}
+
 function onMessage(message) {
   fs.appendFileSync(captureFile, `${JSON.stringify(message)}\n`);
   timeline("in", message.method, message.params?.threadId);
@@ -3180,8 +3242,16 @@ function onMessage(message) {
       const finishStart = () => {
         respond(message.id, {
           thread: value,
-          model: message.params.model || "gpt-6-astra",
+          model: mode === "model-mismatch"
+            ? "gpt-5.6-terra"
+            : message.params.model || "gpt-6-astra",
           modelProvider: "openai",
+          // Real Codex answers with the session's resolved effort.
+          ...(mode === "effort-unreported" ? {} : {
+            reasoningEffort: mode === "effort-mismatch"
+              ? "medium"
+              : message.params.config?.model_reasoning_effort ?? null,
+          }),
           cwd: message.params.cwd,
           approvalPolicy: message.params.approvalPolicy || "never",
           approvalsReviewer: "user",
@@ -3226,8 +3296,10 @@ function onMessage(message) {
       }
       respond(message.id, {
         thread: thread(message.params.threadId),
-        model: "gpt-6-astra",
+        // Neither value is a wrapper default, so a reply proves the read-back.
+        model: "gpt-5.6-terra",
         modelProvider: "openai",
+        reasoningEffort: "max",
         cwd: workspace,
         approvalPolicy: "never",
         approvalsReviewer: "user",
@@ -3240,15 +3312,29 @@ function onMessage(message) {
         send({ id: message.id, error: { code: -32000, message: "turn start exploded" } });
         break;
       }
+      if (mode === "start-held" && !startHeld) {
+        startHeld = true;
+        holdStart(message, false);
+        break;
+      }
       startTurn(message);
       break;
     case "turn/steer":
+      if (mode === "steer-held") {
+        whenReleased("release-steer", () =>
+          respond(message.id, { turnId: message.params.expectedTurnId }));
+        break;
+      }
       respond(message.id, { turnId: message.params.expectedTurnId });
       if (mode === "park") setTimeout(() => completeActive("STEER_OK"), 15);
       break;
     case "turn/interrupt": {
       const interrupted = active;
       if (mode === "cancel-no-native") break;
+      if (interrupted?.turnId === heldTurnId && !heldTurnActive) {
+        send({ id: message.id, error: { code: -32600, message: "no active turn to interrupt" } });
+        break;
+      }
       respond(message.id, {});
       if (interrupted) {
         active = null;
@@ -3311,6 +3397,15 @@ function onMessage(message) {
       });
       break;
     case "review/start":
+      if (mode === "start-held" && !startHeld) {
+        startHeld = true;
+        holdStart(message, true, {
+          reviewThreadId: message.params.delivery === "detached"
+            ? "thread-review-detached"
+            : message.params.threadId,
+        });
+        break;
+      }
       startTurn(
         message,
         true,
@@ -3489,7 +3584,9 @@ const stubMode = {
   "init-timeout-negative": "delayed-initialize",
   "init-timeout-overflow": "delayed-initialize",
   "init-timeout-zero": "delayed-initialize",
-}[scenario] ?? (["peek", "job-compat", "busy", "idle", "cancel", "steer", "hold"].includes(scenario)
+  "cancel-steer": "steer-held",
+}[scenario] ?? (/^cancel-(start|review)-/u.test(scenario) ? "start-held" : null) ??
+  (["peek", "job-compat", "job-idle", "busy", "idle", "cancel", "steer", "hold"].includes(scenario)
   ? "park"
   : ["schema-no-app", "unavailable-call"].includes(scenario)
     ? "unavailable"
@@ -3533,6 +3630,9 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
       : {}),
     ...(["turn-start-withheld", "archive-withheld"].includes(scenario)
       ? { MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS: "120" }
+      : {}),
+    ...(scenario === "cancel-start-silent"
+      ? { MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS: "400" }
       : {}),
     ...(["cancel-no-native", "cancel-during-thread-start", "resume-canceled"].includes(scenario)
       ? { MCP_AGENTS_CODEX_CANCEL_GRACE_MS: "120" }
@@ -3878,9 +3978,11 @@ try {
     await mcpInitialize();
     const callId = nextId;
     const open = call("codex", initialArgs("cancel me")).catch((error) => ({ driverError: error.message }));
-    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
-      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"turn/start"'))) {
-      throw new Error("turn/start was not captured before cancellation");
+    // Cancel a registered turn; the cancel-start-* cases cover an unanswered start.
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const peek = await call("codex-peek", { threadId: "thread-1" });
+      if (peek.result?.structuredContent?.turns?.[0]?.state === "running") break;
+      await sleep(10);
     }
     notify("notifications/cancelled", { requestId: callId, reason: "test" });
     if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
@@ -3890,6 +3992,74 @@ try {
     }
     data.canceled = await Promise.race([open, sleep(250).then(() => null)]);
     data.ping = await request("ping");
+  } else if (/^cancel-(start|review)-/u.test(scenario)) {
+    await mcpInitialize();
+    const review = scenario.startsWith("cancel-review-");
+    const threadId = review ? "thread-review" : "thread-1";
+    const method = review ? "review/start" : "turn/start";
+    const captured = (text) => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes(text);
+    const callId = nextId;
+    void (review
+      ? call("codex-review", {
+        threadId,
+        target: { type: "baseBranch", branch: "main" },
+        delivery: scenario === "cancel-review-detached" ? "detached" : "inline",
+      })
+      : call("codex", initialArgs("canceled in flight"))).catch(() => {});
+    if (!await waitFor(() => captured(`"method":"${method}"`))) {
+      throw new Error(`${method} was not captured before cancellation`);
+    }
+    notify("notifications/cancelled", { requestId: callId, reason: "canceled in flight" });
+    // The bridge has seen the cancel while the start is still unanswered.
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      data.peekWhileWaiting = await call("codex-peek", { threadId });
+      if (data.peekWhileWaiting.result?.structuredContent?.turns?.[0]?.state === "canceling") break;
+      await sleep(10);
+    }
+    data.sidecarsWhileWaiting = readSidecars();
+    if (scenario === "cancel-start-silent") {
+      await waitFor(() => stderr.includes("turn/start timed out after dispatch"), 3000);
+      await sleep(200);
+    } else {
+      fs.writeFileSync(
+        `${stubDir}/release-start`,
+        scenario.endsWith("-error") ? "error"
+          : scenario.endsWith("-completed") ? "complete-first" : "answer",
+      );
+      const released = scenario === "cancel-review-detached" ? "thread-review-detached" : threadId;
+      data.released = await waitFor(() => unsubscribesNow(released) >= 1, 3000);
+      await sleep(100);
+    }
+    data.peekAfter = await call("codex-peek", { threadId });
+    data.sidecarsAfter = readSidecars();
+    data.reply = await call("codex-reply", { threadId, prompt: "after the cancel" });
+    data.canceledResponseCount = frames.filter((frame) => frame.id === callId).length;
+  } else if (scenario === "cancel-steer") {
+    await mcpInitialize();
+    data.started = await call("codex-start", initialArgs("steer target"));
+    const jobId = data.started.result?.structuredContent?.jobId;
+    const captured = (text) => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes(text);
+    const callId = nextId;
+    void call("codex-steer", { threadId: "thread-1", prompt: "late direction" }).catch(() => {});
+    if (!await waitFor(() => captured('"method":"turn/steer"'))) {
+      throw new Error("turn/steer was not captured before cancellation");
+    }
+    notify("notifications/cancelled", { requestId: callId, reason: "steer abandoned" });
+    await sleep(100);
+    fs.writeFileSync(`${stubDir}/release-steer`, "answer");
+    await sleep(100);
+    data.peekAfterSteer = await call("codex-peek", { threadId: "thread-1" });
+    data.cancel = await call("codex-cancel", { jobId });
+    data.interrupted = await waitFor(() => captured('"method":"turn/interrupt"'), 1500);
+    let cursor = 0;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      data.status = await call("codex-status", { jobId, cursor, wait_ms: 500 });
+      const state = data.status.result?.structuredContent?.state;
+      cursor = data.status.result?.structuredContent?.cursor ?? cursor;
+      if (state && !["running", "starting", "canceling"].includes(state)) break;
+    }
   } else if (scenario === "cancel-no-native") {
     await mcpInitialize();
     const callId = nextId;
@@ -4272,6 +4442,22 @@ try {
     await mcpInitialize();
     data.first = await call("codex", initialArgs("authenticate"));
     data.second = await call("codex", initialArgs("must be latched"));
+  } else if (scenario === "effort-default") {
+    await mcpInitialize();
+    const { model, model_reasoning_effort, ...unpinned } = initialArgs("hello");
+    data.call = await call("codex", unpinned);
+  } else if (scenario === "job-idle") {
+    await mcpInitialize();
+    data.started = await call("codex-start", initialArgs("idle background"));
+    const jobId = data.started.result?.structuredContent?.jobId;
+    let cursor = 0;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      data.status = await call("codex-status", { jobId, cursor, wait_ms: 1000 });
+      const state = data.status.result?.structuredContent?.state;
+      cursor = data.status.result?.structuredContent?.cursor ?? cursor;
+      if (state && state !== "running" && state !== "starting") break;
+    }
+    data.result = await call("codex-result", { jobId, offset: 0 });
   } else {
     await mcpInitialize();
     data.call = await call("codex", initialArgs("hello"));
@@ -6951,7 +7137,12 @@ test_codex_app_case "Codex initial calls map to thread/start and turn/start" \
   "normal" \
   '(.data.call.result.isError != true) and
    (.data.call.result.content[0].text == "APP_SERVER_OK") and
-   (.data.call.result.structuredContent == {threadId:"thread-1",content:"APP_SERVER_OK"}) and
+   (.data.call.result.structuredContent == {threadId:"thread-1",content:"APP_SERVER_OK",
+      modelSettings:{reportedBy:"thread_start",
+        model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+        reasoningEffort:{requested:"high",reported:"high",status:"confirmed"}}}) and
+   (.stderr | contains("[mcp-agents] Codex turn started (tool=codex, thread=thread-1, reported_by=thread_start, requested_model=gpt-6-astra, reported_model=gpt-6-astra, model_status=confirmed, requested_effort=high, reported_effort=high, effort_status=confirmed)")) and
+   (.stderr | contains("WARNING: Codex turn started") | not) and
    ([.frames[] | select(.method == "codex/event")] | length == 0) and
    ([.frames[] | select(
       (((.method // "") | startswith("thread/")) or
@@ -6970,6 +7161,73 @@ test_codex_app_case "Codex initial calls map to thread/start and turn/start" \
    ([.appRequests[] | select(.method == "turn/start")][0].params |
      (.threadId == "thread-1") and (.effort == "high") and
      (.input == [{type:"text",text:"hello"}]))'
+
+test_codex_app_case "An unreported reasoning effort is never called confirmed" \
+  "effort-unreported" \
+  '(.data.call.result.isError != true) and
+   (.data.call.result.structuredContent.modelSettings ==
+      {reportedBy:"thread_start",
+       model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+       reasoningEffort:{requested:"high",reported:null,status:"unreported"}}) and
+   (.stderr | contains("reported_effort=none, effort_status=unreported)")) and
+   (.stderr | contains("WARNING: Codex turn started") | not)'
+
+test_codex_app_case "A different reported reasoning effort is a warned mismatch" \
+  "effort-mismatch" \
+  '(.data.call.result.isError != true) and
+   (.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.data.call.result.structuredContent.modelSettings.model.status == "confirmed") and
+   (.data.call.result.structuredContent.modelSettings.reasoningEffort ==
+      {requested:"high",reported:"medium",status:"mismatch"}) and
+   (.stderr | contains("[mcp-agents] WARNING: Codex turn started (tool=codex, thread=thread-1, reported_by=thread_start,")) and
+   (.stderr | contains("requested_effort=high, reported_effort=medium, effort_status=mismatch)"))'
+
+test_codex_app_case "A mid-turn model reroute withdraws the confirmation" \
+  "model-rerouted" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.data.call.result.structuredContent.modelSettings ==
+      {reportedBy:"model_rerouted",
+       model:{requested:"gpt-6-astra",reported:"gpt-5.6-terra",status:"rerouted"},
+       reasoningEffort:{requested:"high",reported:null,status:"rerouted"}}) and
+   (.stderr | contains("[mcp-agents] WARNING: Codex rerouted the model (thread=thread-1, from=gpt-6-astra, to=gpt-5.6-terra, reason=highRiskCyberActivity)")) and
+   ([.frames[] | select((.method // "") == "model/rerouted")] | length == 0)'
+
+test_codex_app_case "A reroute of another turn on the thread leaves the confirmation alone" \
+  "model-rerouted-foreign" \
+  '(.data.call.result.structuredContent.modelSettings ==
+      {reportedBy:"thread_start",
+       model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+       reasoningEffort:{requested:"high",reported:"high",status:"confirmed"}}) and
+   (.stderr | contains("Codex rerouted the model") | not)'
+
+test_codex_app_case "A different reported model is a warned mismatch" \
+  "model-mismatch" \
+  '(.data.call.result.isError != true) and
+   (.data.call.result.structuredContent.modelSettings ==
+      {reportedBy:"thread_start",
+       model:{requested:"gpt-6-astra",reported:"gpt-5.6-terra",status:"mismatch"},
+       reasoningEffort:{requested:"high",reported:"high",status:"confirmed"}}) and
+   (.stderr | contains("[mcp-agents] WARNING: Codex turn started (tool=codex, thread=thread-1, reported_by=thread_start, requested_model=gpt-6-astra, reported_model=gpt-5.6-terra, model_status=mismatch,"))'
+
+test_codex_app_case "Server defaults count as the request when the caller names none" \
+  "effort-default" \
+  '([.appRequests[] | select(.method == "thread/start")][0].params |
+     (.model == "gpt-6-astra") and (.config.model_reasoning_effort == "max")) and
+   (.data.call.result.structuredContent.modelSettings ==
+      {reportedBy:"thread_start",
+       model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+       reasoningEffort:{requested:"max",reported:"max",status:"confirmed"}})' \
+  "--model_reasoning_effort max"
+
+test_codex_app_case "A failed Codex job still reports what it ran with" \
+  "job-idle" \
+  '(.data.status.result.structuredContent.state == "failed") and
+   (.data.status.result.structuredContent.modelSettings.reasoningEffort ==
+      {requested:"high",reported:"high",status:"confirmed"}) and
+   (.data.result.result.isError == true) and
+   (.data.result.result.structuredContent.modelSettings ==
+      .data.started.result.structuredContent.modelSettings)' \
+  "--codex_idle_timeout 0.1"
 
 test_codex_app_case "Codex homes link only allowlisted durable project state" \
   "normal" \
@@ -7002,6 +7260,11 @@ test_codex_app_case "The isolated child CODEX_HOME stays outside every served wo
 test_codex_app_case "Codex replies resume durable threads before starting turns" \
   "reply" \
   '(.data.reply.result.structuredContent.threadId == "thread-resume") and
+   (.data.reply.result.structuredContent.modelSettings ==
+      {reportedBy:"thread_resume",
+       model:{requested:null,reported:"gpt-5.6-terra",status:"inherited"},
+       reasoningEffort:{requested:null,reported:"max",status:"inherited"}}) and
+   (.stderr | contains("Codex turn started (tool=codex-reply, thread=thread-resume, reported_by=thread_resume, requested_model=none, reported_model=gpt-5.6-terra, model_status=inherited, requested_effort=none, reported_effort=max, effort_status=inherited)")) and
    ([.appRequests[] | select(.method == "thread/resume" and
       .params.threadId == "thread-resume")] | length == 1) and
    ([.appRequests[] | select(.method == "turn/start" and
@@ -7056,6 +7319,71 @@ test_codex_app_case "MCP cancellation uses direct turn/interrupt and keeps disco
    length == 1) and
    (.data.ping.result.content[0].text == "pong")'
 
+test_codex_app_case "A turn canceled before Codex answered turn/start is still interrupted" \
+  "cancel-start-answer" \
+  '(.data.peekWhileWaiting.result.structuredContent.turns[0].state == "canceling") and
+   ([.data.sidecarsWhileWaiting[].turns[] | select(
+      .threadId == "thread-1" and .turnId == null and .state == "canceling")] | length == 1) and
+   ([.appRequests[] | select(.method == "turn/interrupt" and
+      .params.threadId == "thread-1" and .params.turnId == "turn-1")] | length >= 2) and
+   (.stderr | contains("interrupt was not confirmed") | not) and
+   (.data.released == true) and
+   (.data.peekAfter.result.structuredContent.count == 0) and
+   ([.data.sidecarsAfter[].turns[]] | length == 0) and
+   (.data.reply.result.content[0].text == "APP_SERVER_OK") and
+   (.data.canceledResponseCount == 0) and
+   (.appSpawns | length == 1)'
+
+test_codex_app_case "A canceled turn start that Codex refuses releases its thread and lease" \
+  "cancel-start-error" \
+  '(.data.peekWhileWaiting.result.structuredContent.turns[0].state == "canceling") and
+   ([.appRequests[] | select(.method == "turn/interrupt")] | length == 0) and
+   (.data.released == true) and
+   (.data.peekAfter.result.structuredContent.count == 0) and
+   (.data.reply.result.content[0].text == "APP_SERVER_OK")'
+
+test_codex_app_case "A canceled turn that finished before its start was answered is not interrupted" \
+  "cancel-start-completed" \
+  '([.appRequests[] | select(.method == "turn/interrupt")] | length == 0) and
+   (.data.released == true) and
+   (.data.peekAfter.result.structuredContent.count == 0) and
+   (.data.reply.result.content[0].text == "APP_SERVER_OK")'
+
+test_codex_app_case "A canceled turn start that is never answered ends its generation" \
+  "cancel-start-silent" \
+  '(.data.peekWhileWaiting.result.structuredContent.turns[0].state == "canceling") and
+   (.stderr | contains("turn/start timed out after dispatch")) and
+   (.data.peekAfter.result.structuredContent.turns[0].state == "outcome_unknown") and
+   (.data.reply.result.structuredContent.code == "codex_thread_busy") and
+   ([.appRequests[] | select(.method == "turn/start")] | length == 1) and
+   ([.appRequests[] | select(.method == "turn/interrupt")] | length == 0)'
+
+test_codex_app_case "A review canceled before Codex answered review/start is still interrupted" \
+  "cancel-review-answer" \
+  '(.data.peekWhileWaiting.result.structuredContent.turns[0].state == "canceling") and
+   ([.appRequests[] | select(.method == "turn/interrupt" and
+      .params.threadId == "thread-review" and .params.turnId == "turn-1")] | length >= 2) and
+   (.stderr | contains("interrupt was not confirmed") | not) and
+   (.data.peekAfter.result.structuredContent.count == 0) and
+   (.data.reply.result.content[0].text == "APP_SERVER_OK")'
+
+test_codex_app_case "A detached review canceled in flight is interrupted on its own thread" \
+  "cancel-review-detached" \
+  '([.appRequests[] | select(.method == "turn/interrupt" and
+      .params.threadId == "thread-review-detached" and .params.turnId == "turn-1")] |
+   length >= 2) and
+   (.stderr | contains("interrupt was not confirmed") | not) and
+   (.data.released == true) and
+   (.data.reply.result.content[0].text == "APP_SERVER_OK")'
+
+test_codex_app_case "A canceled steer leaves its turn interruptible" \
+  "cancel-steer" \
+  '(.data.peekAfterSteer.result.structuredContent.turns[0].state == "running") and
+   (.data.interrupted == true) and
+   ([.appRequests[] | select(.method == "turn/interrupt" and
+      .params.threadId == "thread-1" and .params.turnId == "turn-1")] | length == 1) and
+   (.data.status.result.structuredContent.state == "canceled")'
+
 test_codex_app_case "Canceled foreground calls settle internally without killing siblings" \
   "cancel-no-native" \
   '(.data.registeredBeforeCancel == true) and
@@ -7087,6 +7415,8 @@ test_codex_app_case "Cancellation during thread setup clears provisional livenes
 test_codex_app_case "Idle timeout interrupts one turn without tearing down App Server" \
   "idle" \
   '(.data.call.result.isError == true) and
+   (.data.call.result.structuredContent.modelSettings.reasoningEffort ==
+      {requested:"high",reported:"high",status:"confirmed"}) and
    ([.appRequests[] | select(.method == "turn/interrupt")] | length == 1) and
    (.appSpawns | length == 1) and
    (.data.ping.result.content[0].text == "pong")' \
@@ -7138,6 +7468,7 @@ test_codex_app_case "Codex peek preserves liveness identity without prompt leaka
       (has("jobId")) and
       (has("requestId") | not)) and
    (.data.peek.result | tostring | contains("PRIVATE_PEEK_PROMPT") | not) and
+   (.data.peek.result | tostring | test("modelSettings|reasoningEffort") | not) and
    ([.appRequests[] | select(.method == "turn/interrupt")] | length == 1)'
 
 test_codex_app_case "An empty Codex peek preserves its non-termination warning" \
@@ -7152,6 +7483,7 @@ test_codex_app_case "An empty Codex peek preserves its non-termination warning" 
 test_codex_app_case "Codex peek marks a reply workspace as inherited" \
   "peek-reply" \
   '(.data.initial.result.content[0].text == "APP_SERVER_OK") and
+   (.data.started.result.structuredContent.modelSettings.reportedBy == "thread_resume") and
    (.data.peek.result.structuredContent.turns[0] |
      (.tool == "codex-reply") and (.threadId == "thread-1") and
      (.cwd | endswith("/workspace")) and (.cwdInferred == true)) and
@@ -7181,6 +7513,12 @@ test_codex_app_case "Codex jobs preserve status, commentary, and result contract
   "job" \
   '(.data.started.result.structuredContent.jobId | type == "string") and
    (.data.started.result | tostring | contains("app/") | not) and
+   (.data.started.result.structuredContent.modelSettings.reasoningEffort ==
+      {requested:"high",reported:"high",status:"confirmed"}) and
+   (.data.status.result.structuredContent.modelSettings ==
+      .data.started.result.structuredContent.modelSettings) and
+   (.data.result.result.structuredContent.modelSettings ==
+      .data.started.result.structuredContent.modelSettings) and
    (.data.status.result.structuredContent.state == "completed") and
    (.data.result.result.structuredContent.state == "completed") and
    (.data.result.result.structuredContent.text == "APP_SERVER_OK") and
@@ -7196,6 +7534,10 @@ test_codex_app_case "Review tools use the stable native target union" \
   "review" \
   '([.appRequests[] | select(.method == "review/start")][0].params ==
       {threadId:"thread-review",target:{type:"baseBranch",branch:"main"},delivery:"inline"}) and
+   (.data.review.result.structuredContent.modelSettings ==
+      {reportedBy:"review_source_thread",
+       model:{requested:null,reported:"gpt-5.6-terra",status:"inherited"},
+       reasoningEffort:{requested:null,reported:"max",status:"inherited"}}) and
    (.data.review.result.content[0].text == "REVIEW_OK")'
 
 test_codex_app_case "Exited review-mode items become the public review result" \
@@ -7207,6 +7549,7 @@ test_codex_app_case "Exited review-mode items become the public review result" \
 test_codex_app_case "Detached review threads retain an exclusive writer lease" \
   "detached-review" \
   '(.data.started.result.isError != true) and
+   (.data.started.result.structuredContent.modelSettings.reportedBy == "review_source_thread") and
    (.data.reply.result.isError == true) and
    (.data.reply.result.structuredContent.code == "codex_thread_busy") and
    ([.appRequests[] | select(.method == "review/start")][0].params.delivery == "detached") and
@@ -7228,7 +7571,11 @@ test_codex_app_case "Thread tools map to stable history and lifecycle methods" \
    ([.appRequests[].method | select(. == "thread/archive")] | length == 1) and
    ([.appRequests[].method | select(. == "thread/unarchive")] | length == 1) and
    (.data.read.result.structuredContent | tostring | contains("READ_OK")) and
-   (.data.read.result.structuredContent | tostring | contains("reasoning") | not) and
+   (.data.read.result.structuredContent.thread.reasoningEffort == "medium") and
+   (.data.list.result.structuredContent.threads[0].reasoningEffort == "medium") and
+   (.data.fork.result.structuredContent.thread.reasoningEffort == "medium") and
+   (.data.read.result.structuredContent | del(.thread.reasoningEffort) | tostring |
+     contains("reasoning") | not) and
    (.data.read.result.structuredContent | tostring | contains("SECRET_REASONING") | not)'
 
 # Thread release: a finished thread is unsubscribed so Codex can unload it and
@@ -7450,6 +7797,7 @@ test_codex_modern_interaction_case \
    ([.appRequests[] | select(.method == "thread/resume")] | length == 0) and
    ([.appRequests[] | select(.id == "question-1")][0].result.answers.choice.answers == ["Ship"]) and
    (.result.content[0].text == "INTERACTION_OK") and
+   (.result.structuredContent.modelSettings.reasoningEffort.status == "confirmed") and
    (([.serverFrames, .clientFrames] | tostring) | contains("question-1") | not) and
    (.decodedRequestStates | length == 1) and
    ([.decodedRequestStates[]?.p | keys] == [["bridgeSessionId","callHash","interactionId","toolName","turnId","v"]]) and

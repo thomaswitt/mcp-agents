@@ -6921,7 +6921,14 @@ async function createCodexRuntime({
     method,
     params = {},
     timeoutMs = 30_000,
-    { mutating = false, onOutcomeUnknown, onLateResult, signal, deadlineAt } = {},
+    {
+      mutating = false,
+      onOutcomeUnknown,
+      onCancelRequested,
+      onLateResult,
+      signal,
+      deadlineAt,
+    } = {},
   ) => {
     if (!generationState?.alive || app !== generationState) {
       return Promise.reject(appError(
@@ -6950,7 +6957,6 @@ async function createCodexRuntime({
         const pending = generationState.pending.get(id);
         if (!pending) return;
         if (pending.mutating && pending.dispatched) {
-          pending.outcomeUnknown = true;
           try { pending.onOutcomeUnknown?.(); } catch {}
           logErr(
             `[mcp-agents] ${method} timed out after dispatch; ` +
@@ -6988,8 +6994,8 @@ async function createCodexRuntime({
         method,
         mutating,
         dispatched: false,
-        outcomeUnknown: false,
         onOutcomeUnknown,
+        onCancelRequested,
         onLateResult,
         resolve: resolveRequest,
         reject: rejectRequest,
@@ -6999,11 +7005,25 @@ async function createCodexRuntime({
       const onAbort = () => {
         if (pending.canceled || !generationState.pending.has(id)) return;
         pending.canceled = true;
-        clearTimeout(pending.timer);
-        if (pending.mutating && pending.dispatched) {
-          pending.outcomeUnknown = true;
-          try { pending.onOutcomeUnknown?.(); } catch {}
+        if (!pending.dispatched) {
+          // Nothing reached Codex, so nothing can be running because of it.
+          clearTimeout(pending.timer);
+          generationState.pending.delete(id);
+          detachAbort(pending);
+          rejectRequest(appError(
+            "codex_turn_interrupted",
+            `Codex call was canceled before ${method} was sent`,
+          ));
+          return;
         }
+        if (pending.mutating) {
+          // Only Codex's answer says what the mutation did: it may name a turn
+          // to interrupt, or prove nothing started. Keep waiting for it under
+          // the mutation deadline; no answer ends the generation as usual.
+          try { pending.onCancelRequested?.(); } catch {}
+          return;
+        }
+        clearTimeout(pending.timer);
         const remainingGrace = deadlineAt === undefined
           ? cancelGraceMs
           : Math.max(0, deadlineAt - Date.now());
@@ -7014,12 +7034,10 @@ async function createCodexRuntime({
             generationState.lateResultHooks.set(id, pending.onLateResult);
           }
           detachAbort(pending);
-          const error = appError(
+          rejectRequest(appError(
             "codex_turn_interrupted",
             `Codex call was canceled while waiting for ${method}`,
-          );
-          if (pending.outcomeUnknown) error.mutationOutcomeUnknown = true;
-          rejectRequest(error);
+          ));
         }, Math.min(cancelGraceMs, remainingGrace));
       };
       pending.abortListener = onAbort;
@@ -7374,6 +7392,8 @@ async function createCodexRuntime({
     reviewThreadId,
     sourceThreadId,
     tool,
+    modelSettings,
+    cancelRequested = false,
     cwdInferred = false,
     provisional,
     deadlineAt,
@@ -7407,8 +7427,11 @@ async function createCodexRuntime({
       reviewThreadId,
       sourceThreadId,
       tool,
+      modelSettings,
       cwdInferred,
-      state: "active",
+      // Canceling from birth: no idle timer, no progress, and interactions
+      // Codex raised before this registration fail closed when drained.
+      state: cancelRequested ? "canceling" : "active",
       startedAt: new Date(now).toISOString(),
       updatedAt: new Date(now).toISOString(),
       lastActivityAt: now,
@@ -7417,7 +7440,8 @@ async function createCodexRuntime({
       agentMessages: [],
       finalAnswers: [],
       resolve: resolveTurn,
-      reject: rejectTurn,
+      // A failed run still tells its caller what it ran with.
+      reject: (err) => rejectTurn(Object.assign(err, { modelSettings })),
       completion,
       releaseLease,
       terminal: false,
@@ -7446,7 +7470,24 @@ async function createCodexRuntime({
         `Codex turn exceeded ${resolvedHardMs}ms`,
       ));
     }, Math.max(1, turn.hardDeadlineAt - now));
+    const { model, reasoningEffort } = modelSettings;
+    const mismatch = [model, reasoningEffort].some((field) => field.status === "mismatch");
+    logErr(
+      `[mcp-agents] ${mismatch ? "WARNING: " : ""}Codex turn started ` +
+        `(tool=${tool}, thread=${threadId}, reported_by=${modelSettings.reportedBy}, ` +
+        `requested_model=${model.requested ?? "none"}, ` +
+        `reported_model=${model.reported ?? "none"}, model_status=${model.status}, ` +
+        `requested_effort=${reasoningEffort.requested ?? "none"}, ` +
+        `reported_effort=${reasoningEffort.reported ?? "none"}, ` +
+        `effort_status=${reasoningEffort.status})`,
+    );
     scheduleProgress(turn, "turn started");
+    // The call was canceled while turn/start was in flight, but Codex started
+    // the turn anyway: stop it now, unless Codex already reported it finished.
+    if (cancelRequested &&
+        completedBeforeRegistration.get(turnId)?.generation !== generationState.generation) {
+      void interruptTurn(turn, "MCP request canceled before the turn was registered");
+    }
     drainDeferredAppRequests(generationState, turnId);
     const early = takeEarlyCompletion(turnId);
     if (early?.generation === generationState.generation) {
@@ -7644,15 +7685,29 @@ async function createCodexRuntime({
     turn.interruptRequested = true;
     const generationState = app;
     if (!generationState || generationState.generation !== turn.generation) return;
-    try {
-      await requestApp(generationState, "turn/interrupt", {
-        threadId: turn.threadId,
-        turnId: turn.turnId,
-      }, cancelGraceMs);
-    } catch (err) {
-      logErr(
-        `[mcp-agents] Codex interrupt was not confirmed (${reason}): ${err.message}`,
-      );
+    // Codex activates a turn shortly after answering turn/start and refuses an
+    // earlier interrupt ("no active turn to interrupt"). Retry its refusals
+    // until one is accepted, the turn finishes, or the cancel grace runs out.
+    const giveUpAt = Date.now() + cancelGraceMs;
+    for (let delayMs = 25; ; delayMs = Math.min(delayMs * 2, 1_000)) {
+      try {
+        await requestApp(generationState, "turn/interrupt", {
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+        }, Math.max(1, giveUpAt - Date.now()));
+        return;
+      } catch (err) {
+        if (turn.terminal) return;
+        if (err?.appServerCode === undefined || !generationState.alive ||
+            Date.now() + delayMs >= giveUpAt) {
+          logErr(
+            `[mcp-agents] Codex interrupt was not confirmed (${reason}): ${err.message}`,
+          );
+          return;
+        }
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+      if (turn.terminal || Date.now() >= giveUpAt) return;
     }
   }
 
@@ -8030,6 +8085,24 @@ async function createCodexRuntime({
       return;
     }
     if (!turn) return;
+    if (method === "model/rerouted") {
+      // Only the turn Codex names: the thread fallback above would credit a
+      // goal continuation's reroute to the bridge's own turn. Codex may swap
+      // the effort along with the model and reports no new level.
+      if (turn.turnId !== params.turnId || turn.terminal) return;
+      const { model, reasoningEffort } = turn.modelSettings;
+      turn.modelSettings.reportedBy = "model_rerouted";
+      model.reported = boundedText(params.toModel, 64) || null;
+      reasoningEffort.reported = null;
+      model.status = reasoningEffort.status = "rerouted";
+      logErr(
+        `[mcp-agents] WARNING: Codex rerouted the model (thread=${turn.threadId}, ` +
+          `from=${boundedText(params.fromModel, 64) || "none"}, ` +
+          `to=${model.reported ?? "none"}, ` +
+          `reason=${boundedText(params.reason, 64) || "none"})`,
+      );
+      return;
+    }
     if (method === "item/started") {
       const item = params.item;
       if (item?.id) turn.itemPhases.set(item.id, item.phase);
@@ -8179,7 +8252,8 @@ async function createCodexRuntime({
         return;
       }
       if (pending.generation !== generationState.generation) return;
-      if (pending.outcomeUnknown || pending.canceled) {
+      // A canceled mutation still settles from its answer (see requestApp).
+      if (pending.canceled && !pending.mutating) {
         // The caller gave up, but Codex still acted; let it record what the
         // late answer created (e.g. a thread that must still be released).
         // Consumed here, so the cancel timer does not keep it any longer.
@@ -8458,6 +8532,9 @@ async function createCodexRuntime({
           updateProvisionalTurn(provisional, { state: "outcome_unknown" });
         }
       },
+      onCancelRequested: () => {
+        if (provisional) updateProvisionalTurn(provisional, { state: "canceling" });
+      },
     };
   };
   const awaitSetupBoundary = (promise, signal, deadlineAt) => {
@@ -8614,6 +8691,28 @@ async function createCodexRuntime({
     }
     return config;
   };
+  // What this call asked for next to what Codex's own thread/start or
+  // thread/resume answer says the session runs with. That answer is session
+  // configuration, not per-turn telemetry: "confirmed" means only that the two
+  // agree. Replies and reviews ask for nothing and report what they inherit.
+  const readModelSettings = (reportedBy, requested, response) => {
+    const field = (asked, told) => {
+      // Bounded for display only; the comparison uses Codex's exact value.
+      const reported = boundedText(told, 64) || null;
+      return {
+        requested: asked ?? null,
+        reported,
+        status: !reported ? "unreported"
+          : !asked ? "inherited"
+          : told === asked ? "confirmed" : "mismatch",
+      };
+    };
+    return {
+      reportedBy,
+      model: field(requested?.model, response?.model),
+      reasoningEffort: field(requested?.reasoningEffort, response?.reasoningEffort),
+    };
+  };
   const awaitTurn = async (turn, signal, onDetach) => {
     const onAbort = () => void interruptTurn(turn, "MCP request canceled");
     const detach = () => signal?.removeEventListener("abort", onAbort);
@@ -8695,6 +8794,7 @@ async function createCodexRuntime({
     const generationState = await awaitSetupBoundary(ensureApp(), signal, deadlineAt);
     let releaseLease;
     let turn;
+    let modelSettings;
     let threadSubscribed = false;
     const provisional = beginProvisionalTurn({
       generationState,
@@ -8715,6 +8815,7 @@ async function createCodexRuntime({
         threadSubscribed = true;
         holdThread(generationState, threadId);
         const resumed = await resumeThread(generationState, threadId, { signal, deadlineAt });
+        modelSettings = readModelSettings("thread_resume", null, resumed);
         workspace ??= {
           cwd: resumed?.thread?.cwd,
           sandbox: resumed?.thread?.sandbox,
@@ -8748,23 +8849,27 @@ async function createCodexRuntime({
             ephemeral: false,
           },
           appMutationTimeoutMs,
-          {
-            ...mutationOptions(provisional, { signal, deadlineAt }),
-            // Canceled after dispatch: the new thread still exists, subscribed.
-            onLateResult: (late) => {
-              // No turn ever ran on it, so it is released like any idle thread.
-              const lateId = late?.thread?.id;
-              if (typeof lateId === "string") holdThread(generationState, lateId);
-            },
-          },
+          mutationOptions(provisional, { signal, deadlineAt }),
         );
         threadId = started?.thread?.id;
         if (!threadId) {
           throw appError("codex_protocol_error", "thread/start returned no thread ID");
         }
+        modelSettings = readModelSettings("thread_start", {
+          model: args.model ?? resolvedModel,
+          reasoningEffort: args.model_reasoning_effort ?? resolvedEffort,
+        }, started);
         threadSubscribed = true;
-        if (args.allow_subagents === true) generationState.subagentThreads.add(threadId);
         holdThread(generationState, threadId);
+        // Canceled while thread/start was in flight: no turn ran on the new
+        // thread, so it is released like any idle one, never subagent-tagged.
+        if (signal?.aborted) {
+          throw appError(
+            "codex_turn_interrupted",
+            "Codex call was canceled while thread/start was in flight",
+          );
+        }
+        if (args.allow_subagents === true) generationState.subagentThreads.add(threadId);
         updateProvisionalTurn(provisional, { threadId });
         rememberThreadWorkspace(threadId, args.cwd, args.sandbox);
         releaseLease = acquireThreadLease(threadId, "turn");
@@ -8811,6 +8916,8 @@ async function createCodexRuntime({
         canElicit: backgroundJob ? false : supportsFormElicitation(ctx),
         releaseLease,
         tool: reply ? "codex-reply" : "codex",
+        modelSettings,
+        cancelRequested: Boolean(signal?.aborted),
         cwdInferred: Boolean(reply && workspace?.cwd),
         provisional,
         deadlineAt,
@@ -8819,6 +8926,7 @@ async function createCodexRuntime({
       if (backgroundJob) {
         backgroundJob.threadId = threadId;
         backgroundJob.turnId = turnId;
+        backgroundJob.modelSettings = modelSettings;
         backgroundJob.state = "running";
         backgroundJob.statusMessage = "Codex: running";
         backgroundJob.statusCursor += 1;
@@ -8841,10 +8949,7 @@ async function createCodexRuntime({
     if (!backgroundJob) {
       const outcome = await awaitForegroundResult(turn, ctx);
       if (outcome.kind === "interaction") return outcome;
-      return {
-        kind: "complete",
-        result: { threadId, content: outcome.completed.content },
-      };
+      return { kind: "complete", result: foregroundResult(turn, outcome.completed) };
     }
     try {
       const completed = await awaitTurn(turn);
@@ -8904,15 +9009,7 @@ async function createCodexRuntime({
           delivery: args.delivery ?? "inline",
         },
         appMutationTimeoutMs,
-        {
-          ...mutationOptions(provisional, { signal, deadlineAt }),
-          onLateResult: (late) => {
-            const lateReviewId = late?.reviewThreadId;
-            if (typeof lateReviewId === "string" && lateReviewId !== args.threadId) {
-              holdThread(generationState, lateReviewId);
-            }
-          },
-        },
+        mutationOptions(provisional, { signal, deadlineAt }),
       );
       const turnId = response?.turn?.id;
       reviewThreadId = response?.reviewThreadId;
@@ -8958,6 +9055,9 @@ async function createCodexRuntime({
         reviewThreadId,
         sourceThreadId: args.threadId,
         tool: "codex-review",
+        // review/start reports nothing; this is the source thread's answer.
+        modelSettings: readModelSettings("review_source_thread", null, resumed),
+        cancelRequested: Boolean(signal?.aborted),
         cwdInferred: Boolean(workspace?.cwd),
         provisional,
         deadlineAt,
@@ -8966,6 +9066,7 @@ async function createCodexRuntime({
       if (backgroundJob) {
         backgroundJob.threadId = reviewThreadId;
         backgroundJob.turnId = turnId;
+        backgroundJob.modelSettings = turn.modelSettings;
         backgroundJob.state = "running";
         backgroundJob.statusMessage = "Codex: running";
         backgroundJob.statusCursor += 1;
@@ -8990,14 +9091,7 @@ async function createCodexRuntime({
     if (!backgroundJob) {
       const outcome = await awaitForegroundResult(turn, ctx);
       if (outcome.kind === "interaction") return outcome;
-      return {
-        kind: "complete",
-        result: {
-          threadId: args.threadId,
-          reviewThreadId,
-          content: outcome.completed.content,
-        },
-      };
+      return { kind: "complete", result: foregroundResult(turn, outcome.completed) };
     }
     try {
       const completed = await awaitTurn(turn);
@@ -9017,9 +9111,14 @@ async function createCodexRuntime({
     ? {
       threadId: turn.sourceThreadId,
       reviewThreadId: turn.reviewThreadId,
+      modelSettings: turn.modelSettings,
       content: completed.content,
     }
-    : { threadId: turn.threadId, content: completed.content };
+    : {
+      threadId: turn.threadId,
+      modelSettings: turn.modelSettings,
+      content: completed.content,
+    };
   const foregroundInputRequired = async (params, interaction) => inputRequired({
     inputRequests: {
       interaction: inputRequired.elicit(
@@ -9160,6 +9259,7 @@ async function createCodexRuntime({
     elapsedSeconds: Math.max(0, Math.floor((Date.now() - job.createdAt) / 1_000)),
     lastActivitySeconds: Math.max(0, Math.floor((Date.now() - job.lastActivityAt) / 1_000)),
     ...(job.threadId ? { threadId: job.threadId } : {}),
+    ...(job.modelSettings ? { modelSettings: job.modelSettings } : {}),
     ...(job.errorCode ? { code: job.errorCode } : {}),
     resultAvailable: job.state === "completed",
     resultTruncated: false,
@@ -9237,6 +9337,7 @@ async function createCodexRuntime({
         state: job.state,
         cursor: 0,
         message: job.statusMessage,
+        modelSettings: job.modelSettings,
         commentaryStartOffset: 0,
         commentaryEndOffset: 0,
         next: { tool: "codex-status", arguments: { jobId: job.jobId, cursor: 0 } },
@@ -9253,8 +9354,8 @@ async function createCodexRuntime({
     if (!thread || typeof thread !== "object") return {};
     const clean = {};
     for (const field of [
-      "id", "preview", "modelProvider", "model", "cwd", "createdAt", "updatedAt",
-      "status", "archived", "name", "gitInfo",
+      "id", "preview", "modelProvider", "model", "reasoningEffort", "cwd", "createdAt",
+      "updatedAt", "status", "archived", "name", "gitInfo",
     ]) if (thread[field] !== undefined) clean[field] = thread[field];
     if (!includeTurns || !Array.isArray(thread.turns)) return clean;
     const start = cursor ? Number(cursor) : 0;
@@ -9553,6 +9654,7 @@ async function createCodexRuntime({
             return errorResult(job.errorCode ?? "codex_job_failed", job.statusMessage, {
               jobId: job.jobId,
               state: job.state,
+              ...(job.modelSettings ? { modelSettings: job.modelSettings } : {}),
               resultAvailable: false,
             });
           }
@@ -9570,6 +9672,7 @@ async function createCodexRuntime({
             jobId: job.jobId,
             state: job.state,
             ...(job.threadId ? { threadId: job.threadId } : {}),
+            ...(job.modelSettings ? { modelSettings: job.modelSettings } : {}),
             offset,
             nextOffset: page.nextOffset,
             endOffset: page.endOffset,
@@ -9832,7 +9935,10 @@ async function createCodexRuntime({
       return errorResult(
         err?.codexCode ?? "codex_app_server_error",
         err instanceof Error ? err.message : String(err),
-        args.threadId ? { threadId: args.threadId } : {},
+        {
+          ...(args.threadId ? { threadId: args.threadId } : {}),
+          ...(err?.modelSettings ? { modelSettings: err.modelSettings } : {}),
+        },
       );
     }
     }));

@@ -176,7 +176,14 @@ line carries `mcp_agents=` and `codex=`. The `claude` and `gemini` providers
 run `claude --version` / `agy --version` once in the background and log
 `[mcp-agents] provider CLI version (<claude|agy>=<x.y.z>)`; the probe never
 delays the transport and reports `unknown` with a reason within four seconds
-(a three-second timeout plus a one-second grace).
+(a three-second timeout plus a one-second grace). The `codex` provider also
+logs one `[mcp-agents] Codex turn started (tool=…, thread=…, reported_by=…,
+requested_model=…, reported_model=…, model_status=…, requested_effort=…,
+reported_effort=…, effort_status=…)` line for every turn it starts, prefixed
+`WARNING:` when Codex reports a different model or effort than requested, and
+`[mcp-agents] WARNING: Codex rerouted the model (…)` when Codex reroutes the
+model of such a turn. Turns Codex starts on its own, such as goal
+continuations, are not logged.
 Use the Quickstart configuration above if you prefer this mode.
 
 ### Shared HTTP daemon
@@ -532,6 +539,33 @@ policy are inherited. Both schemas set `additionalProperties: false`; raw App
 Server config, instructions, provider selection, and per-call approval policy
 remain unavailable.
 
+Run results report which model and reasoning effort were requested and which
+Codex reported, in `structuredContent.modelSettings`:
+
+```json
+{
+  "reportedBy": "thread_start",
+  "model": { "requested": "gpt-6-astra", "reported": "gpt-6-astra", "status": "confirmed" },
+  "reasoningEffort": { "requested": "max", "reported": "max", "status": "confirmed" }
+}
+```
+
+| `status` | Meaning |
+| --- | --- |
+| `confirmed` | Codex reported exactly the requested value |
+| `mismatch` | Codex reported a different value; the call still succeeds |
+| `unreported` | Codex reported nothing for this field |
+| `inherited` | Nothing was requested (`codex-reply`, `codex-review`); `reported` is what Codex resumed with |
+| `rerouted` | Codex rerouted the model during the turn; the effort is no longer known |
+
+`reportedBy` names the Codex answer behind `reported`: `thread_start`,
+`thread_resume`, `review_source_thread` (Codex reports nothing for a review
+itself, so this is its source thread), or `model_rerouted`. The read-back is
+Codex's session configuration, not per-turn execution telemetry. The same
+object appears on `codex-start`, `codex-status`, and a finished job's
+`codex-result`, and on the error result of a turn that started and then
+failed, except an authentication failure.
+
 #### Curated App Server tools
 
 | Tool | Required arguments | Purpose |
@@ -561,7 +595,9 @@ bounded to 100 records per call. A listing's `preview` is usually the first user
 message, so treat thread-list output as conversation content. Returned history
 is otherwise sanitized; the bridge does not expose raw App Server frames,
 hidden reasoning, config, arbitrary filesystem operations, or private native
-request IDs.
+request IDs. Thread metadata carries Codex's configured `model` and
+`reasoningEffort` when the installed Codex reports them: current or
+last-persisted configuration, not per-turn telemetry.
 
 </details>
 
@@ -739,7 +775,11 @@ timed-out write-capable turn may still have changed the workspace, so inspect
 state before retrying. MCP deliberately emits no response after the client has
 canceled that request; the bridge still settles its local handler after the
 configured grace while retaining liveness and ownership for any native turn
-that may still be writing.
+that may still be writing. A cancel that arrives before Codex has answered a
+request that changes state, such as starting a turn, waits for that answer:
+a turn Codex started anyway is interrupted at once, and a request Codex never
+answers is treated like any unanswered one, so its App Server generation is
+terminated.
 
 While the MCP connection remains open, elapsed time alone never releases
 ownership: native completion or generation termination must prove the writer
