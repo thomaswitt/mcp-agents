@@ -108,6 +108,7 @@ const MAX_CODEX_PROGRESS_CODEPOINTS = 200;
 const MAX_CODEX_PAGE_CODEPOINTS = 32_768;
 const MAX_CODEX_COMMENTARY_BYTES = 1024 * 1024;
 const MAX_ACTIVE_CODEX_JOBS = 8;
+const MAX_DEFERRED_REQUEST_TURN_IDS = 256;
 const MAX_RETAINED_CODEX_JOBS = 32;
 const MAX_EARLY_CODEX_COMPLETIONS = 32;
 // Releasing a finished thread asks Codex for its goal first; neither request may
@@ -7864,6 +7865,10 @@ async function createCodexRuntime({
     }
     const deferred = generationState.deferredRequests.get(turnId) ?? [];
     if (deferred.length >= 16) {
+      failClosedAppInteraction(generationState, message);
+      return;
+    }
+    if (deferred.length === 0 && generationState.deferredRequests.size >= MAX_DEFERRED_REQUEST_TURN_IDS) {
       failClosedAppInteraction(generationState, message);
       return;
     }
