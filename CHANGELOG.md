@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.37.0] - 2026-11-06
 
 ### Added
 
@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Cap deferred Codex interaction queues at 256 distinct turn IDs per App
+  Server generation. Requests beyond that limit are refused through the
+  existing cancellation path; per-turn limits and expiry still apply.
 - The `codex` provider now mirrors the source config's `model_provider` and
   that provider's allowlisted `[model_providers.<id>]` keys into each isolated
   generation. Previously calls through the `codex` provider silently ran on
@@ -41,7 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `base_url` and `query_params` are copied verbatim and must not hold
   credentials; the provider's `env_key` and `env_http_headers` variables are
   excluded from the environment of commands Codex runs by default.
-- Upgrade effect: a bridge whose environment lacks the provider's `env_key`
+
+### Changed
+
+- **Breaking:** a bridge whose environment lacks the provider's `env_key`
   variable now fails each turn with "Missing environment variable" (it used to
   run on OpenAI), and a provider that authenticates through settings the bridge
   does not mirror (`experimental_bearer_token`, `auth`, credential-named
