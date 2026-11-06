@@ -3721,6 +3721,8 @@ const stubMode = {
   "cancel-steer": "steer-held",
   "progress-detailed": "progress-items",
   "progress-minimal": "progress-items",
+  "provider-auth": "auth",
+  "provider-auth-openai": "auth",
 }[scenario] ?? (/^cancel-(start|review)-/u.test(scenario) ? "start-held" : null) ??
   (["peek", "job-compat", "job-idle", "busy", "idle", "cancel", "steer", "hold"].includes(scenario)
   ? "park"
@@ -4111,6 +4113,236 @@ try {
     await checkGeneration({});
     assert.equal(stderr.includes("SECRET_CONFIG_CONTENT"), false);
     data.trustVerified = true;
+  } else if (scenario === "model-provider") {
+    const { createRequire } = await import("node:module");
+    const { parse } = createRequire(`${serverDir}/package.json`)("smol-toml");
+    const { default: assert } = await import("node:assert/strict");
+    const source = `${stubDir}/real-codex-home/config.toml`;
+    const spawns = () => fs.existsSync(`${stubDir}/app-spawns.jsonl`)
+      ? fs.readFileSync(`${stubDir}/app-spawns.jsonl`, "utf8").trim().split("\n").map(JSON.parse)
+      : [];
+    const list = () => call("codex-thread-list", {});
+    const generate = async (text) => {
+      if (text === null) { if (fs.existsSync(source)) fs.unlinkSync(source); }
+      else fs.writeFileSync(source, text);
+      const result = await list();
+      assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+      const captured = spawns().at(-1);
+      const config = parse(captured.config);
+      const headerAt = captured.config.search(/^\[/m);
+      const providerAt = captured.config.search(/^model_provider\b/m);
+      if (providerAt >= 0) assert.ok(headerAt < 0 || providerAt < headerAt, "model_provider after a table header");
+      return { captured, config: JSON.parse(JSON.stringify(config)) };
+    };
+    const stopGeneration = async () => {
+      process.kill(spawns().at(-1).pid, "SIGTERM");
+      assert.equal(await waitFor(() => readSidecars().every((s) => s.childPid === null)), true);
+    };
+    await mcpInitialize();
+
+    // 5/6/7: hostile strings, allowlisted keys, secrets withheld, env_key exclusion.
+    const hostileUrl = 'http://h/"q"\\b c ] [x]\nline2';
+    const hostileName = 'na"me\\ # ] \n[tbl]';
+    const providerTable = {
+      name: hostileName,
+      base_url: hostileUrl,
+      env_key: "DUMMY_PROVIDER_KEY",
+      env_key_instructions: "set it",
+      wire_api: "responses",
+      query_params: { "api-version": "2025-01-01" },
+      env_http_headers: { "X-Dummy": "DUMMY_HEADER_ENV" },
+      request_max_retries: 3,
+      stream_max_retries: 4,
+      stream_idle_timeout_ms: 300000,
+      requires_openai_auth: false,
+    };
+    const q = (v) => JSON.stringify(v);
+    const tomlProvider = [
+      'model_provider = "cliproxy"',
+      '[model_providers.cliproxy]',
+      `name = ${q(hostileName)}`,
+      `base_url = ${q(hostileUrl)}`,
+      'env_key = "DUMMY_PROVIDER_KEY"',
+      'env_key_instructions = "set it"',
+      'wire_api = "responses"',
+      'query_params = { "api-version" = "2025-01-01" }',
+      'env_http_headers = { "X-Dummy" = "DUMMY_HEADER_ENV" }',
+      'request_max_retries = 3',
+      'stream_max_retries = 4',
+      'stream_idle_timeout_ms = 300000',
+      'requires_openai_auth = false',
+      'supports_websockets = true',
+      'http_headers = { X-Trace = "dummy-secret-0001" }',
+    ].join("\n");
+    let r = await generate(tomlProvider);
+    assert.equal(r.config.model_provider, "cliproxy");
+    assert.deepEqual(r.config.model_providers, { cliproxy: providerTable });
+    assert.deepEqual(r.config.shell_environment_policy, { exclude: ["DUMMY_PROVIDER_KEY", "DUMMY_HEADER_ENV"] });
+    for (const secret of ["dummy-secret-0001"]) {
+      assert.equal(r.captured.config.includes(secret), false);
+      assert.equal(stderr.includes(secret), false);
+    }
+    assert.ok(stderr.includes("supports_websockets") && stderr.includes("http_headers"));
+    await stopGeneration();
+
+    // 6: absent env_key -> no shell_environment_policy.
+    r = await generate('model_provider = "p"\n[model_providers.p]\nbase_url = "http://x"\n');
+    assert.equal(r.config.shell_environment_policy, undefined);
+    assert.deepEqual(r.config.model_providers, { p: { base_url: "http://x" } });
+    await stopGeneration();
+
+    // 2: no model_provider -> baseline config; keys elsewhere are ignored.
+    const baseline = await generate(null);
+    assert.equal(baseline.config.model_provider, undefined);
+    assert.equal(baseline.config.model_providers, undefined);
+    assert.equal(baseline.config.shell_environment_policy, undefined);
+    await stopGeneration();
+    r = await generate('[model_providers.p]\nbase_url = "http://x"\n');
+    assert.equal(r.captured.config, baseline.captured.config);
+    await stopGeneration();
+
+    // 3: built-in provider without a table -> only the top-level line is added.
+    r = await generate('model_provider = "openai"\n');
+    assert.equal(r.captured.config.split("\n").filter((l) => !l.startsWith("model_provider")).join("\n"),
+      baseline.captured.config);
+    assert.equal(r.config.model_provider, "openai");
+    assert.equal(r.config.model_providers, undefined);
+    await stopGeneration();
+
+    // 4: invalid shapes refuse child startup with a redacted error.
+    const before = spawns().length;
+    for (const bad of [
+      'model_provider = 1\nSECRET_CONFIG_CONTENT = "x"',
+      'model_provider = ""',
+      'model_provider = "p"\n[model_providers]\np = "SECRET_CONFIG_CONTENT"',
+      'model_provider = "p"\n[model_providers.p]\nquery_params = { a = 1 }\nSECRET_CONFIG_CONTENT = 1',
+      'model_provider = "p"\n[model_providers.p]\nbase_url = ["SECRET_CONFIG_CONTENT"]',
+      'model_provider = "p"\n[model_providers.p]\nenv_key = 5',
+    ]) {
+      fs.writeFileSync(source, bad);
+      const result = await list();
+      assert.equal(result.result?.isError, true, bad);
+      assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable");
+      assert.equal(JSON.stringify(result).includes("SECRET_CONFIG_CONTENT"), false);
+      assert.equal(spawns().length, before);
+      const discovery = await request("tools/list");
+      assert.ok(discovery.result.tools.length > 0);
+    }
+    assert.equal(stderr.includes("SECRET_CONFIG_CONTENT"), false);
+
+    // C1/I1/M6: credential sources the bridge does not mirror, credentials in
+    // base_url, and further invalid shapes refuse startup, redacted.
+    for (const bad of [
+      'model_provider = "p"\n[model_providers.p]\nexperimental_bearer_token = "dummy-secret-0003"',
+      'model_provider = "p"\n[model_providers.p]\nenv_key = "K"\nexperimental_bearer_token = "dummy-secret-0003"',
+      'model_provider = "p"\n[model_providers.p]\nauth = { command = "dummy-secret-0003" }',
+      'model_provider = "p"\n[model_providers.p]\nhttp_headers = { Authorization = "dummy-secret-0003" }',
+      'model_provider = "p"\n[model_providers.p]\nhttp_headers = { "X-Api-Key" = "dummy-secret-0003" }',
+      'model_provider = "p"\n[model_providers.p]\naws = { profile = "p", secret = "dummy-secret-0003" }',
+      'model_provider = "p"\n[model_providers.p]\naws = "dummy-secret-0003"',
+      'model_provider = "p"\n[model_providers.p]\nbase_url = "https://user:dummy-secret-0003@h/v1"',
+      'model_provider = "p"\n[model_providers.p]\nbase_url = "https://h/v1?key=dummy-secret-0003"',
+      'model_provider = "p"\n[model_providers.p]\nbase_url = "dummy-secret-0003 not a url"',
+      'model_provider = "p"\nmodel_providers = "dummy-secret-0003"',
+      'model_provider = "p"\n[model_providers.p]\nenv_http_headers = { H = 1 }\nSECRET_CONFIG_CONTENT = 1',
+      'model_provider = "p"\n[model_providers.p]\nrequest_max_retries = 1.5\nSECRET_CONFIG_CONTENT = 1',
+    ]) {
+      fs.writeFileSync(source, bad);
+      const result = await list();
+      assert.equal(result.result?.isError, true, bad);
+      assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable");
+      assert.equal(JSON.stringify(result).includes("dummy-secret-0003"), false, bad);
+      assert.equal(JSON.stringify(result).includes("SECRET_CONFIG_CONTENT"), false, bad);
+      assert.equal(spawns().length, before);
+    }
+    assert.equal(stderr.includes("dummy-secret-0003"), false);
+    assert.equal(stderr.includes("SECRET_CONFIG_CONTENT"), false);
+
+    // N2: env_key and env_http_headers values must be variable names.
+    // Fragment: refused like a query string.
+    for (const bad of [
+      'model_provider = "p"\n[model_providers.p]\nenv_key = "sk-dummy-literal-0001"',
+      'model_provider = "p"\n[model_providers.p]\nenv_http_headers = { H = "sk-dummy-literal-0001" }',
+      'model_provider = "p"\n[model_providers.p]\nbase_url = "https://h/v1#sk-dummy-literal-0001"',
+    ]) {
+      fs.writeFileSync(source, bad);
+      const result = await list();
+      assert.equal(result.result?.isError, true, bad);
+      assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable");
+      assert.equal(JSON.stringify(result).includes("sk-dummy-literal-0001"), false, bad);
+      assert.equal(spawns().length, before);
+    }
+    assert.equal(stderr.includes("sk-dummy-literal-0001"), false);
+
+    // The refusal names the keys to remove, from the fixed list only.
+    fs.writeFileSync(source, 'model_provider = "p"\n[model_providers.p]\nenv_key = "K"\nexperimental_bearer_token = "dummy-secret-0003"');
+    const named = await list();
+    assert.ok(named.result.structuredContent.message.includes("authenticates through experimental_bearer_token, which the bridge does not mirror; remove it"));
+    fs.writeFileSync(source, 'model_provider = "p"\n[model_providers.p]\nexperimental_bearer_token = "dummy-secret-0003"\nauth = { command = "x" }');
+    const twoNames = await list();
+    assert.ok(twoNames.result.structuredContent.message.includes("authenticates through experimental_bearer_token and auth, which the bridge does not mirror; remove them"));
+    fs.writeFileSync(source, 'model_provider = "p"\n[model_providers.p]\nexperimental_bearer_token = "dummy-secret-0003"\nauth = { command = "x" }\nhttp_headers = { Authorization = "x" }');
+    const threeNames = await list();
+    assert.ok(threeNames.result.structuredContent.message.includes("through experimental_bearer_token, auth, and http_headers (credential-named entries), which"));
+
+    // C1: other http_headers are dropped and logged; aws is mirrored.
+    r = await generate([
+      'model_provider = "p"',
+      '[model_providers.p]',
+      'base_url = "https://h/v1"',
+      'http_headers = { X-Trace = "on" }',
+      'aws = { profile = "prof", region = "reg" }',
+    ].join("\n"));
+    assert.deepEqual(r.config.model_providers, {
+      p: { base_url: "https://h/v1", aws: { profile: "prof", region: "reg" } },
+    });
+    assert.equal(r.captured.config.includes("X-Trace"), false);
+    assert.ok(stderr.includes('"http_headers"'));
+    // M6: the skipped-key line repeats once per generation.
+    const countSkipLines = () => stderr.split("\n").filter((l) => l.includes("not mirrored into the bridge config")).length;
+    const skipLinesBefore = countSkipLines();
+    await stopGeneration();
+    await generate(fs.readFileSync(source, "utf8"));
+    assert.equal(countSkipLines(), skipLinesBefore + 1);
+    await stopGeneration();
+
+    // M1/M2: trust and provider from one source in one generation; every
+    // provider variable is excluded, env_key first, deduplicated.
+    r = await generate([
+      'model_provider = "gw"',
+      `[projects.${q(`${stubDir}/workspace`)}]`,
+      'trust_level = "trusted"',
+      '[model_providers.gw]',
+      'base_url = "https://gw.example/v1"',
+      'env_key = "GW_KEY"',
+      'env_http_headers = { "X-Key" = "GW_HEADER_KEY", "X-Dup" = "GW_KEY" }',
+    ].join("\n"));
+    assert.deepEqual(r.config.projects, { [`${stubDir}/workspace`]: { trust_level: "trusted" } });
+    assert.equal(r.config.model_provider, "gw");
+    assert.deepEqual(r.config.shell_environment_policy, { exclude: ["GW_KEY", "GW_HEADER_KEY"] });
+    await stopGeneration();
+    data.providerVerified = true;
+  } else if (scenario === "provider-auth" || scenario === "provider-auth-openai") {
+    const source = `${stubDir}/real-codex-home/config.toml`;
+    fs.writeFileSync(source, scenario === "provider-auth"
+      ? 'model_provider = "p"\n[model_providers.p]\nbase_url = "https://h/v1"\nenv_key = "DUMMY_PROVIDER_KEY"\n'
+      : 'model_provider = "openai"\n');
+    await mcpInitialize();
+    data.first = await call("codex", initialArgs("authenticate"));
+    data.second = await call("codex", initialArgs("must be latched"));
+    if (scenario === "provider-auth") {
+      // N1: a later generation from a source without a provider must not
+      // change the remedy chosen when the latch was set.
+      const spawnLog = `${stubDir}/app-spawns.jsonl`;
+      const pids = () => fs.readFileSync(spawnLog, "utf8").trim().split("\n").map(JSON.parse).map((e) => e.pid);
+      const firstCount = pids().length;
+      process.kill(pids().at(-1), "SIGTERM");
+      await waitFor(() => readSidecars().every((s) => s.childPid === null));
+      fs.writeFileSync(source, 'model_provider = "openai"\n');
+      data.list = await call("codex-thread-list", {});
+      data.newGeneration = pids().length > firstCount;
+      data.third = await call("codex", initialArgs("still latched"));
+    }
   } else if (scenario === "turn-start-withheld") {
     await mcpInitialize();
     data.first = await call("codex", initialArgs("accepted but unacknowledged"));
@@ -7152,6 +7384,23 @@ test_claude_job \
 # App Server adapter contract tests (fast — no real Codex needed).
 test_codex_app_case "Codex inherits project trust per generation and refuses invalid source config" \
   "project-trust" '(.data.trustVerified == true)' "" "20"
+
+test_codex_app_case "Codex mirrors the source model provider per generation without secrets" \
+  "model-provider" '(.data.providerVerified == true)' "" "20"
+
+test_codex_app_case "A rejected mirrored provider key names its variable instead of codex login" \
+  "provider-auth" \
+  '(.data.first.result.structuredContent.code == "codex_auth_invalidated") and
+   (.data.first.result.structuredContent.message | contains("DUMMY_PROVIDER_KEY") and (contains("codex login") | not)) and
+   (.data.second.result.structuredContent.message | contains("DUMMY_PROVIDER_KEY") and (contains("codex login") | not)) and
+   (.data.newGeneration == true) and
+   (.data.third.result.structuredContent.code == "codex_auth_invalidated") and
+   (.data.third.result.structuredContent.message | contains("DUMMY_PROVIDER_KEY") and (contains("codex login") | not))'
+
+test_codex_app_case "A rejected OpenAI-provider login keeps the codex login remedy" \
+  "provider-auth-openai" \
+  '(.data.first.result.structuredContent.code == "codex_auth_invalidated") and
+   (.data.first.result.structuredContent.message | contains("codex login"))'
 
 test_codex_http_case "Codex HTTP rejects invalid project roots before MCP dispatch" \
   "roots"

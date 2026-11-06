@@ -707,7 +707,8 @@ Each App Server generation receives an isolated `CODEX_HOME` and
 `CODEX_SQLITE_HOME`. The bridge links only the durable native goal files into
 the SQLite home, copies authentication and the model cache, writes a minimal
 config, strips external MCP servers and unrelated preferences, and selectively
-mirrors an explicit Fast-mode opt-in and project trust decisions.
+mirrors an explicit Fast-mode opt-in, project trust decisions, and the source
+model provider.
 
 Before starting each App Server generation, the bridge reads the source
 `$CODEX_HOME/config.toml` (default: `~/.codex/config.toml`) and copies only
@@ -727,7 +728,43 @@ back to the source config. A missing source config or absent trust decision
 adds no trust. An unreadable or malformed source config, or invalid project
 trust settings, refuses child startup with `codex_app_server_unavailable`;
 MCP initialization and discovery remain available, and a later call retries
-after the source is corrected. Error messages never include config contents.
+after the source is corrected. Error messages never include config values;
+they may name a setting or the environment variable a provider reads.
+
+Each generation also mirrors the source `model_provider` and that provider's
+`[model_providers.<id>]` table, so a custom provider keeps working in the
+bridge instead of falling back to the built-in `openai` provider. Only these
+keys are copied: `name`, `base_url`, `env_key`, `env_key_instructions`,
+`wire_api`, `query_params`, `env_http_headers`, `request_max_retries`,
+`stream_max_retries`, `stream_idle_timeout_ms`, `requires_openai_auth`, and
+`aws` (string `profile` and `region` only). `env_key` and the `env_http_headers`
+values must be environment variable names; a value that is not refuses startup
+with a redacted error. Every other key is never copied;
+the bridge logs the skipped key names (never values) to stderr. A provider
+with no `[model_providers.<id>]` table, such as the built-in `openai` or
+`oss`, is mirrored as the `model_provider` line alone.
+
+`base_url` and `query_params` are copied verbatim and must not hold
+credentials: a `base_url` with userinfo, a query string, or a fragment is
+refused. Codex error text can include the request URL and reaches the MCP
+caller, so put keys in `env_key` or `env_http_headers` instead. A provider that authenticates
+through `experimental_bearer_token`, an `auth` table, or an `http_headers`
+entry whose name contains `auth`, `key`, `token`, or `secret` is refused with
+the same `codex_app_server_unavailable` error, because the bridge does not
+mirror those settings and Codex would otherwise send the copied `auth.json`
+login to the provider's host. Use `env_key` or `env_http_headers`.
+
+The variable named by `env_key` must be set in the bridge's own environment,
+because the child inherits it; a missing variable fails each turn with
+"Missing environment variable", and a key the provider rejects reports that
+variable instead of `codex login`. The private config adds `env_key` and every
+variable named in `env_http_headers` to `shell_environment_policy.exclude`, so
+commands Codex runs do not see them by default; a trusted project's own
+`shell_environment_policy` can replace that exclusion.
+
+The bridge model (`--model`, the per-call `model`, or the default
+`gpt-6-astra` when the call names none) must be one the provider serves.
+Profiles (`profile = "x"`) and `openai_base_url` are not mirrored.
 
 The minimal config strips the MCP servers of the user's own Codex config. A
 served project's `.codex/config.toml` is a separate layer: once Codex trusts the
