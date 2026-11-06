@@ -20,6 +20,9 @@ PASS=0
 FAIL=0
 TEST_CHILD_REGISTRY=$(mktemp)
 export MCP_AGENTS_TEST_CHILD_REGISTRY="$TEST_CHILD_REGISTRY"
+# An exported allowlist in the caller's shell must not leak into unrelated cases.
+unset MCP_AGENTS_CODEX_MCP_SERVERS
+unset MCP_AGENTS_CODEX_PLUGINS
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -780,6 +783,50 @@ test_cli_error() {
   fi
 }
 
+# ── Helper: test an invalid Codex MCP allowlist (environment value, optional CLI) ──
+test_codex_mcp_servers_env_error() {
+  local label="$1"
+  local value="$2"
+  local expected="$3"
+  local extra="$4"
+
+  echo "--- $label ---"
+
+  STDERR_OUTPUT=$(env MCP_AGENTS_CODEX_MCP_SERVERS="$value" \
+    $SERVER --provider codex $extra 2>&1 >/dev/null) || true
+
+  if echo "$STDERR_OUTPUT" | grep -q "$expected"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (expected '$expected' in stderr)"
+    echo "  Stderr: $STDERR_OUTPUT"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ── Helper: test an invalid Codex plugin allowlist (environment value, optional CLI) ──
+test_codex_plugins_env_error() {
+  local label="$1"
+  local value="$2"
+  local expected="$3"
+  local extra="$4"
+
+  echo "--- $label ---"
+
+  STDERR_OUTPUT=$(env MCP_AGENTS_CODEX_PLUGINS="$value" \
+    $SERVER --provider codex $extra 2>&1 >/dev/null) || true
+
+  if echo "$STDERR_OUTPUT" | grep -q "$expected"; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (expected '$expected' in stderr)"
+    echo "  Stderr: $STDERR_OUTPUT"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 # ── Helper: test an invalid workspace-network environment value ──
 test_codex_workspace_network_env_error() {
   local label="$1"
@@ -922,6 +969,51 @@ test_cli_error "--codex-workspace-network invalid value"    "--codex-workspace-n
 test_cli_error "--codex-workspace-network invalid inline"   "--codex-workspace-network=maybe" "must be true or false"
 test_codex_workspace_network_env_error \
   "workspace network env rejects invalid value" "maybe" "must be true or false"
+test_cli_flag "--help shows Codex MCP allowlist flag" "--help" "--codex-mcp-servers"
+test_cli_flag "--help shows Codex MCP allowlist environment" "--help" "MCP_AGENTS_CODEX_MCP_SERVERS"
+test_cli_error "--codex-mcp-servers without value"          "--codex-mcp-servers"         "requires a value"
+test_cli_error "--codex-mcp-servers rejects invalid names"   "--codex-mcp-servers bad.name" "comma-separated server names"
+test_cli_error "--codex-mcp-servers rejects empty entries"   "--codex-mcp-servers a,,b"    "comma-separated server names"
+test_cli_error "--codex-mcp-servers rejects the reserved codex_apps name" "--codex-mcp-servers a,codex_apps" "reserves"
+test_cli_error "--codex-mcp-servers rejects duplicates"      "--codex-mcp-servers a,b,a"   "more than once"
+test_cli_error "--codex-mcp-servers rejects invalid inline"  "--codex-mcp-servers=a/b"     "comma-separated server names"
+for non_codex_provider in claude gemini browser codex-legacy; do
+  test_cli_error \
+    "--codex-mcp-servers rejects $non_codex_provider" \
+    "--provider $non_codex_provider --codex-mcp-servers mobbin" \
+    "only supported by --provider codex"
+done
+test_codex_mcp_servers_env_error \
+  "Codex MCP allowlist env rejects invalid name" "bad name" "comma-separated server names" ""
+test_codex_mcp_servers_env_error \
+  "Codex MCP allowlist env rejects duplicates" "a, b ,a" "more than once" ""
+test_codex_mcp_servers_env_error \
+  "Codex MCP allowlist invalid CLI value fails despite a valid env value" "mobbin" \
+  "comma-separated server names" "--codex-mcp-servers bad.name"
+test_cli_flag "--help shows Codex plugin allowlist flag" "--help" "--codex-plugins"
+test_cli_flag "--help shows Codex plugin allowlist environment" "--help" "MCP_AGENTS_CODEX_PLUGINS"
+test_cli_error "--codex-plugins without value"          "--codex-plugins"            "requires a value"
+test_cli_error "--codex-plugins rejects a bare name"    "--codex-plugins mobbin"     "plugin@marketplace"
+test_cli_error "--codex-plugins rejects dots"           "--codex-plugins mob.bin@mobbin" "plugin@marketplace"
+test_cli_error "--codex-plugins rejects dotted marketplace" "--codex-plugins mobbin@mob.bin" "plugin@marketplace"
+test_cli_error "--codex-plugins rejects path separators" "--codex-plugins ../x@y"    "plugin@marketplace"
+test_cli_error "--codex-plugins rejects empty entries"  "--codex-plugins a@b,,c@d"   "plugin@marketplace"
+test_cli_error "--codex-plugins rejects double at"      "--codex-plugins a@b@c"      "plugin@marketplace"
+test_cli_error "--codex-plugins rejects duplicates"     "--codex-plugins a@b,c@d,a@b" "more than once"
+test_cli_error "--codex-plugins rejects invalid inline" "--codex-plugins=a/b@c"      "plugin@marketplace"
+for non_codex_provider in claude gemini browser codex-legacy; do
+  test_cli_error \
+    "--codex-plugins rejects $non_codex_provider" \
+    "--provider $non_codex_provider --codex-plugins mobbin@mobbin" \
+    "only supported by --provider codex"
+done
+test_codex_plugins_env_error \
+  "Codex plugin allowlist env rejects invalid id" "bad id@x" "plugin@marketplace" ""
+test_codex_plugins_env_error \
+  "Codex plugin allowlist env rejects duplicates" "a@b, c@d ,a@b" "more than once" ""
+test_codex_plugins_env_error \
+  "Codex plugin allowlist invalid CLI value fails despite a valid env value" "mobbin@mobbin" \
+  "plugin@marketplace" "--codex-plugins bad.name@x"
 test_cli_error "--goal without value"                      "--goal"                     "requires a value"
 test_cli_error "--transport without value"                 "--transport"                "requires a value"
 test_cli_error "--transport rejects unknown values"        "--transport pipe"           "must be stdio or http"
@@ -4113,6 +4205,664 @@ try {
     await checkGeneration({});
     assert.equal(stderr.includes("SECRET_CONFIG_CONTENT"), false);
     data.trustVerified = true;
+  } else if (["mcp-off", "mcp-empty-cli", "mcp-allowlist", "mcp-env-trim", "mcp-cli-wins", "mcp-prototype-name"].includes(scenario)) {
+    const { createRequire } = await import("node:module");
+    const { parse } = createRequire(`${serverDir}/package.json`)("smol-toml");
+    const { default: assert } = await import("node:assert/strict");
+    const source = `${stubDir}/real-codex-home/config.toml`;
+    const spawns = () => fs.existsSync(`${stubDir}/app-spawns.jsonl`)
+      ? fs.readFileSync(`${stubDir}/app-spawns.jsonl`, "utf8").trim().split("\n").map(JSON.parse)
+      : [];
+    const approved = ["search_screens", "get_screen", "list_apps", "get_flow", "search_flows"];
+    const prompted = ["upload", "delete_collection", "export"];
+    const sortedApproved = [...approved].sort();
+    const SENTINEL = "SECRET_CONFIG_CONTENT";
+    const toolTables = (approvedTools, promptedTools = prompted) => [
+      ...approvedTools.map((t) => `[mcp_servers.mobbin.tools.${t}]\napproval_mode = "approve"`),
+      ...promptedTools.map((t) => `[mcp_servers.mobbin.tools.${t}]\napproval_mode = "prompt"`),
+    ].join("\n");
+    const mobbin = ({ url = 'url = "https://api.mobbin.com/mcp"', head = [], tools = toolTables(approved) } = {}) => [
+      "[mcp_servers.mobbin]",
+      url,
+      ...head,
+      "[mcp_servers.mobbin.oauth]",
+      "callback_port = 4567",
+      tools,
+    ].join("\n");
+    const unrelated = [
+      "default_tools_approval_mode = \"prompt\"",
+      `scopes = ["${SENTINEL}"]`,
+      "startup_timeout_sec = 20",
+    ];
+    const other = '[mcp_servers.other]\nurl = "https://other.example.com/mcp"\n[mcp_servers.other.tools.x]\napproval_mode = "approve"\n';
+    const list = () => call("codex-thread-list", {});
+    const lastConfig = () => spawns().at(-1).config;
+    const stopGeneration = async () => {
+      process.kill(spawns().at(-1).pid, "SIGTERM");
+      assert.equal(await waitFor(() => readSidecars().every((s) => s.childPid === null)), true);
+    };
+    const expectMobbin = async (tools, extra = {}, grace = 0) => {
+      const result = await list();
+      assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+      const captured = spawns().at(-1);
+      const config = JSON.parse(JSON.stringify(parse(captured.config)));
+      assert.deepEqual(Object.keys(config.mcp_servers), ["mobbin"]);
+      assert.deepEqual(config.mcp_servers.mobbin, {
+        url: "https://api.mobbin.com/mcp",
+        enabled_tools: tools,
+        ...extra,
+        tools: Object.fromEntries(tools.map((t) => [t, { approval_mode: "approve" }])),
+      });
+      for (const dropped of [SENTINEL, "callback_port", "default_tools_approval_mode", "oauth", "scopes", "other.example.com"]) {
+        assert.equal(captured.config.includes(dropped), false, dropped);
+      }
+      assert.equal(config.features.plugins, false);
+      assert.equal(config.mcp_optional_startup_grace_ms, grace);
+      assert.ok(captured.config.indexOf("mcp_optional_startup_grace_ms") < captured.config.indexOf("["));
+      assert.equal(captured.configMode, "600");
+    };
+    await mcpInitialize();
+    if (scenario === "mcp-off" || scenario === "mcp-empty-cli") {
+      fs.writeFileSync(source, `mcp_optional_startup_grace_ms = 2500\n${mobbin({ head: unrelated })}\n${other}`);
+      assert.notEqual((await list()).result?.isError, true);
+      const withServers = lastConfig();
+      assert.equal(withServers.includes("mcp_servers"), false);
+      assert.equal(withServers.includes("mcp_optional_startup_grace_ms"), false);
+      await stopGeneration();
+      fs.unlinkSync(source);
+      assert.notEqual((await list()).result?.isError, true);
+      assert.equal(lastConfig(), withServers);
+      assert.equal(spawns().length, 2);
+      data.mcpVerified = true;
+    } else if (scenario === "mcp-prototype-name") {
+      fs.writeFileSync(source, [
+        'model_provider = "example"',
+        '[model_providers.example]',
+        'name = "Example"',
+        'base_url = "https://provider.example.com/v1"',
+        'env_key = "EXAMPLE_PROVIDER_KEY"',
+        mobbin().replaceAll("mcp_servers.mobbin", "mcp_servers.__proto__"),
+      ].join("\n"));
+      const result = await list();
+      assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+      const config = JSON.parse(JSON.stringify(parse(lastConfig())));
+      assert.deepEqual(Object.keys(config.mcp_servers), ["__proto__"]);
+      assert.deepEqual(config.mcp_servers.__proto__, {
+        url: "https://api.mobbin.com/mcp",
+        enabled_tools: sortedApproved,
+        tools: Object.fromEntries(sortedApproved.map((t) => [t, { approval_mode: "approve" }])),
+      });
+      assert.equal(config.model_provider, "example");
+      assert.equal(config.model_providers.example.env_key, "EXAMPLE_PROVIDER_KEY");
+      assert.deepEqual(config.shell_environment_policy.exclude, ["EXAMPLE_PROVIDER_KEY"]);
+      data.mcpVerified = true;
+    } else if (scenario !== "mcp-allowlist") {
+      fs.writeFileSync(source, `${other}\n${mobbin({ head: unrelated })}`);
+      await expectMobbin(sortedApproved, { startup_timeout_sec: 20 });
+      data.mcpVerified = true;
+    } else {
+      fs.writeFileSync(source, `${other}\n${mobbin({ head: unrelated })}`);
+      await expectMobbin(sortedApproved, { startup_timeout_sec: 20 });
+      await stopGeneration();
+
+      // A valid source grace value is mirrored (small and bigint-sized).
+      fs.writeFileSync(source, `mcp_optional_startup_grace_ms = 2500\n${mobbin({ head: unrelated })}`);
+      await expectMobbin(sortedApproved, { startup_timeout_sec: 20 }, 2500);
+      await stopGeneration();
+      fs.writeFileSync(source, `mcp_optional_startup_grace_ms = 9007199254740993\n${mobbin({ head: unrelated })}`);
+      await list();
+      assert.match(lastConfig(), /^mcp_optional_startup_grace_ms = 9007199254740993$/mu);
+      await stopGeneration();
+
+      // Source enabled_tools / disabled_tools narrow the set; bad timeouts drop;
+      // a canonical https url on a non-loopback host is accepted.
+      fs.writeFileSync(source, mobbin({
+        url: 'url = "https://mcp.example.com/mcp"',
+        head: [
+          'enabled_tools = ["get_flow", "get_screen", "list_apps", "upload"]',
+          'disabled_tools = ["get_screen"]',
+          "startup_timeout_sec = -1",
+          "tool_timeout_sec = 45.5",
+        ],
+      }));
+      {
+        const result = await list();
+        assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+        const config = JSON.parse(JSON.stringify(parse(lastConfig())));
+        assert.deepEqual(config.mcp_servers.mobbin, {
+          url: "https://mcp.example.com/mcp",
+          enabled_tools: ["get_flow", "list_apps"],
+          tool_timeout_sec: 45.5,
+          tools: { get_flow: { approval_mode: "approve" }, list_apps: { approval_mode: "approve" } },
+        });
+      }
+      await stopGeneration();
+
+      // Tool names needing TOML quoting round-trip exactly and inject nothing.
+      {
+        const oddTools = ["a.b", 'x"y', "line\nbreak"];
+        const quoted = (t) => `"${t.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"').replace(/\n/gu, "\\n")}"`;
+        fs.writeFileSync(source, [
+          "[mcp_servers.mobbin]",
+          'url = "https://api.mobbin.com/mcp"',
+          ...oddTools.map((t) => `[mcp_servers.mobbin.tools.${quoted(t)}]\napproval_mode = "approve"`),
+        ].join("\n"));
+        const result = await list();
+        assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+        const config = JSON.parse(JSON.stringify(parse(lastConfig())));
+        assert.deepEqual(Object.keys(config.mcp_servers), ["mobbin"]);
+        assert.deepEqual(Object.keys(config.mcp_servers.mobbin).sort(), ["enabled_tools", "tools", "url"]);
+        assert.deepEqual(config.mcp_servers.mobbin.enabled_tools, [...oddTools].sort());
+        assert.deepEqual(Object.keys(config.mcp_servers.mobbin.tools).sort(), [...oddTools].sort());
+        for (const t of oddTools) {
+          assert.deepEqual(config.mcp_servers.mobbin.tools[t], { approval_mode: "approve" });
+        }
+        await stopGeneration();
+      }
+
+      const spawnCount = spawns().length;
+      const refusals = [
+        ["missing source config", null],
+        ["no servers", 'model = "x"\n'],
+        ["servers not a table", `mcp_servers = "${SENTINEL}"\n`],
+        ["server absent", other],
+        ["entry not a table", `[mcp_servers]\nmobbin = "${SENTINEL}"\n`],
+        ["disabled", mobbin({ head: ["enabled = false", `bearer_note = "${SENTINEL}"`] })],
+        ["enabled not boolean", mobbin({ head: [`enabled = "${SENTINEL}"`] })],
+        ["stdio command", mobbin({ head: [`command = "${SENTINEL}"`, `args = ["${SENTINEL}"]`] })],
+        ["stdio only", `[mcp_servers.mobbin]\ncommand = "${SENTINEL}"\n${toolTables(approved)}\n`],
+        ["http_headers", mobbin({ head: [`http_headers = { Authorization = "${SENTINEL}" }`] })],
+        ["env_http_headers", mobbin({ head: [`env_http_headers = { Authorization = "${SENTINEL}" }`] })],
+        ["bearer_token_env_var", mobbin({ head: [`bearer_token_env_var = "${SENTINEL}"`] })],
+        ["url missing", mobbin({ url: `# ${SENTINEL}` })],
+        ["url not a string", mobbin({ url: "url = 5" })],
+        ["url unparseable", mobbin({ url: `url = "${SENTINEL}"` })],
+        ["url wrong scheme", mobbin({ url: `url = "ftp://api.mobbin.com/${SENTINEL}"` })],
+        ["url userinfo", mobbin({ url: `url = "https://user:${SENTINEL}@api.mobbin.com/mcp"` })],
+        ["url http", mobbin({ url: 'url = "http://mcp.example.com/mcp"' })],
+        ["url query string", mobbin({ url: `url = "https://api.mobbin.com/mcp?key=${SENTINEL}"` })],
+        ["url fragment", mobbin({ url: `url = "https://api.mobbin.com/mcp#${SENTINEL}"` })],
+        ["url empty query", mobbin({ url: 'url = "https://api.mobbin.com/mcp?"' })],
+        ["url non-canonical uppercase host", mobbin({ url: 'url = "https://API.mobbin.com/mcp"' })],
+        ["url non-canonical default port", mobbin({ url: 'url = "https://api.mobbin.com:443/mcp"' })],
+        ["url non-canonical dot segment", mobbin({ url: 'url = "https://api.mobbin.com/a/../mcp"' })],
+        ["url unspecified ::", mobbin({ url: 'url = "https://[::]/"' })],
+        ["url hex ipv4 loopback", mobbin({ url: 'url = "https://0x7f.1/"' })],
+        ["url fullwidth localhost", mobbin({ url: 'url = "https://ｌｏｃａｌｈｏｓｔ/"' })],
+        ["url mapped unspecified", mobbin({ url: 'url = "https://[::ffff:0:0]/"' })],
+        ["url localhost", mobbin({ url: `url = "http://localhost:3000/${SENTINEL}"` })],
+        ["url localhost trailing dot", mobbin({ url: `url = "http://LOCALHOST.:3000/${SENTINEL}"` })],
+        ["url subdomain of localhost", mobbin({ url: `url = "https://app.localhost/${SENTINEL}"` })],
+        ["url 127.0.0.1", mobbin({ url: `url = "http://127.0.0.1:8080/${SENTINEL}"` })],
+        ["url 127.8.9.10", mobbin({ url: `url = "https://127.8.9.10/${SENTINEL}"` })],
+        ["url decimal loopback", mobbin({ url: `url = "http://2130706433/${SENTINEL}"` })],
+        ["url ::1", mobbin({ url: `url = "http://[::1]:8080/${SENTINEL}"` })],
+        ["url mapped loopback", mobbin({ url: `url = "http://[::ffff:127.0.0.1]/${SENTINEL}"` })],
+        ["url 0.0.0.0", mobbin({ url: `url = "http://0.0.0.0:9/${SENTINEL}"` })],
+        ["enabled_tools wrong type", mobbin({ head: [`enabled_tools = "${SENTINEL}"`] })],
+        ["all tools prompt", mobbin({ tools: toolTables([], [...approved, ...prompted]) })],
+        ["no tools table", `[mcp_servers.mobbin]\nurl = "https://api.mobbin.com/mcp"\n`],
+        ["approved tools all disabled", mobbin({ head: [`disabled_tools = ${JSON.stringify(approved)}`] })],
+        ["approved tools not enabled", mobbin({ head: ['enabled_tools = ["upload"]'] })],
+        ["grace negative", `mcp_optional_startup_grace_ms = -1\n${mobbin()}`],
+        ["grace float", `mcp_optional_startup_grace_ms = 1.5\n${mobbin()}`],
+        ["grace string", `mcp_optional_startup_grace_ms = "${SENTINEL}"\n${mobbin()}`],
+        ["grace boolean", `mcp_optional_startup_grace_ms = true\n${mobbin()}`],
+        ["grace too large", `mcp_optional_startup_grace_ms = 99999999999999999999999\n${mobbin()}`],
+        ["approve-like value", mobbin({ tools: `[mcp_servers.mobbin.tools.get_screen]\napproval_mode = "approve "\n[mcp_servers.mobbin.tools.get_flow]\napproval_mode = true` })],
+      ];
+      for (const [label, config] of refusals) {
+        if (config === null) { try { fs.unlinkSync(source); } catch {} }
+        else fs.writeFileSync(source, config);
+        const result = await list();
+        assert.equal(result.result?.isError, true, label);
+        assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable", label);
+        assert.equal(JSON.stringify(result).includes(SENTINEL), false, label);
+        assert.equal(spawns().length, spawnCount, label);
+        const discovery = await request("tools/list");
+        assert.ok(discovery.result.tools.length > 0, label);
+      }
+
+      // A later call retries after the source is corrected.
+      fs.writeFileSync(source, mobbin({ head: unrelated }));
+      await expectMobbin(sortedApproved, { startup_timeout_sec: 20 });
+      assert.equal(spawns().length, spawnCount + 1);
+      data.mcpVerified = true;
+    }
+    assert.equal(stderr.includes(SENTINEL), false);
+  } else if (scenario.startsWith("plugins-")) {
+    const { createRequire } = await import("node:module");
+    const { parse } = createRequire(`${serverDir}/package.json`)("smol-toml");
+    const { default: assert } = await import("node:assert/strict");
+    const { dirname } = await import("node:path");
+    const source = `${stubDir}/real-codex-home/config.toml`;
+    const cache = `${stubDir}/real-codex-home/plugins/cache`;
+    const spawns = () => fs.existsSync(`${stubDir}/app-spawns.jsonl`)
+      ? fs.readFileSync(`${stubDir}/app-spawns.jsonl`, "utf8").trim().split("\n").map(JSON.parse)
+      : [];
+    const SENTINEL = "SECRET_CONFIG_CONTENT";
+    const ID = "mobbin@mobbin";
+    const approved = ["search_screens", "get_screen", "list_apps", "get_flow", "search_flows"];
+    const prompted = ["upload", "delete_collection", "export"];
+    const sortedApproved = [...approved].sort();
+    const tools = (server, ok = approved, prompt = prompted) => [
+      ...ok.map((t) => `[plugins."${ID}".mcp_servers.${server}.tools.${t}]\napproval_mode = "approve"`),
+      ...prompt.map((t) => `[plugins."${ID}".mcp_servers.${server}.tools.${t}]\napproval_mode = "prompt"`),
+    ].join("\n");
+    const noise = [
+      `scopes = ["${SENTINEL}"]`,
+      'default_tools_approval_mode = "prompt"',
+      'url = "https://evil.example.com/mcp"',
+      "startup_timeout_sec = 20",
+    ].join("\n");
+    const pluginSource = ({ head = "", servers = ["mobbin"], extra = "" } = {}) => [
+      `[plugins."${ID}"]`,
+      "enabled = true",
+      head,
+      ...servers.map((s) => `[plugins."${ID}".mcp_servers.${s}]\n${noise}\n${tools(s)}`),
+      extra,
+    ].join("\n");
+    const mobbinServer = { type: "streamable-http", url: "https://api.mobbin.com/mcp" };
+    const put = (root, rel, content) => {
+      fs.mkdirSync(`${root}/${rel}`.replace(/\/[^/]*$/u, ""), { recursive: true });
+      fs.writeFileSync(`${root}/${rel}`, content);
+    };
+    // A Mobbin-like plugin: root plugin.json with the Agent Plugins $schema,
+    // .codex-plugin/plugin.json pointing at ./mcp.json, skills, and a .git dir.
+    const install = ({ manifest, rootManifest, mcp, dotMcp, version = "1.0.0", market = "mobbin", plugin = "mobbin", skip = [] } = {}) => {
+      const root = `${cache}/${market}/${plugin}/${version}`;
+      const body = manifest === undefined
+        ? { name: plugin, mcpServers: "./mcp.json", skills: "./skills/" }
+        : manifest;
+      const rootBody = rootManifest === undefined
+        ? { $schema: "https://example.com/agent-plugin.schema.json", name: plugin }
+        : rootManifest;
+      if (!skip.includes("manifest")) put(root, ".codex-plugin/plugin.json", typeof body === "string" ? body : JSON.stringify(body));
+      if (!skip.includes("root")) put(root, "plugin.json", typeof rootBody === "string" ? rootBody : JSON.stringify(rootBody));
+      if (!skip.includes("mcp")) put(root, "mcp.json", typeof mcp === "string" ? mcp : JSON.stringify(mcp ?? { mcpServers: { mobbin: mobbinServer } }));
+      if (dotMcp !== undefined) put(root, ".mcp.json", typeof dotMcp === "string" ? dotMcp : JSON.stringify(dotMcp));
+      put(root, "skills/design/SKILL.md", "---\nname: design\n---\n");
+      put(root, ".git/HEAD", "ref: refs/heads/main\n");
+      return root;
+    };
+    const restoreModes = () => {
+      for (const path of [`${cache}/mobbin/mobbin`, `${cache}/mobbin/mobbin/1.0.0`, `${cache}/mobbin/mobbin/1.0.0/mcp.json`]) {
+        try { fs.chmodSync(path, path.endsWith(".json") ? 0o600 : 0o755); } catch {}
+      }
+    };
+    const reset = () => {
+      restoreModes();
+      fs.rmSync(`${stubDir}/real-codex-home/plugins`, { recursive: true, force: true });
+      fs.rmSync(`${stubDir}/elsewhere`, { recursive: true, force: true });
+      fs.writeFileSync(source, pluginSource());
+    };
+    const list = () => call("codex-thread-list", {});
+    const lastSpawn = () => spawns().at(-1);
+    const lastConfig = () => lastSpawn().config;
+    const stopGeneration = async () => {
+      process.kill(lastSpawn().pid, "SIGTERM");
+      assert.equal(await waitFor(() => readSidecars().every((s) => s.childPid === null)), true);
+    };
+    const parsedConfig = () => JSON.parse(JSON.stringify(parse(lastConfig())));
+    const liftedEntry = (url, list) => ({
+      url,
+      enabled_tools: list,
+      tools: Object.fromEntries(list.map((t) => [t, { approval_mode: "approve" }])),
+    });
+    const mobbinEntry = (list = sortedApproved) => liftedEntry("https://api.mobbin.com/mcp", list);
+    const expectRun = async (expectedServers) => {
+      const result = await list();
+      assert.notEqual(result.result?.isError, true, JSON.stringify(result));
+      const config = parsedConfig();
+      assert.equal(config.features.plugins, false);
+      assert.equal(config.features.apps, false);
+      assert.equal(config.features.hooks, false);
+      assert.equal(Object.hasOwn(config, "marketplaces"), false);
+      assert.equal(Object.hasOwn(config, "plugins"), false);
+      assert.deepEqual(config.mcp_servers, expectedServers);
+      assert.equal(lastConfig().includes("[plugins"), false);
+      assert.equal(lastConfig().includes("[marketplaces"), false);
+      assert.equal(lastConfig().includes("plugins = true"), false);
+      assert.equal(fs.existsSync(`${lastSpawn().codexHome}/plugins`), false);
+      for (const dropped of [SENTINEL, "evil.example.com", "scopes", "default_tools_approval_mode", "startup_timeout_sec"]) {
+        assert.equal(lastConfig().includes(dropped), false, dropped);
+      }
+      return config;
+    };
+    const countHomes = () => {
+      const dir = lastSpawn() ? dirname(lastSpawn().codexHome) : null;
+      return dir ? fs.readdirSync(dir).filter((n) => n.startsWith("mcp-agents-codex-")).length : 0;
+    };
+    await mcpInitialize();
+
+    if (scenario === "plugins-off" || scenario === "plugins-empty-cli") {
+      reset();
+      install();
+      assert.notEqual((await list()).result?.isError, true);
+      const withPlugin = lastConfig();
+      assert.ok(withPlugin.includes("plugins = false"));
+      assert.equal(withPlugin.includes("[plugins"), false);
+      assert.equal(withPlugin.includes("[mcp_servers"), false);
+      assert.equal(withPlugin.includes("plugins = true"), false);
+      assert.equal(fs.existsSync(`${lastSpawn().codexHome}/plugins`), false);
+      await stopGeneration();
+      fs.rmSync(`${stubDir}/real-codex-home/plugins`, { recursive: true, force: true });
+      fs.unlinkSync(source);
+      assert.notEqual((await list()).result?.isError, true);
+      assert.equal(lastConfig(), withPlugin);
+      assert.equal(spawns().length, 2);
+      data.pluginsVerified = true;
+    } else if (scenario === "plugins-env-trim" || scenario === "plugins-cli-wins") {
+      reset();
+      install();
+      await expectRun({ mobbin: mobbinEntry() });
+      data.pluginsVerified = true;
+    } else if (scenario === "plugins-allowlist") {
+      assert.ok(stderr.includes(`Codex plugin allowlist: ${ID}`));
+      // Happy path: Mobbin-like plugin lifted as a plain url entry, no copy.
+      reset();
+      install();
+      await expectRun({ mobbin: mobbinEntry() });
+      assert.deepEqual(Object.keys(parsedConfig().mcp_servers.mobbin).sort(), ["enabled_tools", "tools", "url"]);
+      assert.equal(lastConfig().includes("startup_timeout_sec"), false);
+      assert.equal(lastConfig().includes("tool_timeout_sec"), false);
+      assert.deepEqual(fs.readdirSync(lastSpawn().codexHome).filter((n) => /plugin|skill|\.git/u.test(n)), []);
+      await stopGeneration();
+
+      // Declaration in .mcp.json only, root manifest only, identical duplicates.
+      reset();
+      install({ skip: ["mcp"], manifest: { name: "mobbin" }, dotMcp: { mcpServers: { mobbin: mobbinServer } } });
+      await expectRun({ mobbin: mobbinEntry() });
+      await stopGeneration();
+      reset();
+      install({ skip: ["manifest"], rootManifest: { $schema: "https://example.com/s.json", name: "mobbin", mcpServers: "./mcp.json" } });
+      await expectRun({ mobbin: mobbinEntry() });
+      await stopGeneration();
+      reset();
+      install({ dotMcp: { mcpServers: { mobbin: mobbinServer } } });
+      await expectRun({ mobbin: mobbinEntry() });
+      await stopGeneration();
+
+      // Inline mcpServers object, with and without the mcpServers key.
+      for (const inline of [{ mobbin: mobbinServer }, { mcpServers: { mobbin: mobbinServer } }]) {
+        reset();
+        install({ skip: ["mcp"], manifest: { name: "mobbin", mcpServers: inline } });
+        await expectRun({ mobbin: mobbinEntry() });
+        await stopGeneration();
+      }
+
+      // Conflicting declarations across sources skip only that server.
+      reset();
+      fs.writeFileSync(source, pluginSource({ servers: ["mobbin", "other"] }));
+      install({
+        mcp: { mcpServers: { mobbin: mobbinServer, other: { url: "https://api.example.com/other" } } },
+        dotMcp: { mcpServers: { mobbin: { type: "streamable-http", url: "https://api.mobbin.com/other" }, other: { url: "https://api.example.com/other" } } },
+      });
+      await expectRun({ other: liftedEntry("https://api.example.com/other", sortedApproved) });
+      assert.ok(stderr.includes(`Codex plugin "${ID}": skipped server "mobbin": conflicting declarations`));
+      await stopGeneration();
+
+      // Every skip reason; only the clean server is lifted.
+      reset();
+      const badKeys = ["command", "args", "env", "env_vars", "headers", "http_headers", "env_http_headers",
+        "http_headers_helper", "bearer_token_env_var", "bearerTokenEnvVar", "oauth", "scopes",
+        "startup_timeout_sec", "tool_timeout_sec", "enabled", "enabled_tools"];
+      const declared = { mobbin: mobbinServer };
+      const skippedNames = [];
+      badKeys.forEach((key, i) => {
+        declared[`key${i}`] = { type: "streamable-http", url: "https://api.example.com/k", [key]: key === "args" ? [SENTINEL] : SENTINEL };
+        skippedNames.push(`key${i}`);
+      });
+      Object.assign(declared, {
+        sse: { type: "sse", url: "https://api.example.com/sse" },
+        stdio: { type: "stdio", url: "https://api.example.com/stdio" },
+        weirdtype: { type: 5, url: "https://api.example.com/w" },
+        plainhttp: { url: "http://api.example.com/mcp" },
+        loopback: { url: "https://localhost/mcp" },
+        loopback2: { url: "https://127.0.0.1/mcp" },
+        query: { url: `https://api.example.com/mcp?k=${SENTINEL}` },
+        nourl: { type: "http" },
+        nooverride: { url: "https://api.example.com/no" },
+        disabled: { url: "https://api.example.com/dis" },
+        zero: { url: "https://api.example.com/zero" },
+        notatable: SENTINEL,
+        "bad name": { url: "https://api.example.com/bn" },
+      });
+      skippedNames.push("sse", "stdio", "weirdtype", "plainhttp", "loopback", "loopback2", "query", "nourl", "nooverride", "disabled", "zero", "notatable");
+      // The skip log is capped at 20 lines per generation, so check the skip
+      // reasons in two groups that each stay under the cap.
+      const groups = [
+        skippedNames.filter((n) => n.startsWith("key")),
+        skippedNames.filter((n) => !n.startsWith("key")),
+      ];
+      for (const [groupIndex, group] of groups.entries()) {
+        reset();
+        const groupDeclared = { mobbin: mobbinServer };
+        for (const name of group) groupDeclared[name] = declared[name];
+        if (groupIndex === 1) groupDeclared["bad name"] = declared["bad name"];
+        const withOverrides = ["mobbin", ...group.filter((n) => !["nooverride", "disabled", "zero", "notatable"].includes(n))]
+          .filter((n) => /^[A-Za-z0-9_-]+$/u.test(n));
+        fs.writeFileSync(source, [
+          pluginSource({ servers: withOverrides }),
+          `[plugins."${ID}".mcp_servers.disabled]\nenabled = false\n${tools("disabled")}`,
+          `[plugins."${ID}".mcp_servers.zero]\n${tools("zero", [], prompted)}`,
+        ].join("\n"));
+        install({ mcp: { mcpServers: groupDeclared } });
+        await expectRun({ mobbin: mobbinEntry() });
+        for (const name of group) {
+          assert.ok(stderr.includes(`Codex plugin "${ID}": skipped server "${name}":`), name);
+        }
+        if (groupIndex === 1) {
+          assert.ok(stderr.includes(`Codex plugin "${ID}": skipped a server with an invalid name`));
+          assert.equal(stderr.includes('server "bad name"'), false);
+        }
+        assert.equal(stderr.includes(SENTINEL), false);
+        await stopGeneration();
+      }
+
+      // A later declaration with an extra key skips the server even when the
+      // first one is clean and type/url are identical.
+      reset();
+      fs.writeFileSync(source, pluginSource({ servers: ["mobbin", "other"] }));
+      install({
+        mcp: { mcpServers: { mobbin: mobbinServer, other: { url: "https://api.example.com/other" } } },
+        dotMcp: { mcpServers: { mobbin: { ...mobbinServer, http_headers_helper: SENTINEL } } },
+      });
+      await expectRun({ other: liftedEntry("https://api.example.com/other", sortedApproved) });
+      assert.ok(stderr.includes(`Codex plugin "${ID}": skipped server "mobbin": only type and url are supported`));
+      assert.equal(stderr.includes(SENTINEL), false);
+      await stopGeneration();
+
+      // Skip log lines are capped per generation; codex_apps is reserved.
+      reset();
+      const capped = { mobbin: mobbinServer, codex_apps: mobbinServer };
+      const cappedNames = [];
+      for (let i = 0; i < 25; i += 1) {
+        capped[`cap${i}`] = { url: `http://api.example.com/cap${i}` };
+        cappedNames.push(`cap${i}`);
+      }
+      fs.writeFileSync(source, pluginSource({ servers: ["mobbin", "codex_apps"] }));
+      install({ mcp: { mcpServers: capped } });
+      await expectRun({ mobbin: mobbinEntry() });
+      const capLines = stderr.split("\n").filter((line) => line.includes('skipped server "cap'));
+      // codex_apps (declared first) takes the 20th logged line; 6 more follow.
+      assert.equal(capLines.length, 19);
+      assert.ok(stderr.includes(`Codex plugin "${ID}": skipped 6 more server(s)`));
+      assert.equal(stderr.includes('server "codex_apps"'), false);
+      assert.equal(parsedConfig().mcp_servers.codex_apps, undefined);
+      await stopGeneration();
+
+      // Source override narrowing: enabled_tools / disabled_tools / enabled = false.
+      reset();
+      install();
+      fs.writeFileSync(source, pluginSource({ servers: ["mobbin"] }).replace(
+        `[plugins."${ID}".mcp_servers.mobbin]\n`,
+        `[plugins."${ID}".mcp_servers.mobbin]\nenabled_tools = ["get_flow", "get_screen", "upload"]\ndisabled_tools = ["get_screen"]\n`));
+      await expectRun({ mobbin: mobbinEntry(["get_flow"]) });
+      await stopGeneration();
+
+      // Refusals.
+      const spawnCount = spawns().length;
+      const homes = countHomes();
+      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+      const unusable = (mcp) => () => { install({ mcp }); };
+      const refusals = [
+        ["source plugins absent", () => { install(); fs.writeFileSync(source, 'model = "x"\n'); }],
+        ["source plugins not a table", () => { install(); fs.writeFileSync(source, `plugins = "${SENTINEL}"\n`); }],
+        ["source plugin entry not a table", () => { install(); fs.writeFileSync(source, `[plugins]\n"${ID}" = "${SENTINEL}"\n`); }],
+        ["source plugin disabled", () => { install(); fs.writeFileSync(source, `[plugins."${ID}"]\nenabled = false\nnote = "${SENTINEL}"\n`); }],
+        ["source plugin enabled not boolean", () => { install(); fs.writeFileSync(source, `[plugins."${ID}"]\nenabled = "${SENTINEL}"\n`); }],
+        ["source config missing", () => { install(); fs.unlinkSync(source); }],
+        ["cache directory missing", () => {}],
+        ["marketplace directory missing", () => { install({ market: "other" }); }],
+        ["plugin directory is a symlink", () => {
+          install({ market: "elsewhere-src" });
+          fs.mkdirSync(`${cache}/mobbin`, { recursive: true });
+          fs.symlinkSync(`${cache}/elsewhere-src/mobbin`, `${cache}/mobbin/mobbin`, "dir");
+        }],
+        ["marketplace directory is a symlink", () => {
+          install({ market: "elsewhere-src" });
+          fs.symlinkSync(`${cache}/elsewhere-src`, `${cache}/mobbin`, "dir");
+        }],
+        ["zero versions", () => { fs.mkdirSync(`${cache}/mobbin/mobbin`, { recursive: true }); }],
+        ["two versions", () => { install(); install({ version: "2.0.0" }); }],
+        ["stray file beside the version", () => { install(); fs.writeFileSync(`${cache}/mobbin/mobbin/stray`, "x"); }],
+        ["version is a file", () => { fs.mkdirSync(`${cache}/mobbin/mobbin`, { recursive: true }); fs.writeFileSync(`${cache}/mobbin/mobbin/1.0.0`, SENTINEL); }],
+        ["version is a symlink", () => {
+          install({ version: "real" });
+          fs.renameSync(`${cache}/mobbin/mobbin/real`, `${stubDir}/elsewhere`);
+          fs.symlinkSync(`${stubDir}/elsewhere`, `${cache}/mobbin/mobbin/1.0.0`, "dir");
+        }],
+        ["no manifest at all", () => { install({ skip: ["manifest", "root"] }); }],
+        ["manifest invalid JSON", () => { install({ manifest: `{ ${SENTINEL}` }); }],
+        ["root manifest invalid JSON", () => { install({ rootManifest: `{ ${SENTINEL}` }); }],
+        ["manifest not an object", () => { install({ manifest: `["${SENTINEL}"]` }); }],
+        ["manifest directory is a symlink", () => {
+          const root = install();
+          fs.renameSync(`${root}/.codex-plugin`, `${stubDir}/elsewhere`);
+          fs.symlinkSync(`${stubDir}/elsewhere`, `${root}/.codex-plugin`, "dir");
+        }],
+        ["manifest is a symlink", () => {
+          const root = install({ skip: ["manifest"] });
+          fs.mkdirSync(`${root}/.codex-plugin`, { recursive: true });
+          fs.writeFileSync(`${stubDir}/outside.json`, JSON.stringify({ name: "mobbin" }));
+          fs.symlinkSync(`${stubDir}/outside.json`, `${root}/.codex-plugin/plugin.json`);
+        }],
+        ["oversized manifest", () => { install({ rootManifest: JSON.stringify({ name: "mobbin", pad: "x".repeat(1024 * 1024 + 1) }) }); }],
+        ["mcpServers path traversal", () => {
+          install({ manifest: { name: "mobbin", mcpServers: "../../x.json" } });
+          put(cache, "mobbin/x.json", JSON.stringify({ mcpServers: { mobbin: mobbinServer } }));
+        }],
+        ["mcpServers absolute path", () => {
+          install({ manifest: { name: "mobbin", mcpServers: `${stubDir}/outside.json` } });
+          fs.writeFileSync(`${stubDir}/outside.json`, JSON.stringify({ mcpServers: { mobbin: mobbinServer } }));
+        }],
+        ["mcpServers directory symlinks out of the plugin", () => {
+          const root = install({ manifest: { name: "mobbin", mcpServers: "./sub/mcp.json" } });
+          fs.mkdirSync(`${stubDir}/elsewhere`, { recursive: true });
+          fs.writeFileSync(`${stubDir}/elsewhere/mcp.json`, JSON.stringify({ mcpServers: { mobbin: mobbinServer } }));
+          fs.symlinkSync(`${stubDir}/elsewhere`, `${root}/sub`, "dir");
+        }],
+        ["mcpServers empty string", () => { install({ manifest: { name: "mobbin", mcpServers: "" } }); }],
+        ["mcpServers points at the root", () => { install({ manifest: { name: "mobbin", mcpServers: "./" } }); }],
+        ["mcpServers file missing", () => { install({ skip: ["mcp"] }); }],
+        ["mcpServers file invalid JSON", () => { install({ mcp: `{ ${SENTINEL}` }); }],
+        ["mcpServers file lacks mcpServers", () => { install({ mcp: { other: SENTINEL } }); }],
+        ["mcpServers file mcpServers not a table", () => { install({ mcp: { mcpServers: SENTINEL } }); }],
+        ["oversized mcp.json", () => { install({ mcp: JSON.stringify({ mcpServers: { mobbin: mobbinServer }, pad: "x".repeat(1024 * 1024 + 1) }) }); }],
+        [".mcp.json invalid JSON", () => { install({ dotMcp: `{ ${SENTINEL}` }); }],
+        [".mcp.json lacks mcpServers", () => { install({ dotMcp: { other: SENTINEL } }); }],
+        ["mcp.json is a symlink out of the tree", () => {
+          install({ skip: ["mcp"] });
+          fs.writeFileSync(`${stubDir}/outside.json`, JSON.stringify({ mcpServers: { mobbin: mobbinServer } }));
+          fs.symlinkSync(`${stubDir}/outside.json`, `${cache}/mobbin/mobbin/1.0.0/mcp.json`);
+        }],
+        ["mcp.json is a symlink inside the tree", () => {
+          const root = install({ skip: ["mcp"] });
+          put(root, "real.json", JSON.stringify({ mcpServers: { mobbin: mobbinServer } }));
+          fs.symlinkSync(`${root}/real.json`, `${root}/mcp.json`);
+        }],
+        [".mcp.json is a dangling symlink", () => {
+          const root = install();
+          fs.symlinkSync(`${stubDir}/nowhere-${SENTINEL}`, `${root}/.mcp.json`);
+        }],
+        ["mcpServers wrong type number", () => { install({ manifest: { name: "mobbin", mcpServers: 5 } }); }],
+        ["mcpServers wrong type array", () => { install({ manifest: { name: "mobbin", mcpServers: [SENTINEL] } }); }],
+        ["mcpServers null", () => { install({ manifest: { name: "mobbin", mcpServers: null } }); }],
+        ["inline mcpServers key not a table", () => { install({ manifest: { name: "mobbin", mcpServers: { mcpServers: SENTINEL } } }); }],
+        ["skills-only plugin without servers", () => { install({ skip: ["mcp"], manifest: { name: "mobbin", skills: "./skills/" } }); }],
+        ["only stdio server", unusable({ mcpServers: { mobbin: { command: SENTINEL, args: [SENTINEL], env: { TOKEN: SENTINEL } } } })],
+        ["only http_headers_helper server", unusable({ mcpServers: { mobbin: { ...mobbinServer, http_headers_helper: SENTINEL } } })],
+        ["only invalid server name", unusable({ mcpServers: { "bad name": mobbinServer } })],
+        ["only loopback server", unusable({ mcpServers: { mobbin: { url: "https://localhost/mcp" } } })],
+        ["no override for the server", () => { install(); fs.writeFileSync(source, `[plugins."${ID}"]\nenabled = true\n`); }],
+        ["override disabled", () => {
+          install();
+          fs.writeFileSync(source, pluginSource().replace(`[plugins."${ID}".mcp_servers.mobbin]\n`, `[plugins."${ID}".mcp_servers.mobbin]\nenabled = false\n`));
+        }],
+        ["override without approved tools", () => {
+          install();
+          fs.writeFileSync(source, `[plugins."${ID}"]\nenabled = true\n[plugins."${ID}".mcp_servers.mobbin.tools.upload]\napproval_mode = "prompt"\n`);
+        }],
+        ["conflicting declarations leave nothing usable", () => {
+          install({ dotMcp: { mcpServers: { mobbin: { type: "streamable-http", url: "https://api.mobbin.com/other" } } } });
+        }],
+        ...(isRoot ? [] : [
+          ["unreadable mcp.json", () => { install(); fs.chmodSync(`${cache}/mobbin/mobbin/1.0.0/mcp.json`, 0o000); }],
+          ["unreadable version directory", () => { install(); fs.chmodSync(`${cache}/mobbin/mobbin/1.0.0`, 0o000); }],
+          ["unreadable plugin directory", () => { install(); fs.chmodSync(`${cache}/mobbin/mobbin`, 0o000); }],
+        ]),
+      ];
+      for (const [label, setup] of refusals) {
+        reset();
+        setup();
+        const result = await list();
+        const text = JSON.stringify(result);
+        restoreModes();
+        assert.equal(result.result?.isError, true, label);
+        assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable", label);
+        assert.equal(text.includes(SENTINEL), false, label);
+        assert.equal(text.includes("outside.json"), false, label);
+        assert.equal(text.includes("real-codex-home"), false, `${label}: path leaked to the client`);
+        assert.equal(text.includes("EACCES"), false, label);
+        assert.equal(spawns().length, spawnCount, label);
+        assert.equal(countHomes(), homes, `${label}: leaked partial home`);
+        const discovery = await request("tools/list");
+        assert.ok(discovery.result.tools.length > 0, label);
+      }
+      assert.equal(stderr.includes("real-codex-home"), false, "source path leaked to stderr");
+      assert.equal(stderr.includes("EACCES"), false);
+
+      // A later call retries after the source is corrected.
+      reset();
+      install();
+      await expectRun({ mobbin: mobbinEntry() });
+      assert.equal(spawns().length, spawnCount + 1);
+      assert.equal(stderr.includes(SENTINEL), false);
+      data.pluginsVerified = true;
+    } else if (scenario === "plugins-dup-server") {
+      reset();
+      install();
+      install({ plugin: "second", manifest: { name: "second", mcpServers: "./mcp.json" } });
+      fs.writeFileSync(source, `${pluginSource()}\n[plugins."second@mobbin"]\nenabled = true\n[plugins."second@mobbin".mcp_servers.mobbin.tools.get_screen]\napproval_mode = "approve"\n`);
+      const result = await list();
+      assert.equal(result.result?.isError, true);
+      assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable");
+      assert.ok(JSON.stringify(result).includes("collides"));
+      assert.equal(spawns().length, 0);
+      data.pluginsVerified = true;
+    } else if (scenario === "plugins-conflict") {
+      reset();
+      install();
+      fs.writeFileSync(source, `${pluginSource()}\n[mcp_servers.mobbin]\nurl = "https://api.mobbin.com/mcp"\n[mcp_servers.mobbin.tools.get_screen]\napproval_mode = "approve"\n`);
+      const result = await list();
+      assert.equal(result.result?.isError, true);
+      assert.equal(result.result.structuredContent.code, "codex_app_server_unavailable");
+      assert.ok(JSON.stringify(result).includes("collides"));
+      assert.equal(spawns().length, 0);
+      data.pluginsVerified = true;
+    }
+    assert.equal(stderr.includes(SENTINEL), false);
   } else if (scenario === "model-provider") {
     const { createRequire } = await import("node:module");
     const { parse } = createRequire(`${serverDir}/package.json`)("smol-toml");
@@ -7385,6 +8135,39 @@ test_claude_job \
 test_codex_app_case "Codex inherits project trust per generation and refuses invalid source config" \
   "project-trust" '(.data.trustVerified == true)' "" "20"
 
+test_codex_app_case "Codex leaves user MCP servers out of the isolated config when the allowlist is off" \
+  "mcp-off" '(.data.mcpVerified == true)' "" "20"
+test_codex_app_case "Codex preserves a prototype-named MCP server alongside its model provider" \
+  "mcp-prototype-name" '(.data.mcpVerified == true)' "--codex-mcp-servers __proto__" "20"
+test_codex_app_case "Codex copies only allowlisted approve-only remote MCP servers and refuses unsafe ones" \
+  "mcp-allowlist" '(.data.mcpVerified == true)' "--codex-mcp-servers mobbin" "45"
+MCP_AGENTS_CODEX_MCP_SERVERS="  mobbin  " \
+  test_codex_app_case "Codex MCP allowlist environment value is trimmed" \
+  "mcp-env-trim" '(.data.mcpVerified == true)' "" "20"
+MCP_AGENTS_CODEX_MCP_SERVERS="other" \
+  test_codex_app_case "Codex MCP allowlist CLI value beats the environment" \
+  "mcp-cli-wins" '(.data.mcpVerified == true)' "--codex-mcp-servers mobbin" "20"
+MCP_AGENTS_CODEX_MCP_SERVERS="mobbin" \
+  test_codex_app_case "Codex MCP allowlist explicit empty CLI value overrides the environment" \
+  "mcp-empty-cli" '(.data.mcpVerified == true)' "--codex-mcp-servers=" "20"
+
+test_codex_app_case "Codex leaves installed plugins out of the isolated home when the plugin allowlist is off" \
+  "plugins-off" '(.data.pluginsVerified == true)' "" "20"
+test_codex_app_case "Codex lifts allowlisted plugin servers as plain entries, copies nothing, and refuses unsafe plugins" \
+  "plugins-allowlist" '(.data.pluginsVerified == true)' "--codex-plugins mobbin@mobbin" "90"
+MCP_AGENTS_CODEX_PLUGINS="  mobbin@mobbin  " \
+  test_codex_app_case "Codex plugin allowlist environment value is trimmed" \
+  "plugins-env-trim" '(.data.pluginsVerified == true)' "" "20"
+MCP_AGENTS_CODEX_PLUGINS="other@market" \
+  test_codex_app_case "Codex plugin allowlist CLI value beats the environment" \
+  "plugins-cli-wins" '(.data.pluginsVerified == true)' "--codex-plugins mobbin@mobbin" "20"
+MCP_AGENTS_CODEX_PLUGINS="mobbin@mobbin" \
+  test_codex_app_case "Codex plugin allowlist explicit empty CLI value overrides the environment" \
+  "plugins-empty-cli" '(.data.pluginsVerified == true)' "--codex-plugins=" "20"
+test_codex_app_case "Codex plugin allowlist refuses a server name shared with the MCP server allowlist" \
+  "plugins-conflict" '(.data.pluginsVerified == true)' "--codex-mcp-servers mobbin --codex-plugins mobbin@mobbin" "20"
+test_codex_app_case "Codex plugin allowlist refuses a server name shared by two plugins" \
+  "plugins-dup-server" '(.data.pluginsVerified == true)' "--codex-plugins mobbin@mobbin,second@mobbin" "20"
 test_codex_app_case "Codex mirrors the source model provider per generation without secrets" \
   "model-provider" '(.data.providerVerified == true)' "" "20"
 

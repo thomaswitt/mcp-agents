@@ -73,6 +73,10 @@ const DEFAULT_CODEX_APPROVAL_POLICY = "never";
 const DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS = true;
 const CODEX_WORKSPACE_NETWORK_ACCESS_ENV =
   "MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS";
+// Codex treats this server name specially, so neither allowlist may use it.
+const CODEX_RESERVED_SERVER_NAME = "codex_apps";
+const CODEX_MCP_SERVERS_ENV = "MCP_AGENTS_CODEX_MCP_SERVERS";
+const CODEX_PLUGINS_ENV = "MCP_AGENTS_CODEX_PLUGINS";
 const CODEX_STATE_ROOT_ENV = "MCP_AGENTS_CODEX_STATE_ROOT";
 const CODEX_SESSION_RETENTION_DAYS_ENV =
   "MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS";
@@ -638,6 +642,15 @@ Options:
   --codex-workspace-network=<b> Enable network access in workspace-write Codex
                                  sessions: true or false [default: ${DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS};
                                  env: ${CODEX_WORKSPACE_NETWORK_ACCESS_ENV}]
+  --codex-mcp-servers <names>    Comma-separated names of remote MCP servers to
+                                 copy from your Codex config into isolated codex
+                                 sessions (url and approve-only tools; codex only)
+                                 [default: none; env: ${CODEX_MCP_SERVERS_ENV}]
+  --codex-plugins <ids>          Comma-separated ids (plugin@marketplace) of
+                                 installed Codex plugins whose remote MCP servers
+                                 are lifted into isolated codex sessions
+                                 (approve-only tools; plugins stay off; codex
+                                 only) [default: none; env: ${CODEX_PLUGINS_ENV}]
   --goal <text>                  Native durable goal for codex; codex-legacy
                                  approximates goals by injecting instructions
                                  into each affected turn [default: none]
@@ -960,10 +973,11 @@ async function createHttpMcpHost({
  * Parse CLI flags from process.argv.
  * Handles commands, --help, --version, --provider, --transport, HTTP options,
  * --model, --model_reasoning_effort,
- * --sandbox_mode, --approval_policy, --codex-workspace-network, --goal,
+ * --sandbox_mode, --approval_policy, --codex-workspace-network,
+ * --codex-mcp-servers, --goal,
  * --codex_idle_timeout, --codex_cancel_grace, --codex_status_interval, browser
  * provider settings, --timeout, and unknown flags.
- * @returns {{ command: "serve"|"http-auth-headers", provider: string, transport: "stdio"|"http", httpPort: number, httpRuntimeIdleTimeoutMs: number, httpTokenFile?: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, codexStateRoot?: string, codexSessionRetentionDays?: number, browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[], defaultTimeoutMs?: number }}
+ * @returns {{ command: "serve"|"http-auth-headers", provider: string, transport: "stdio"|"http", httpPort: number, httpRuntimeIdleTimeoutMs: number, httpTokenFile?: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, codexStateRoot?: string, codexSessionRetentionDays?: number, codexMcpServers?: string, codexPlugins?: string, browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[], defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -987,6 +1001,8 @@ function parseArgs() {
   let codexStatusIntervalMs;
   let codexStateRoot;
   let codexSessionRetentionDays;
+  let codexMcpServers;
+  let codexPlugins;
   let browserLeaseCommand;
   let browserCommand;
   let browserIdleTimeoutMs;
@@ -1004,6 +1020,14 @@ function parseArgs() {
         arg.slice("--codex-workspace-network=".length),
         "--codex-workspace-network",
       );
+      continue;
+    }
+    if (arg.startsWith("--codex-mcp-servers=")) {
+      codexMcpServers = arg.slice("--codex-mcp-servers=".length);
+      continue;
+    }
+    if (arg.startsWith("--codex-plugins=")) {
+      codexPlugins = arg.slice("--codex-plugins=".length);
       continue;
     }
     switch (arg) {
@@ -1117,6 +1141,20 @@ function parseArgs() {
           args[++i],
           "--codex-workspace-network",
         );
+        break;
+      case "--codex-mcp-servers":
+        if (i + 1 >= args.length) {
+          writeStderr("error: --codex-mcp-servers requires a value\n");
+          process.exit(1);
+        }
+        codexMcpServers = args[++i];
+        break;
+      case "--codex-plugins":
+        if (i + 1 >= args.length) {
+          writeStderr("error: --codex-plugins requires a value\n");
+          process.exit(1);
+        }
+        codexPlugins = args[++i];
         break;
       case "--goal":
         if (i + 1 >= args.length) {
@@ -1343,6 +1381,18 @@ function parseArgs() {
     );
     process.exit(1);
   }
+  if (provider !== "codex" && codexMcpServers !== undefined) {
+    writeStderr(
+      "error: --codex-mcp-servers is only supported by --provider codex\n",
+    );
+    process.exit(1);
+  }
+  if (provider !== "codex" && codexPlugins !== undefined) {
+    writeStderr(
+      "error: --codex-plugins is only supported by --provider codex\n",
+    );
+    process.exit(1);
+  }
   if (provider !== "codex" && codexSessionRetentionDays !== undefined) {
     writeStderr(
       "error: --codex-session-retention-days is only supported by --provider codex\n",
@@ -1399,6 +1449,8 @@ function parseArgs() {
     codexStatusIntervalMs,
     codexStateRoot,
     codexSessionRetentionDays,
+    codexMcpServers,
+    codexPlugins,
     browserLeaseCommand,
     browserCommand,
     browserIdleTimeoutMs,
@@ -1437,6 +1489,88 @@ function resolveCodexWorkspaceNetworkAccess(cliValue) {
   const envValue = process.env[CODEX_WORKSPACE_NETWORK_ACCESS_ENV];
   if (envValue === undefined) return DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS;
   return parseBooleanSetting(envValue, CODEX_WORKSPACE_NETWORK_ACCESS_ENV);
+}
+
+/**
+ * Parse a comma-separated Codex MCP server allowlist or terminate with a
+ * configuration error. Empty input disables the allowlist.
+ * @param {string} value
+ * @param {string} source Flag or environment variable name for the error text.
+ * @returns {string[]}
+ */
+function parseCodexMcpServerNames(value, source) {
+  if (value.trim() === "") return [];
+  const names = value.split(",").map((name) => name.trim());
+  if (names.some((name) => !/^[A-Za-z0-9_-]+$/u.test(name))) {
+    writeStderr(
+      `error: ${source} must be comma-separated server names made of letters, digits, "_" or "-"\n`,
+    );
+    process.exit(1);
+  }
+  if (names.includes(CODEX_RESERVED_SERVER_NAME)) {
+    writeStderr(`error: ${source} must not name "${CODEX_RESERVED_SERVER_NAME}", which Codex reserves\n`);
+    process.exit(1);
+  }
+  if (new Set(names).size !== names.length) {
+    writeStderr(`error: ${source} lists a server name more than once\n`);
+    process.exit(1);
+  }
+  return names;
+}
+
+/**
+ * Resolve the operator allowlist of user MCP servers copied into isolated
+ * Codex configs. A CLI value (even an empty one) wins over the environment
+ * variable; unset or blank disables the feature.
+ * @param {string | undefined} cliValue
+ * @returns {string[]}
+ */
+function resolveCodexMcpServers(cliValue) {
+  if (cliValue !== undefined) {
+    return parseCodexMcpServerNames(cliValue, "--codex-mcp-servers");
+  }
+  const envValue = process.env[CODEX_MCP_SERVERS_ENV];
+  if (envValue === undefined) return [];
+  return parseCodexMcpServerNames(envValue, CODEX_MCP_SERVERS_ENV);
+}
+
+/**
+ * Parse a comma-separated Codex plugin allowlist (`plugin@marketplace` ids) or
+ * terminate with a configuration error. Empty input disables the allowlist.
+ * Dots are rejected so ids are safe path segments.
+ * @param {string} value
+ * @param {string} source Flag or environment variable name for the error text.
+ * @returns {string[]}
+ */
+function parseCodexPluginIds(value, source) {
+  if (value.trim() === "") return [];
+  const ids = value.split(",").map((id) => id.trim());
+  if (ids.some((id) => !/^[A-Za-z0-9_-]+@[A-Za-z0-9_-]+$/u.test(id))) {
+    writeStderr(
+      `error: ${source} must be comma-separated plugin ids of the form plugin@marketplace made of letters, digits, "_" or "-"\n`,
+    );
+    process.exit(1);
+  }
+  if (new Set(ids).size !== ids.length) {
+    writeStderr(`error: ${source} lists a plugin id more than once\n`);
+    process.exit(1);
+  }
+  return ids;
+}
+
+/**
+ * Resolve the operator allowlist of installed Codex plugins. A CLI value (even
+ * an empty one) wins over the environment variable; unset or blank disables it.
+ * @param {string | undefined} cliValue
+ * @returns {string[]}
+ */
+function resolveCodexPlugins(cliValue) {
+  if (cliValue !== undefined) {
+    return parseCodexPluginIds(cliValue, "--codex-plugins");
+  }
+  const envValue = process.env[CODEX_PLUGINS_ENV];
+  if (envValue === undefined) return [];
+  return parseCodexPluginIds(envValue, CODEX_PLUGINS_ENV);
 }
 
 /**
@@ -3095,22 +3229,21 @@ function readCodexFastModeOptIn(codexHome) {
   }
 }
 
-const isTomlTable = (value) => value !== null && typeof value === "object" &&
-  (Object.getPrototypeOf(value) === null || Object.getPrototypeOf(value) === Object.prototype);
-
 /**
- * Read and parse the source Codex config once. Errors never quote the source.
+ * Read and parse the source Codex config once. A missing file is an empty
+ * config; read and parse failures never quote the file's contents.
  * @param {string} codexHome
- * @returns {Record<string, unknown> | undefined} undefined when the file is missing
+ * @returns {Record<string, unknown>}
  */
 function readCodexSourceConfig(codexHome) {
   let source;
   try {
     source = readFileSync(join(codexHome, "config.toml"), "utf8");
   } catch (err) {
-    if (err?.code === "ENOENT") return undefined;
+    if (err?.code === "ENOENT") return {};
     throw new Error("Cannot read source Codex config.toml; check its path and permissions");
   }
+
   try {
     return parseToml(source, { integersAsBigInt: "asNeeded" });
   } catch {
@@ -3120,12 +3253,43 @@ function readCodexSourceConfig(codexHome) {
 }
 
 /**
- * Extract only explicit project trust decisions; never recover a partial registry.
- * @param {Record<string, unknown> | undefined} config
+ * Read the source config's top-level `mcp_optional_startup_grace_ms`: how long
+ * Codex waits for optional MCP servers when it builds a turn's tool catalog.
+ * Absent means 0 (wait for each server's startup timeout), so an allowlisted
+ * server is in the first turn's catalog. Present-but-invalid refuses startup
+ * without echoing the value.
+ * @param {Record<string, any>} config
+ * @returns {string} A TOML integer literal.
+ */
+function readCodexOptionalStartupGraceMs(config) {
+  if (!Object.hasOwn(config, "mcp_optional_startup_grace_ms")) return "0";
+  const value = config.mcp_optional_startup_grace_ms;
+  const valid = typeof value === "bigint"
+    ? value >= 0n && value <= 18446744073709551615n
+    : Number.isSafeInteger(value) && value >= 0;
+  if (!valid) {
+    throw new Error("Source Codex config.toml has an invalid mcp_optional_startup_grace_ms; use a non-negative integer");
+  }
+  return String(value);
+}
+
+/**
+ * Whether a parsed TOML value is a plain table.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isTomlTable(value) {
+  return value !== null && typeof value === "object" &&
+    (Object.getPrototypeOf(value) === null || Object.getPrototypeOf(value) === Object.prototype);
+}
+
+/**
+ * Read only explicit project trust decisions; never recover a partial registry.
+ * @param {Record<string, any>} config Parsed source Codex config.
  * @returns {Record<string, { trust_level: "trusted" | "untrusted" }>}
  */
-function codexProjectTrustFrom(config) {
-  if (!config || !Object.hasOwn(config, "projects")) return {};
+function readCodexProjectTrust(config) {
+  if (!Object.hasOwn(config, "projects")) return {};
   const invalidTrust = () => new Error(
     "Source Codex config.toml has invalid project trust settings; " +
     "projects must be tables with trust_level set to trusted or untrusted when present",
@@ -3144,11 +3308,420 @@ function codexProjectTrustFrom(config) {
 }
 
 /**
+ * Whether a URL hostname (as normalized by `URL`) is a loopback or unspecified
+ * address, in any spelling `URL` canonicalizes to these forms.
+ * @param {string} hostname
+ * @returns {boolean}
+ */
+function isLoopbackHostname(hostname) {
+  let host = hostname.toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  while (host.endsWith(".")) host = host.slice(0, -1);
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/u.exec(host);
+  if (v4) return Number(v4[1]) === 127 || Number(v4[1]) === 0;
+  if (host.includes(":")) {
+    if (host === "::" || host === "::1") return true;
+    // IPv4-mapped (URL canonicalizes ::ffff:a.b.c.d to ::ffff:xxxx:yyyy).
+    const mapped = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/u.exec(host);
+    if (mapped) {
+      const firstOctet = Number.parseInt(mapped[1], 16) >> 8;
+      return firstOctet === 127 || firstOctet === 0;
+    }
+  }
+  return false;
+}
+
+/**
+ * Check a candidate remote MCP server URL against the allowlist rules: https
+ * only, canonical form, no credentials, query, fragment, or literal loopback
+ * host. Returns a fixed reason string, or undefined when the URL qualifies.
+ * Never echoes the value.
+ * @param {unknown} value
+ * @returns {string | undefined}
+ */
+function codexRemoteUrlProblem(value) {
+  let url;
+  try {
+    if (typeof value !== "string") throw new Error("not a string");
+    url = new URL(value);
+  } catch {
+    return "url is missing or invalid";
+  }
+  if (url.protocol !== "https:") return "url must use https";
+  if (url.username !== "" || url.password !== "") {
+    return "url must not contain credentials";
+  }
+  // An empty "?" or "#" leaves search/hash empty but stays in href.
+  if (url.search !== "" || url.hash !== "" || /[?#]/u.test(value)) {
+    return "url must not contain a query string or fragment";
+  }
+  if (url.href !== value) return "url must be in canonical form";
+  if (isLoopbackHostname(url.hostname)) {
+    return "url must not point at a loopback host";
+  }
+  return undefined;
+}
+
+/**
+ * Approve-only tool names from a source `tools` table, narrowed by optional
+ * `enabled_tools` / `disabled_tools` lists. Returns undefined when a list has
+ * the wrong type.
+ * @param {Record<string, any>} entry
+ * @returns {string[] | undefined} Sorted tool names.
+ */
+function codexApprovedTools(entry) {
+  const list = (key) => {
+    if (!Object.hasOwn(entry, key)) return null;
+    const value = entry[key];
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+      return undefined;
+    }
+    return new Set(value);
+  };
+  const enabled = list("enabled_tools");
+  const disabled = list("disabled_tools");
+  if (enabled === undefined || disabled === undefined) return undefined;
+  const approved = [];
+  if (isTomlTable(entry.tools)) {
+    for (const [tool, toolConfig] of Object.entries(entry.tools)) {
+      if (!isTomlTable(toolConfig) || toolConfig.approval_mode !== "approve") continue;
+      if (enabled && !enabled.has(tool)) continue;
+      if (disabled?.has(tool)) continue;
+      approved.push(tool);
+    }
+  }
+  return approved.sort();
+}
+
+/**
+ * Derive the isolated-config `[mcp_servers.*]` tables for the operator
+ * allowlist. Only remote URL servers qualify, and only url, approve-only tools,
+ * and positive timeouts are copied; anything else in the source entry is
+ * dropped. Errors name only the server and a fixed reason, never source values.
+ * @param {Record<string, any>} config Parsed source Codex config.
+ * @param {string[]} names Validated allowlist.
+ * @returns {Record<string, Record<string, any>>}
+ */
+function selectCodexMcpServers(config, names) {
+  const selected = Object.create(null);
+  const sourceServers = isTomlTable(config.mcp_servers) ? config.mcp_servers : {};
+  for (const name of names) {
+    const refuse = (reason) => new Error(
+      `Codex MCP server allowlist refused "${name}": ${reason}`,
+    );
+    if (!Object.hasOwn(sourceServers, name)) {
+      throw refuse("not defined in the source Codex config.toml [mcp_servers]");
+    }
+    const entry = sourceServers[name];
+    if (!isTomlTable(entry)) throw refuse("source entry is not a table");
+    if (Object.hasOwn(entry, "enabled") && entry.enabled !== true) {
+      throw refuse("source entry is disabled");
+    }
+    if (Object.hasOwn(entry, "command")) {
+      throw refuse("stdio servers are not supported; use a remote url server");
+    }
+    for (const key of ["http_headers", "env_http_headers", "bearer_token_env_var"]) {
+      if (Object.hasOwn(entry, key)) {
+        throw refuse("static or environment-sourced credentials are not forwarded");
+      }
+    }
+    const urlProblem = codexRemoteUrlProblem(entry.url);
+    if (urlProblem) throw refuse(urlProblem);
+
+    for (const key of ["enabled_tools", "disabled_tools"]) {
+      if (Object.hasOwn(entry, key) &&
+          (!Array.isArray(entry[key]) || entry[key].some((item) => typeof item !== "string"))) {
+        throw refuse(`${key} must be a list of tool names`);
+      }
+    }
+    const approved = codexApprovedTools(entry);
+    if (approved.length === 0) {
+      throw refuse('no enabled tools have approval_mode = "approve"');
+    }
+
+    const server = { url: entry.url };
+    server.enabled_tools = approved;
+    for (const key of ["startup_timeout_sec", "tool_timeout_sec"]) {
+      const value = entry[key];
+      if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+        server[key] = value;
+      }
+    }
+    server.tools = Object.fromEntries(
+      approved.map((tool) => [tool, { approval_mode: "approve" }]),
+    );
+    selected[name] = server;
+  }
+  return selected;
+}
+
+const CODEX_PLUGIN_MAX_JSON_BYTES = 1024 * 1024;
+const CODEX_PLUGIN_SERVER_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
+const CODEX_PLUGIN_SERVER_KEYS = new Set(["type", "url"]);
+const CODEX_PLUGIN_SKIP_LOG_LIMIT = 20;
+const CODEX_PLUGIN_HTTP_TYPES = new Set(["http", "streamable-http", "streamable_http"]);
+
+/** A fixed-reason plugin allowlist refusal; it never carries paths or values. */
+class CodexPluginRefusal extends Error {}
+
+/**
+ * Read a bounded JSON file through one descriptor: O_NOFOLLOW refuses a
+ * symlink and `fstat` on the opened descriptor proves a regular file within
+ * the size cap, so nothing can be swapped between check and read. Never throws
+ * and never exposes the content or the error.
+ * @param {string} path
+ * @returns {{ absent: true } | { failed: true } | { value: unknown }}
+ */
+function readCodexPluginJson(path) {
+  let fd;
+  try {
+    fd = openSync(
+      path,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+    );
+  } catch (err) {
+    return err?.code === "ENOENT" ? { absent: true } : { failed: true };
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > CODEX_PLUGIN_MAX_JSON_BYTES) return { failed: true };
+    const buffer = readFileSync(fd);
+    if (buffer.length > CODEX_PLUGIN_MAX_JSON_BYTES) return { failed: true };
+    return { value: JSON.parse(buffer.toString("utf8")) };
+  } catch {
+    return { failed: true };
+  } finally {
+    try { closeSync(fd); } catch {}
+  }
+}
+
+/**
+ * Lift the remote MCP servers of the operator-allowlisted installed Codex
+ * plugins into plain top-level `[mcp_servers.*]` entries. Plugins themselves
+ * stay off and nothing is copied: the installed plugin is only READ, so a
+ * resolution mismatch with Codex can make a server missing, never unrestricted.
+ * Declarations are the union of every place Codex might read. A server is
+ * lifted only if it declares nothing beyond `type` and `url`, uses a remote
+ * https URL, and the source `plugins."<id>".mcp_servers.<name>` override
+ * approves at least one tool. Refusals name only the plugin id (and a
+ * validated server name) with a fixed reason, never paths, values or fs errors.
+ * @param {Record<string, any>} config Parsed source Codex config.
+ * @param {string} sourceCodexHome
+ * @param {string[]} ids Validated `plugin@marketplace` allowlist.
+ * @param {string[]} serverNames The `--codex-mcp-servers` allowlist.
+ * @returns {Record<string, Record<string, any>>} Lifted `mcp_servers` tables.
+ */
+function selectCodexPlugins(config, sourceCodexHome, ids, serverNames) {
+  const lifted = new Map();
+  const sourcePlugins = isTomlTable(config.plugins) ? config.plugins : {};
+  const claimedServers = new Set(serverNames);
+  for (const id of ids) {
+    const refuse = (reason) => new CodexPluginRefusal(
+      `Codex plugin allowlist refused "${id}": ${reason}`,
+    );
+    try {
+      const usable = liftCodexPluginServers(id, sourcePlugins, sourceCodexHome, refuse);
+      for (const [name, server] of usable) {
+        if (claimedServers.has(name)) {
+          throw refuse(`server "${name}" collides with another allowlisted server name`);
+        }
+        claimedServers.add(name);
+        lifted.set(name, server);
+      }
+    } catch (err) {
+      if (err instanceof CodexPluginRefusal) throw err;
+      throw refuse("plugin files could not be read");
+    }
+  }
+  return Object.fromEntries(lifted);
+}
+
+/**
+ * Read one installed plugin and return its usable servers (see
+ * `selectCodexPlugins`). May throw raw fs errors; the caller wraps them.
+ * @param {string} id
+ * @param {Record<string, any>} sourcePlugins
+ * @param {string} sourceCodexHome
+ * @param {(reason: string) => Error} refuse
+ * @returns {Map<string, Record<string, any>>}
+ */
+function liftCodexPluginServers(id, sourcePlugins, sourceCodexHome, refuse) {
+  const sourceEntry = Object.hasOwn(sourcePlugins, id) ? sourcePlugins[id] : undefined;
+  if (!isTomlTable(sourceEntry) || sourceEntry.enabled !== true) {
+    throw refuse("not installed or not enabled in the source Codex config");
+  }
+  const marketplace = id.slice(id.indexOf("@") + 1);
+  const plugin = id.slice(0, id.indexOf("@"));
+  const marketplaceDir = join(sourceCodexHome, "plugins", "cache", marketplace);
+  const pluginDir = join(marketplaceDir, plugin);
+  const realDirectory = (path) => {
+    try {
+      const stat = lstatSync(path);
+      return stat.isDirectory() && !stat.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  if (!realDirectory(marketplaceDir) || !realDirectory(pluginDir)) {
+    throw refuse("plugin cache directory is missing or not a real directory");
+  }
+  const versions = readdirSync(pluginDir);
+  if (versions.length !== 1 || !realDirectory(join(pluginDir, versions[0]))) {
+    throw refuse("expected exactly one installed version");
+  }
+  const versionRoot = join(pluginDir, versions[0]);
+  const hiddenManifestDir = join(versionRoot, ".codex-plugin");
+  if (existsSync(hiddenManifestDir) && !realDirectory(hiddenManifestDir)) {
+    throw refuse("plugin manifest directory is not a real directory");
+  }
+
+  // Parse every manifest that exists; an unreadable one refuses the plugin.
+  const manifests = [];
+  for (const path of [
+    join(versionRoot, "plugin.json"),
+    join(hiddenManifestDir, "plugin.json"),
+  ]) {
+    const result = readCodexPluginJson(path);
+    if (result.absent) continue;
+    if (result.failed || !isTomlTable(result.value)) {
+      throw refuse("plugin manifest is unreadable or invalid");
+    }
+    manifests.push(result.value);
+  }
+  if (manifests.length === 0) throw refuse("not a Codex plugin");
+
+  // Union of every place Codex might read server declarations.
+  const tables = [];
+  const addFile = (path, required) => {
+    const result = readCodexPluginJson(path);
+    if (result.absent && !required) return;
+    if (result.absent || result.failed || !isTomlTable(result.value) ||
+        !isTomlTable(result.value.mcpServers)) {
+      throw refuse("server declaration file is unreadable or invalid");
+    }
+    tables.push(result.value.mcpServers);
+  };
+  addFile(join(versionRoot, "mcp.json"), false);
+  addFile(join(versionRoot, ".mcp.json"), false);
+  for (const manifest of manifests) {
+    if (!Object.hasOwn(manifest, "mcpServers")) continue;
+    const entry = manifest.mcpServers;
+    const invalid = () => refuse("invalid mcpServers manifest entry");
+    if (typeof entry === "string") {
+      const file = resolve(versionRoot, entry);
+      const inside = relative(versionRoot, file);
+      if (entry === "" || inside === "" || inside.startsWith("..") || isAbsolute(inside)) {
+        throw invalid();
+      }
+      let contained = false;
+      try {
+        const realInside = relative(realpathSync(versionRoot), realpathSync(file));
+        contained = realInside !== "" && !realInside.startsWith("..") && !isAbsolute(realInside);
+      } catch {}
+      if (!contained) throw invalid();
+      addFile(file, true);
+    } else if (isTomlTable(entry)) {
+      if (Object.hasOwn(entry, "mcpServers")) {
+        if (!isTomlTable(entry.mcpServers)) throw invalid();
+        tables.push(entry.mcpServers);
+      } else {
+        tables.push(entry);
+      }
+    } else {
+      throw invalid();
+    }
+  }
+
+  const declarations = new Map();
+  for (const table of tables) {
+    for (const [name, definition] of Object.entries(table)) {
+      if (!declarations.has(name)) declarations.set(name, []);
+      declarations.get(name).push(definition);
+    }
+  }
+
+  const sourceOverrides = isTomlTable(sourceEntry.mcp_servers) ? sourceEntry.mcp_servers : {};
+  const usable = new Map();
+  let skipped = 0;
+  let skippedSilently = 0;
+  for (const [name, definitions] of declarations) {
+    const validName = CODEX_PLUGIN_SERVER_NAME.test(name) && name !== CODEX_RESERVED_SERVER_NAME;
+    const skip = (reason) => {
+      if (skipped >= CODEX_PLUGIN_SKIP_LOG_LIMIT) {
+        skippedSilently += 1;
+        return;
+      }
+      skipped += 1;
+      const label = validName ? `server "${name}"` : "a server with an invalid name";
+      logErr(`[mcp-agents] Codex plugin "${id}": skipped ${label}: ${reason}`);
+    };
+    if (!validName) {
+      skip("name is not supported");
+      continue;
+    }
+    if (!definitions.every(isTomlTable)) {
+      skip("declaration is not a table");
+      continue;
+    }
+    const signature = (definition) => JSON.stringify([definition.type ?? null, definition.url ?? null]);
+    if (new Set(definitions.map(signature)).size > 1) {
+      skip("conflicting declarations");
+      continue;
+    }
+    const [definition] = definitions;
+    if (!definitions.every((candidate) =>
+      Object.keys(candidate).every((key) => CODEX_PLUGIN_SERVER_KEYS.has(key)))) {
+      skip("only type and url are supported; credentials, commands and other keys are not");
+      continue;
+    }
+    if (!definitions.every((candidate) => !Object.hasOwn(candidate, "type") ||
+        (typeof candidate.type === "string" && CODEX_PLUGIN_HTTP_TYPES.has(candidate.type)))) {
+      skip("only streamable HTTP servers are supported");
+      continue;
+    }
+    const urlProblem = codexRemoteUrlProblem(definition.url);
+    if (urlProblem) {
+      skip(urlProblem);
+      continue;
+    }
+    const override = Object.hasOwn(sourceOverrides, name) ? sourceOverrides[name] : undefined;
+    if (!isTomlTable(override)) {
+      skip('no tools have approval_mode = "approve" in the source config');
+      continue;
+    }
+    if (Object.hasOwn(override, "enabled") && override.enabled !== true) {
+      skip("disabled in the source config");
+      continue;
+    }
+    const approved = codexApprovedTools(override);
+    if (approved === undefined) {
+      skip("enabled_tools and disabled_tools must be lists of tool names");
+      continue;
+    }
+    if (approved.length === 0) {
+      skip('no enabled tools have approval_mode = "approve"');
+      continue;
+    }
+    usable.set(name, {
+      url: definition.url,
+      enabled_tools: approved,
+      tools: Object.fromEntries(approved.map((tool) => [tool, { approval_mode: "approve" }])),
+    });
+  }
+  if (skippedSilently > 0) {
+    logErr(`[mcp-agents] Codex plugin "${id}": skipped ${skippedSilently} more server(s)`);
+  }
+  if (usable.size === 0) throw refuse("no usable remote server with pre-approved tools");
+  return usable;
+}
+
+/**
  * Extract the source `model_provider` and its allowlisted provider table. Keys
  * outside the allowlist are never copied; only their names are logged. A
  * provider that authenticates through a setting the bridge does not mirror is
- * refused, because Codex would otherwise fall back to the copied auth.json and
- * send that login to the provider's host.
+ * refused, because Codex could otherwise use the copied auth.json login for
+ * the provider's host when requires_openai_auth is true.
  * @param {Record<string, unknown> | undefined} config
  * @returns {{ id: string, table: Record<string, unknown> | undefined } | undefined}
  */
@@ -3169,7 +3742,8 @@ function codexModelProviderFrom(config) {
   if (!isTomlTable(sourceTable)) throw invalidProvider();
 
   // Credential sources the bridge does not mirror: refuse rather than let
-  // Codex fall back to the copied auth.json. Header names only, never values.
+  // Codex use the copied auth.json when requires_openai_auth is true. Header
+  // names only, never values.
   // The names in the message come from this fixed list, never from the source.
   // This is a name-based denylist: a credential field a future Codex adds
   // would be dropped and logged, not refused.
@@ -3322,7 +3896,7 @@ function toTomlString(value) {
 
 /**
  * Build the minimal config for the isolated Codex bridge runtime.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, modelProvider?: { id: string, table: Record<string, unknown> | undefined } }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, mcpServers?: Record<string, Record<string, any>>, optionalStartupGraceMs?: string, modelProvider?: { id: string, table: Record<string, unknown> | undefined } }} opts
  * @returns {string}
  */
 function buildCodexBridgeConfig({
@@ -3334,6 +3908,8 @@ function buildCodexBridgeConfig({
   fastModeEnabled,
   agentsEnabledKeySupported,
   projectTrust,
+  mcpServers = {},
+  optionalStartupGraceMs = "0",
   modelProvider,
 }) {
   const providerTable = modelProvider?.table;
@@ -3353,6 +3929,12 @@ function buildCodexBridgeConfig({
     'web_search = "cached"',
     "check_for_update_on_startup = false",
     "allow_login_shell = false",
+    // Codex omits optional MCP servers still starting when it builds a turn's
+    // tool catalog (default grace 1000 ms), so an allowlisted server missed the
+    // first turn. Top-level key: must stay before any table header.
+    ...(Object.keys(mcpServers).length
+      ? [`mcp_optional_startup_grace_ms = ${optionalStartupGraceMs}`]
+      : []),
     "",
     "[sandbox_workspace_write]",
     `network_access = ${workspaceNetworkAccess}`,
@@ -3379,6 +3961,7 @@ function buildCodexBridgeConfig({
     // collab tools on those versions.
     ...(agentsEnabledKeySupported ? ["[agents]", "enabled = false", ""] : []),
     ...(Object.keys(projectTrust).length ? [stringifyToml({ projects: projectTrust })] : []),
+    ...(Object.keys(mcpServers).length ? [stringifyToml({ mcp_servers: mcpServers })] : []),
     ...(modelProvider?.table
       ? [stringifyToml({ model_providers: { [modelProvider.id]: modelProvider.table } })]
       : []),
@@ -3411,8 +3994,9 @@ function prepareIsolatedCodexHomesRoot(
 }
 
 /**
- * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
- * @param {{ homesRoot: string, sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, modelProvider?: { id: string, table: Record<string, unknown> | undefined } }} opts
+ * Create an isolated Codex home that preserves auth but strips inherited MCP
+ * servers, except the operator-allowlisted remote servers in `mcpServers`.
+ * @param {{ homesRoot: string, sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, mcpServers?: Record<string, Record<string, any>>, optionalStartupGraceMs?: string, modelProvider?: { id: string, table: Record<string, unknown> | undefined } }} opts
  * @returns {string}
  */
 function createIsolatedCodexHome({
@@ -3426,6 +4010,8 @@ function createIsolatedCodexHome({
   fastModeEnabled,
   agentsEnabledKeySupported,
   projectTrust,
+  mcpServers,
+  optionalStartupGraceMs,
   modelProvider,
 }) {
   const codexHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-"));
@@ -3467,6 +4053,8 @@ function createIsolatedCodexHome({
         fastModeEnabled,
         agentsEnabledKeySupported,
         projectTrust,
+        mcpServers,
+        optionalStartupGraceMs,
         modelProvider,
       }),
       { encoding: "utf8", mode: 0o600 },
@@ -6483,7 +7071,7 @@ function createOversizeFrameScanner() {
  * Create the project-scoped Codex runtime independently from its MCP transport.
  * App Server request IDs, raw events, reasoning items, and private storage paths
  * never cross the outer MCP boundary.
- * @param {{ projectCwd?: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, statusIntervalOverrideMs?: number, hardTimeoutMs?: number, goal?: string, stateRoot?: string, sessionRetentionDays?: number }} opts
+ * @param {{ projectCwd?: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, statusIntervalOverrideMs?: number, hardTimeoutMs?: number, goal?: string, stateRoot?: string, sessionRetentionDays?: number, codexMcpServers?: string[], codexPlugins?: string[] }} opts
  */
 async function createCodexRuntime({
   projectCwd = STARTUP_CWD,
@@ -6499,6 +7087,8 @@ async function createCodexRuntime({
   goal,
   stateRoot,
   sessionRetentionDays,
+  codexMcpServers = [],
+  codexPlugins = [],
   confineWorkspaceToProject = false,
 }) {
   const resolvedModel = model || DEFAULT_CODEX_MODEL;
@@ -6576,6 +7166,14 @@ async function createCodexRuntime({
   );
   const sourceCodexHome = resolveCodexHome();
   const fastModeEnabled = readCodexFastModeOptIn(sourceCodexHome);
+  if (codexMcpServers.length > 0) {
+    logErr(
+      `[mcp-agents] Codex MCP server allowlist: ${codexMcpServers.join(", ")}`,
+    );
+  }
+  if (codexPlugins.length > 0) {
+    logErr(`[mcp-agents] Codex plugin allowlist: ${codexPlugins.join(", ")}`);
+  }
   const codexVersion = readCodexBinaryVersion();
   const versionText = codexVersion
     ? `${codexVersion.major}.${codexVersion.minor}.${codexVersion.patch}`
@@ -8865,10 +9463,25 @@ async function createCodexRuntime({
 
   const prepareGenerationStorage = () => {
     let projectTrust;
+    let mcpServers = {};
+    let optionalStartupGraceMs;
     let modelProvider;
     try {
       const sourceConfig = readCodexSourceConfig(sourceCodexHome);
-      projectTrust = codexProjectTrustFrom(sourceConfig);
+      projectTrust = readCodexProjectTrust(sourceConfig);
+      if (codexMcpServers.length > 0) {
+        mcpServers = selectCodexMcpServers(sourceConfig, codexMcpServers);
+      }
+      if (codexPlugins.length > 0) {
+        // Plugin servers are lifted as plain entries; plugins stay off.
+        mcpServers = {
+          ...mcpServers,
+          ...selectCodexPlugins(sourceConfig, sourceCodexHome, codexPlugins, codexMcpServers),
+        };
+      }
+      if (Object.keys(mcpServers).length > 0) {
+        optionalStartupGraceMs = readCodexOptionalStartupGraceMs(sourceConfig);
+      }
       modelProvider = codexModelProviderFrom(sourceConfig);
     } catch (err) {
       throw appError("codex_app_server_unavailable", err.message);
@@ -8906,6 +9519,8 @@ async function createCodexRuntime({
       fastModeEnabled,
       agentsEnabledKeySupported,
       projectTrust,
+      mcpServers,
+      optionalStartupGraceMs,
       modelProvider,
     });
     const sqliteHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-sqlite-"));
@@ -11007,6 +11622,8 @@ async function main() {
     codexStatusIntervalMs,
     codexStateRoot,
     codexSessionRetentionDays,
+    codexMcpServers: codexMcpServersSetting,
+    codexPlugins: codexPluginsSetting,
     browserLeaseCommand,
     browserCommand,
     browserIdleTimeoutMs,
@@ -11059,6 +11676,8 @@ async function main() {
       hardTimeoutMs: defaultTimeoutMs,
       stateRoot: codexStateRoot,
       sessionRetentionDays: codexSessionRetentionDays,
+      codexMcpServers: resolveCodexMcpServers(codexMcpServersSetting),
+      codexPlugins: resolveCodexPlugins(codexPluginsSetting),
     };
     if (transport === "http") {
       await runCodexHttpServer({
