@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `--codex-mcp-servers <names>` (env `MCP_AGENTS_CODEX_MCP_SERVERS`) lets the
+  operator copy named remote MCP servers from the source Codex config into the
+  isolated `codex` sessions. Only the `url` (canonical https, without
+  userinfo, query string, or fragment), the tools whose `approval_mode` is
+  `approve`, and positive timeouts are copied; stdio servers, static or
+  environment-sourced credentials, non-https, non-canonical, query-bearing, and
+  loopback URLs, and servers without approved tools refuse child startup with a
+  redacted `codex_app_server_unavailable` error. The default stays fully isolated.
+  When a server is allowlisted, the isolated config also sets
+  `mcp_optional_startup_grace_ms` (default `0`, or the source's value) so a
+  thread's first turn includes the server instead of omitting it while it starts.
+- `--codex-plugins <ids>` (env `MCP_AGENTS_CODEX_PLUGINS`) lets the operator use
+  the remote MCP servers of named installed Codex plugins (`plugin@marketplace`)
+  in the isolated `codex` sessions without turning plugins on. The bridge reads
+  the installed plugin and writes each usable server as a plain
+  `[mcp_servers.<name>]` entry (`url` plus the tools approved in the source
+  `plugins."<id>".mcp_servers.<name>` override). Nothing is copied,
+  `features.plugins` stays `false`, and plugin skills do not load. Only servers
+  declaring nothing but `type` and a canonical https `url` are lifted; the rest
+  are skipped. Unsafe or malformed plugins refuse child startup with a redacted
+  `codex_app_server_unavailable` error.
+
 ## [0.36.0] - 2026-10-14
 
 ### Changed

@@ -665,6 +665,8 @@ session files in that case; restart the bridge to build a fresh private index.
 | `--model <model>` | `gpt-6-astra` | — |
 | `--model_reasoning_effort <effort>` | `xhigh` | — |
 | `--codex-workspace-network=true\|false` | `true` | `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` |
+| `--codex-mcp-servers <names>` | none; comma-separated names of remote MCP servers to copy into isolated sessions ([details](#codex-app-server-backed-mcp)) | `MCP_AGENTS_CODEX_MCP_SERVERS` |
+| `--codex-plugins <ids>` | none; comma-separated `plugin@marketplace` ids of installed Codex plugins whose remote MCP servers are lifted into isolated sessions; plugins stay off ([details](#operator-allowlist-of-codex-plugins)) | `MCP_AGENTS_CODEX_PLUGINS` |
 | `--codex_idle_timeout <seconds>` | `600`; `0` disables | — |
 | `--codex_cancel_grace <seconds>` | `30` | `MCP_AGENTS_CODEX_CANCEL_GRACE_MS` |
 | `--codex_status_interval <seconds>` | `30` | `MCP_AGENTS_CODEX_STATUS_INTERVAL_MS` |
@@ -729,13 +731,237 @@ trust settings, refuses child startup with `codex_app_server_unavailable`;
 MCP initialization and discovery remain available, and a later call retries
 after the source is corrected. Error messages never include config contents.
 
-The minimal config strips the MCP servers of the user's own Codex config. A
+The minimal config strips the MCP servers of the user's own Codex config, unless
+the operator names them in the allowlist described below. A
 served project's `.codex/config.toml` is a separate layer: once Codex trusts the
 project (through inherited trust or its native trust behavior),
 that project's MCP servers, hooks, and rules load for its threads, and every
 loaded thread runs its own MCP server processes. The bridge therefore releases
 each thread whose work is finished; see
 [Progress, cancellation, and jobs](#codex-app-server-backed-mcp).
+
+#### Operator allowlist of user MCP servers
+
+By default no server from your own `config.toml` reaches bridge threads. To make
+one specific, safe remote MCP server available (for example a read-only design
+reference service), name it with `--codex-mcp-servers <names>` or
+`MCP_AGENTS_CODEX_MCP_SERVERS`. The value is a comma-separated list of server
+names; surrounding whitespace is trimmed, and an empty or unset value keeps the
+isolation exactly as before. The CLI flag wins over the environment variable
+(an explicit empty flag turns the feature off). Each name must match
+`[A-Za-z0-9_-]+`, appear once, and not be `codex_apps` (a name Codex treats
+specially); an invalid setting is a startup error. The
+setting applies to `--provider codex` only: the flag is rejected for
+`codex-legacy`, `claude`, `gemini`, and `browser`, and the environment variable
+is ignored there. With `--transport http`, the allowlist applies to every
+project root the daemon serves.
+
+When any server is allowlisted (by either allowlist), the generated config also
+sets the top-level `mcp_optional_startup_grace_ms`. Codex builds each turn's tool
+catalog without optional MCP servers that are still connecting, waiting only
+this grace period (default 1000 ms), so a freshly started thread otherwise lacks
+the allowlisted tools on its first turn. The bridge writes `0` (wait for each
+server's `startup_timeout_sec`, default 10 s) unless the source config sets its
+own non-negative integer `mcp_optional_startup_grace_ms`, which is mirrored. A
+negative, non-integer, or non-numeric source value refuses child startup
+(`codex_app_server_unavailable`, value not echoed). The trade-off: a thread start
+may wait up to the server's startup timeout when the server is slow or
+unreachable. The server stays optional, so the thread then continues without it.
+With no allowlisted server the key is not written and the source value is
+ignored.
+
+Each generation reads the top-level `[mcp_servers.<name>]` tables of the source
+config (servers that an installed plugin declares are covered by the plugin allowlist below) and writes into the isolated
+config only:
+
+- `url`, which must be `https`, in canonical form (`new URL(url).href` equals
+  the source string), with no user information, query string, or fragment. A
+  query string is refused because a static key could ride in it. Literal
+  loopback hosts (`localhost`, `*.localhost`, `127.0.0.0/8`, `0.0.0.0`, `::`,
+  `::1`, and IPv4-mapped forms) are refused after WHATWG URL canonicalisation.
+  Hostnames are not resolved, so a DNS name or `/etc/hosts` alias that resolves
+  to loopback is not detected, and whether redirects are followed is Codex's
+  HTTP client behavior. The re-entry barrier is that the HTTP daemon binds
+  `127.0.0.1` and requires its bearer token, and the allowlist cannot forward
+  any token because it refuses headers and `bearer_token_env_var`.
+- `enabled_tools` and `tools.<tool>.approval_mode = "approve"`, derived from the
+  source tools whose `approval_mode` is exactly `"approve"`, intersected with
+  the source `enabled_tools` when present, minus the source `disabled_tools`.
+  Bridge threads run with approval policy `never` by default and cannot ask, so
+  they get only the tools you pre-approved.
+- `startup_timeout_sec` and `tool_timeout_sec`, only when finite and positive.
+
+Nothing else is copied: not `command`, `args`, `env`, `env_vars`, `cwd`,
+`http_headers`, `env_http_headers`, `bearer_token_env_var`, `oauth`, `scopes`,
+`default_tools_approval_mode`, or any other key. The bridge refuses child
+startup with `codex_app_server_unavailable` (the message names only the server
+and a fixed reason, never values) when a named server is missing from the
+source config, is not a table or is disabled, has a `command` (stdio servers
+would inherit the bridge environment, which can carry provider credentials), has
+`http_headers`, `env_http_headers`, or `bearer_token_env_var` (static and
+environment-sourced credentials are not forwarded), has a missing, invalid,
+non-https, non-canonical, loopback, or credential-, query-, or
+fragment-bearing `url`, or has no tools left after the
+approve-only derivation.
+
+Caveats on scope: the approve-only guarantee covers the user-level config the
+bridge generates. A trusted project's own `.codex/config.toml` is a separate
+layer that still loads per thread and could define the same server name with
+wider tools or approvals and reuse the same keyring login. Codex's MCP resource
+tools (`list_mcp_resources` / `read_mcp_resource`) may also not be limited by
+`enabled_tools`.
+
+Authentication works only through OAuth logins that Codex stores outside
+`CODEX_HOME`, such as the OS keyring, or through unauthenticated servers. Codex
+keys those credentials by server name plus URL, so the copied server keeps its
+exact source name and URL; a different name with the same URL reports
+`Not logged in`. OAuth credentials kept in a file
+(`mcp_oauth_credentials_store = "file"`) live under the source `CODEX_HOME`,
+are not copied, and do not work. The behavior was verified with Codex CLI
+0.166.0; the bridge does not version-gate the per-tool keys.
+
+Example:
+
+```sh
+MCP_AGENTS_CODEX_MCP_SERVERS=mobbin mcp-agents
+```
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.mobbin]
+url = "https://api.mobbin.com/mcp"
+
+[mcp_servers.mobbin.tools.search_screens]
+approval_mode = "approve"
+
+[mcp_servers.mobbin.tools.get_screen]
+approval_mode = "approve"
+```
+
+#### Operator allowlist of Codex plugins
+
+By default no installed Codex plugin reaches bridge threads. To use the remote
+MCP servers of one specific plugin, name its id (`<plugin>@<marketplace>`, as in
+`codex plugin add mobbin@mobbin`) with `--codex-plugins <ids>` or
+`MCP_AGENTS_CODEX_PLUGINS`. The value is a comma-separated list; surrounding
+whitespace is trimmed, and an empty or unset value keeps the isolation exactly as
+before. The CLI flag wins over the environment variable (an explicit empty flag
+turns the feature off). Each id must match `^[A-Za-z0-9_-]+@[A-Za-z0-9_-]+$` (no
+dots, so ids are safe path segments) and appear once; an invalid setting is a
+startup error. The setting applies to `--provider codex` only, like the server
+allowlist. With `--transport http`, the allowlist applies to every project root
+the daemon serves.
+
+Lifted plugin servers get the same `mcp_optional_startup_grace_ms` handling as
+described under the server allowlist above.
+
+**Plugins stay off.** `features.plugins` is always `false` in the generated
+config (other config layers can still change it; see the caveats), and the isolated
+config has no `[plugins]` or `[marketplaces]` table. Nothing is copied into the
+isolated home: it never gets a `plugins/` directory. Turning plugins on would be
+unsafe and hard to control (with ChatGPT auth Codex enables every
+account-installed plugin, Codex resolves plugin server declarations differently
+from the bridge, and a plugin server's `http_headers_helper` makes Codex run a
+shell command outside the sandbox). Instead the bridge only READS the installed
+plugin and writes its usable servers as plain top-level
+`[mcp_servers.<name>]` entries, exactly the shape of the server allowlist above:
+`url`, approve-only `enabled_tools`, and per-tool `approval_mode = "approve"`
+(no timeouts). Because Codex never reads the plugin files, a mismatch between
+the bridge and Codex can only make a server missing, never unrestricted. A
+plugin's skills do not load in bridge threads.
+
+Each generation, for every named plugin, the bridge:
+
+- requires `[plugins."<id>"]` with `enabled = true` in the source config;
+- requires `<CODEX_HOME>/plugins/cache/<marketplace>/<plugin>/` to be a real
+  directory (not a symlink) holding exactly one entry, a real directory (the
+  installed version), and at least one manifest in it: `plugin.json` or
+  `.codex-plugin/plugin.json`;
+- collects server declarations from the union of every place Codex might read:
+  `mcp.json` and `.mcp.json` in the version root, and the `mcpServers` entry of
+  each existing manifest (a path relative to the version root that must stay
+  inside it, or an inline object, using its `mcpServers` key when present). Each
+  file is opened with `O_NOFOLLOW` (POSIX only; on Windows the `lstat`-based
+  symlink checks remain), checked on the open descriptor (regular file,
+  at most 1 MiB), and must be a JSON object with an `mcpServers` object; a file
+  that is present but unreadable or invalid refuses the plugin.
+
+A declared server is lifted only if **all** of these hold; otherwise it is skipped
+with one stderr line (`Codex plugin "<id>": skipped server "<name>": <fixed reason>`;
+an invalid name is reported as "a server with an invalid name"). At most the
+first 20 skip lines are logged per plugin per generation, followed by one
+`Codex plugin "<id>": skipped <n> more server(s)` line:
+
+- the name matches `^[A-Za-z0-9_-]{1,64}$` and is not `codex_apps` (Codex treats
+  that name specially, so both allowlists refuse it);
+- every declaration of that name across the sources has the same `type` and `url`;
+- every declaration has no key besides `type` and `url` (`command`, `args`, `env`,
+  `env_vars`, headers, `http_headers_helper`, bearer-token variables, `oauth`,
+  `scopes`, timeouts, and anything else all skip it);
+- `type`, in every declaration, is absent or one of `http`, `streamable-http`, `streamable_http`;
+- the `url` passes the same rules as the server allowlist (https, canonical form,
+  no credentials, query, fragment, or literal loopback host);
+- the source override table `plugins."<id>".mcp_servers.<server>` exists, has no
+  `enabled` other than `true`, and leaves at least one tool with
+  `tools.<tool>.approval_mode = "approve"` (intersected with its `enabled_tools`,
+  minus its `disabled_tools`). Only those tools are enabled.
+
+Child startup is refused (`codex_app_server_unavailable`, naming only the plugin
+id and a fixed reason, never paths, values, or raw file system errors) when the
+plugin is not enabled in the source config, its cache directory is missing or a
+symlink, it does not have exactly one installed version, it has no manifest, a
+manifest or declaration file is unreadable, invalid, oversized, or a symlink,
+`mcpServers` is malformed or escapes the version root, the plugin yields no
+usable server, or a lifted server name equals a name in `--codex-mcp-servers` or
+one lifted from another allowlisted plugin (two servers with one name in one
+Codex config is undefined behavior).
+
+Caveats:
+
+- Codex keys MCP OAuth credentials in the OS keyring by server name plus URL.
+  The lifted entry keeps the plugin's server name and exact URL, so the login you
+  made for the plugin's server is found (verified with Codex CLI 0.166.0: a plain
+  `[mcp_servers.mobbin] url = "https://api.mobbin.com/mcp"` in a throwaway
+  `CODEX_HOME` used the existing login). A changed name or URL needs a new login;
+  credentials kept in a file under the source `CODEX_HOME` are not copied.
+- The cache layout (`plugins/cache/<marketplace>/<plugin>/<version>/`) is not
+  documented by Codex. It was verified with Codex CLI 0.166.0 and fails closed:
+  if the layout changes or the directory is absent, the bridge refuses to start
+  the child rather than guessing.
+- The approve-only guarantee covers only the generated user-level config. A
+  trusted project's own `.codex/config.toml` is a separate layer and could define
+  the same server name with wider tools or approvals; see the server allowlist
+  above.
+- Plugins can still be turned on by another config layer. The generated config
+  always writes `plugins = false`, but a trusted project's `.codex/config.toml`
+  (Codex's project layer does not deny `features`) or a system
+  `/etc/codex/config.toml` can set `features.plugins = true`, and under ChatGPT
+  auth Codex would then sync account-installed plugins into the isolated home.
+  This boundary pre-dates the plugin allowlist: such a project can already add
+  stdio servers.
+- Lifted entries are plain config servers to Codex, so Codex's same-origin
+  redirect handling for config servers applies.
+
+Example:
+
+```sh
+MCP_AGENTS_CODEX_PLUGINS=mobbin@mobbin mcp-agents
+```
+
+```toml
+# ~/.codex/config.toml
+[plugins."mobbin@mobbin"]
+enabled = true
+
+[plugins."mobbin@mobbin".mcp_servers.mobbin.tools.search_screens]
+approval_mode = "approve"
+
+[plugins."mobbin@mobbin".mcp_servers.mobbin.tools.get_screen]
+approval_mode = "approve"
+
+[plugins."mobbin@mobbin".mcp_servers.mobbin.tools.upload]
+approval_mode = "prompt"   # not lifted: the bridge thread does not get this tool
+```
 
 Fast mode is inherited only when both of these settings are present in the
 source Codex config:
@@ -750,7 +976,9 @@ fast_mode = true
 Apart from project trust and explicit Fast mode, normal source config settings
 remain private to the user's regular Codex sessions. Native subagents stay off
 unless the initial call sets `allow_subagents: true`; even then they are
-Codex-only in-process workers and cannot re-enter this MCP bridge.
+Codex-only in-process workers and cannot re-enter this MCP bridge (the operator
+allowlist above accepts only https servers and refuses literal loopback hosts
+for that reason).
 
 Workspace-write network access defaults to `true` so commands can reach local
 services. Codex does not provide a localhost-only switch: enabling it permits
