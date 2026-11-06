@@ -3232,7 +3232,7 @@ function readCodexFastModeOptIn(codexHome) {
  * Read and parse the source Codex config once. A missing file is an empty
  * config; read and parse failures never quote the file's contents.
  * @param {string} codexHome
- * @returns {Record<string, any>}
+ * @returns {Record<string, unknown>}
  */
 function readCodexSourceConfig(codexHome) {
   let source;
@@ -3403,7 +3403,7 @@ function codexApprovedTools(entry) {
  * @returns {Record<string, Record<string, any>>}
  */
 function selectCodexMcpServers(config, names) {
-  const selected = {};
+  const selected = Object.create(null);
   const sourceServers = isTomlTable(config.mcp_servers) ? config.mcp_servers : {};
   for (const name of names) {
     const refuse = (reason) => new Error(
@@ -3716,6 +3716,118 @@ function liftCodexPluginServers(id, sourcePlugins, sourceCodexHome, refuse) {
 }
 
 /**
+ * Extract the source `model_provider` and its allowlisted provider table. Keys
+ * outside the allowlist are never copied; only their names are logged. A
+ * provider that authenticates through a setting the bridge does not mirror is
+ * refused, because Codex could otherwise use the copied auth.json login for
+ * the provider's host when requires_openai_auth is true.
+ * @param {Record<string, unknown> | undefined} config
+ * @returns {{ id: string, table: Record<string, unknown> | undefined } | undefined}
+ */
+function codexModelProviderFrom(config) {
+  if (!config || !Object.hasOwn(config, "model_provider")) return undefined;
+  const id = config.model_provider;
+  if (typeof id !== "string" || id === "") {
+    throw new Error("Source Codex config.toml has an invalid model_provider; correct it before retrying");
+  }
+  const invalidProvider = () => new Error(
+    "Source Codex config.toml has invalid model provider settings; " +
+    "the selected model_providers entry must be a table of supported provider keys",
+  );
+  const providers = Object.hasOwn(config, "model_providers") ? config.model_providers : undefined;
+  if (providers !== undefined && !isTomlTable(providers)) throw invalidProvider();
+  if (providers === undefined || !Object.hasOwn(providers, id)) return { id, table: undefined };
+  const sourceTable = providers[id];
+  if (!isTomlTable(sourceTable)) throw invalidProvider();
+
+  // Credential sources the bridge does not mirror: refuse rather than let
+  // Codex use the copied auth.json when requires_openai_auth is true. Header
+  // names only, never values.
+  // The names in the message come from this fixed list, never from the source.
+  // This is a name-based denylist: a credential field a future Codex adds
+  // would be dropped and logged, not refused.
+  const unmirrored = [
+    ...(Object.hasOwn(sourceTable, "experimental_bearer_token") ? ["experimental_bearer_token"] : []),
+    ...(Object.hasOwn(sourceTable, "auth") ? ["auth"] : []),
+    ...(Object.hasOwn(sourceTable, "http_headers") && isTomlTable(sourceTable.http_headers) &&
+      Object.keys(sourceTable.http_headers).some((name) => /auth|key|token|secret/iu.test(name))
+      ? ["http_headers (credential-named entries)"] : []),
+  ];
+  if (unmirrored.length) {
+    throw new Error(
+      "Source Codex model provider authenticates through " +
+      (unmirrored.length > 2
+        ? `${unmirrored.slice(0, -1).join(", ")}, and ${unmirrored.at(-1)}`
+        : unmirrored.join(" and ")) + ", " +
+      "which the bridge does not mirror; remove " +
+      `${unmirrored.length > 1 ? "them" : "it"} and use env_key or env_http_headers before retrying`,
+    );
+  }
+
+  const scalarKeys = new Set([
+    "name", "base_url", "env_key", "env_key_instructions", "wire_api",
+    "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms",
+    "requires_openai_auth",
+  ]);
+  const stringTableKeys = new Set(["query_params", "env_http_headers"]);
+  const isScalar = (value) => typeof value === "string" || typeof value === "boolean" ||
+    typeof value === "bigint" || Number.isInteger(value);
+  const entries = [];
+  const skipped = [];
+  for (const [key, value] of Object.entries(sourceTable)) {
+    if (scalarKeys.has(key)) {
+      if (!isScalar(value)) throw invalidProvider();
+      entries.push([key, value]);
+    } else if (stringTableKeys.has(key)) {
+      if (!isTomlTable(value) || !Object.values(value).every((v) => typeof v === "string")) {
+        throw invalidProvider();
+      }
+      entries.push([key, Object.fromEntries(Object.entries(value))]);
+    } else if (key === "aws") {
+      if (!isTomlTable(value) ||
+          !Object.entries(value).every(([k, v]) => (k === "profile" || k === "region") && typeof v === "string")) {
+        throw invalidProvider();
+      }
+      entries.push([key, Object.fromEntries(Object.entries(value))]);
+    } else {
+      skipped.push(key);
+    }
+  }
+  const table = Object.fromEntries(entries);
+  // These must be environment variable names, never the key itself: the value
+  // is copied into the private config and echoed in Codex errors.
+  const isVarName = (value) => typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(value);
+  if (Object.hasOwn(table, "env_key") && !isVarName(table.env_key)) throw invalidProvider();
+  if (Object.hasOwn(table, "env_http_headers") &&
+      !Object.values(table.env_http_headers).every(isVarName)) {
+    throw invalidProvider();
+  }
+  if (Object.hasOwn(table, "base_url")) {
+    // A credential in the URL would be copied verbatim and can surface in
+    // Codex error text that reaches the MCP caller.
+    let url;
+    try {
+      url = new URL(table.base_url);
+    } catch {
+      throw invalidProvider();
+    }
+    if (url.username || url.password || url.search || url.hash) {
+      throw new Error(
+        "Source Codex model provider base_url must not contain userinfo, a query string or a fragment; " +
+        "use query_params, env_key or env_http_headers before retrying",
+      );
+    }
+  }
+  if (skipped.length) {
+    logErr(
+      "[mcp-agents] model provider settings not mirrored into the bridge config: " +
+      skipped.map((key) => JSON.stringify(key)).join(", "),
+    );
+  }
+  return { id, table };
+}
+
+/**
  * Probe the installed codex binary's version once at bridge startup.
  * @returns {{ major: number, minor: number, patch: number } | undefined}
  */
@@ -3783,7 +3895,7 @@ function toTomlString(value) {
 
 /**
  * Build the minimal config for the isolated Codex bridge runtime.
- * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, mcpServers?: Record<string, Record<string, any>>, optionalStartupGraceMs?: string }} opts
+ * @param {{ model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, mcpServers?: Record<string, Record<string, any>>, optionalStartupGraceMs?: string, modelProvider?: { id: string, table: Record<string, unknown> | undefined } }} opts
  * @returns {string}
  */
 function buildCodexBridgeConfig({
@@ -3797,10 +3909,19 @@ function buildCodexBridgeConfig({
   projectTrust,
   mcpServers = {},
   optionalStartupGraceMs = "0",
+  modelProvider,
 }) {
+  const providerTable = modelProvider?.table;
+  const providerEnvVars = providerTable
+    ? [...new Set([
+        ...(typeof providerTable.env_key === "string" ? [providerTable.env_key] : []),
+        ...Object.values(providerTable.env_http_headers ?? {}),
+      ])]
+    : [];
   return [
     `model = ${toTomlString(model)}`,
     `model_reasoning_effort = ${toTomlString(modelReasoningEffort)}`,
+    ...(modelProvider ? [`model_provider = ${toTomlString(modelProvider.id)}`] : []),
     ...(fastModeEnabled ? ['service_tier = "fast"'] : []),
     `approval_policy = ${toTomlString(approvalPolicy)}`,
     `sandbox_mode = ${toTomlString(sandboxMode)}`,
@@ -3840,6 +3961,13 @@ function buildCodexBridgeConfig({
     ...(agentsEnabledKeySupported ? ["[agents]", "enabled = false", ""] : []),
     ...(Object.keys(projectTrust).length ? [stringifyToml({ projects: projectTrust })] : []),
     ...(Object.keys(mcpServers).length ? [stringifyToml({ mcp_servers: mcpServers })] : []),
+    ...(modelProvider?.table
+      ? [stringifyToml({ model_providers: { [modelProvider.id]: modelProvider.table } })]
+      : []),
+    // Keep the provider's API key variables out of the commands Codex runs.
+    ...(providerEnvVars.length
+      ? [stringifyToml({ shell_environment_policy: { exclude: providerEnvVars } })]
+      : []),
   ].join("\n");
 }
 
@@ -3867,7 +3995,7 @@ function prepareIsolatedCodexHomesRoot(
 /**
  * Create an isolated Codex home that preserves auth but strips inherited MCP
  * servers, except the operator-allowlisted remote servers in `mcpServers`.
- * @param {{ homesRoot: string, sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, mcpServers?: Record<string, Record<string, any>>, optionalStartupGraceMs?: string }} opts
+ * @param {{ homesRoot: string, sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean, projectTrust: Record<string, { trust_level: string }>, mcpServers?: Record<string, Record<string, any>>, optionalStartupGraceMs?: string, modelProvider?: { id: string, table: Record<string, unknown> | undefined } }} opts
  * @returns {string}
  */
 function createIsolatedCodexHome({
@@ -3883,6 +4011,7 @@ function createIsolatedCodexHome({
   projectTrust,
   mcpServers,
   optionalStartupGraceMs,
+  modelProvider,
 }) {
   const codexHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-"));
   // If auth copy or config write throws after the dir exists, remove the
@@ -3925,6 +4054,7 @@ function createIsolatedCodexHome({
         projectTrust,
         mcpServers,
         optionalStartupGraceMs,
+        modelProvider,
       }),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -7203,6 +7333,14 @@ async function createCodexRuntime({
   let retentionStartupTimer;
   let retentionRunning;
   let codexAuthInvalidated = false;
+  // env_key of the provider mirrored into the generation that hit the auth
+  // latch, if any. A rejected key there is fixed in the bridge's environment,
+  // not by codex login. Fixed at latch time; later generations do not change it.
+  let codexLatchedProviderEnvKey;
+  const codexAuthFailureMessage = () => codexLatchedProviderEnvKey
+    ? `Codex authentication is invalid for this MCP process: the model provider rejected the key in \`${codexLatchedProviderEnvKey}\`. ` +
+      `Set a valid key in that variable in this mcp-agents bridge's environment, then restart the bridge.`
+    : CODEX_AUTH_FAILURE_MESSAGE;
   const activeTurns = new Map();
   const activeTurnsByThread = new Map();
   const provisionalTurns = new Map();
@@ -7258,7 +7396,7 @@ async function createCodexRuntime({
   );
   const authFailureResult = (threadId) => errorResult(
     CODEX_AUTH_FAILURE_CODE,
-    CODEX_AUTH_FAILURE_MESSAGE,
+    codexAuthFailureMessage(),
     {
       action: CODEX_AUTH_FAILURE_ACTION,
       ...(threadId ? { threadId } : {}),
@@ -9001,8 +9139,9 @@ async function createCodexRuntime({
       const info = params.error?.codexErrorInfo ?? params.error?.codex_error_info;
       const message = params.error?.message ?? "Codex App Server reported an error";
       if (info === "unauthorized" || /unauthoriz|refresh token/iu.test(message)) {
+        if (!codexAuthInvalidated) codexLatchedProviderEnvKey = generationState.providerEnvKey;
         codexAuthInvalidated = true;
-        if (turn) turn.reject(appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE));
+        if (turn) turn.reject(appError(CODEX_AUTH_FAILURE_CODE, codexAuthFailureMessage()));
       } else if (turn && params.willRetry !== true) {
         turn.reject(appError("codex_turn_failed", message));
       } else if (turn) {
@@ -9321,6 +9460,7 @@ async function createCodexRuntime({
     let projectTrust;
     let mcpServers = {};
     let optionalStartupGraceMs;
+    let modelProvider;
     try {
       const sourceConfig = readCodexSourceConfig(sourceCodexHome);
       projectTrust = readCodexProjectTrust(sourceConfig);
@@ -9337,6 +9477,7 @@ async function createCodexRuntime({
       if (Object.keys(mcpServers).length > 0) {
         optionalStartupGraceMs = readCodexOptionalStartupGraceMs(sourceConfig);
       }
+      modelProvider = codexModelProviderFrom(sourceConfig);
     } catch (err) {
       throw appError("codex_app_server_unavailable", err.message);
     }
@@ -9375,6 +9516,7 @@ async function createCodexRuntime({
       projectTrust,
       mcpServers,
       optionalStartupGraceMs,
+      modelProvider,
     });
     const sqliteHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-sqlite-"));
     chmodSync(sqliteHome, 0o700);
@@ -9397,7 +9539,10 @@ async function createCodexRuntime({
     }
     let initialAuth;
     try { initialAuth = readFileSync(join(codexHome, "auth.json")); } catch {}
-    return { codexHome, sqliteHome, initialAuth };
+    const providerEnvKey = typeof modelProvider?.table?.env_key === "string"
+      ? modelProvider.table.env_key
+      : undefined;
+    return { codexHome, sqliteHome, initialAuth, providerEnvKey };
   };
   const startApp = async () => {
     if (!codexVersion) {
@@ -9846,7 +9991,7 @@ async function createCodexRuntime({
     }
   };
   const runTurn = async (args, ctx, { reply = false, backgroundJob } = {}) => {
-    if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE);
+    if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, codexAuthFailureMessage());
     const signal = backgroundJob ? undefined : ctx.mcpReq.signal;
     const deadlineAt = backgroundJob?.deadlineAt ?? Date.now() + resolvedHardMs;
     let threadId = args.threadId;
@@ -10026,7 +10171,7 @@ async function createCodexRuntime({
   };
 
   const runReview = async (args, ctx, backgroundJob) => {
-    if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE);
+    if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, codexAuthFailureMessage());
     const signal = backgroundJob ? undefined : ctx.mcpReq.signal;
     const deadlineAt = backgroundJob?.deadlineAt ?? Date.now() + resolvedHardMs;
     let workspace = lookupThreadWorkspace(args.threadId);
