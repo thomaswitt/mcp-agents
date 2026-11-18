@@ -29,7 +29,7 @@ import { isAbsolute, join } from "node:path";
 const STARTUP_CWD = process.cwd();
 
 const DEFAULT_CODEX_TIMEOUT_MS = 7_200_000;
-const DEFAULT_CODEX_MODEL = "gpt-6-astra";
+const DEFAULT_CODEX_MODEL = "gpt-6.2-astra";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
 const DEFAULT_CODEX_APPROVAL_POLICY = "never";

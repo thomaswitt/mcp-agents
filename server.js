@@ -66,7 +66,7 @@ const DEFAULT_CLAUDE_TIMEOUT_MS = 900_000;
 const DEFAULT_CLAUDE_JOB_TIMEOUT_MS = 7_200_000;
 const DEFAULT_CODEX_TIMEOUT_MS = 7_200_000;
 const CLI_VERSION_PROBE_TIMEOUT_MS = 3_000;
-const DEFAULT_CODEX_MODEL = "gpt-6-astra";
+const DEFAULT_CODEX_MODEL = "gpt-6.2-astra";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
 const DEFAULT_CODEX_APPROVAL_POLICY = "never";
@@ -208,13 +208,19 @@ const CODEX_AUTH_FAILURE_MESSAGE =
 // died without cleanup and are swept at startup. Comfortably longer than the
 // hard timeout so a live long-running session is never touched.
 const STALE_CODEX_HOME_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
-const DEFAULT_CLAUDE_MODEL = "claude-fable-5-1";
-const DEFAULT_CLAUDE_FALLBACK_MODEL = "claude-opus-5";
+const DEFAULT_CLAUDE_MODEL = "claude-opus-5-5";
+const CLAUDE_FABLE_MODEL = "claude-fable-5-2";
+const CLAUDE_MODEL_PROPERTY = {
+  type: "string",
+  enum: [DEFAULT_CLAUDE_MODEL, CLAUDE_FABLE_MODEL],
+  default: DEFAULT_CLAUDE_MODEL,
+  description: "Defaults to Opus 5.5. Select Fable 5.2 explicitly to use it.",
+};
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 const CLAUDE_QUOTA_FALLBACK_MESSAGE =
   "Claude: Fable credits exhausted; retrying with the default model";
 const CLAUDE_QUOTA_DEFAULT_ERROR =
-  "Claude: the default model also requires usage credits; no further retry";
+  "Claude: this model requires usage credits";
 const CLAUDE_QUOTA_UNSAFE_ERROR =
   "Claude: Fable credits exhausted; automatic retry withheld because " +
   "absence of model or tool work could not be established";
@@ -425,16 +431,16 @@ const CLI_BACKENDS = {
     command: "claude",
     toolName: "claude_code",
     description:
-      `Run Claude Code CLI with a prompt (via stdin), pinned to ${DEFAULT_CLAUDE_MODEL} at effort ${DEFAULT_CLAUDE_EFFORT} with availability fallback to ${DEFAULT_CLAUDE_FALLBACK_MODEL}. Exhausted Fable credits trigger one retry on Claude's default model only when no model or tool work is reported; startup hooks may rerun. Supports prompt + optional timeout_ms only; other arguments (model/effort/config) are ignored.`,
+      `Run Claude Code CLI with a prompt at ${DEFAULT_CLAUDE_EFFORT} effort. Fable uses Opus as its availability fallback. Exhausted Fable credits allow one retry on the account default when no model or tool work was reported. Startup hooks may rerun.`,
     stdinPrompt: true,
-    buildArgs: ({ quotaFallback = false } = {}) => [
-      ...buildClaudeModelArgs(quotaFallback),
+    buildArgs: ({ model }) => [
+      ...buildClaudeModelArgs(model),
       "--no-session-persistence",
       "-p",
       "--output-format",
       "json",
     ],
-    extraProperties: {},
+    extraProperties: { model: CLAUDE_MODEL_PROPERTY },
     defaultTimeoutMs: DEFAULT_CLAUDE_TIMEOUT_MS,
   },
   gemini: {
@@ -601,14 +607,13 @@ function classifyClaudeResult(result, events = []) {
 }
 
 /**
- * Select Claude's runtime default only after a quota rejection.
- * @param {boolean} quotaFallback Whether this request exhausted Fable credits.
+ * @param {string} model Selected model, or "default" on a Fable quota retry.
  * @returns {string[]} Model and effort arguments.
  */
-function buildClaudeModelArgs(quotaFallback = false) {
+function buildClaudeModelArgs(model) {
   return [
-    "--model", quotaFallback ? "default" : DEFAULT_CLAUDE_MODEL,
-    ...(quotaFallback ? [] : ["--fallback-model", DEFAULT_CLAUDE_FALLBACK_MODEL]),
+    "--model", model,
+    ...(model === CLAUDE_FABLE_MODEL ? ["--fallback-model", DEFAULT_CLAUDE_MODEL] : []),
     "--effort", DEFAULT_CLAUDE_EFFORT,
   ];
 }
@@ -2188,12 +2193,12 @@ function probeCliVersion(command, opts = {}) {
 
 /**
  * Build one-shot review arguments without relaxing isolation on a retry.
- * @param {boolean} quotaFallback Whether Fable credits were exhausted.
+ * @param {string} model Claude model for this attempt.
  * @returns {string[]} Claude CLI arguments.
  */
-function buildClaudeReviewArgs(quotaFallback = false) {
+function buildClaudeReviewArgs(model) {
   return [
-    ...buildClaudeModelArgs(quotaFallback),
+    ...buildClaudeModelArgs(model),
     "--no-session-persistence",
     "-p",
     "--input-format",
@@ -2222,7 +2227,7 @@ function claudeJobTools(jobTimeoutMs) {
       name: "claude-start",
       description:
         `Start a one-shot, read-only Claude review in the background. ` +
-        "Exhausted Fable credits trigger one retry on Claude's default model. " +
+        "Exhausted Fable credits trigger one retry on the account default. " +
         `The server-owned deadline is ${jobTimeoutMs}ms; poll claude-status ` +
         "until terminal, then call claude-result.",
       inputSchema: {
@@ -2239,6 +2244,7 @@ function claudeJobTools(jobTimeoutMs) {
             minLength: 1,
             description: "Absolute repository working directory Claude may inspect.",
           },
+          model: CLAUDE_MODEL_PROPERTY,
         },
         required: ["prompt", "cwd"],
       },
@@ -2604,7 +2610,7 @@ function createClaudeJobRuntime({
     job.stdoutBuffer = Buffer.alloc(0);
     let child;
     try {
-      child = spawn(command, buildClaudeReviewArgs(job.quotaFallback), {
+      child = spawn(command, buildClaudeReviewArgs(job.model), {
         cwd: job.cwd,
         detached: true,
         stdio: ["pipe", "pipe", "pipe"],
@@ -2701,11 +2707,11 @@ function createClaudeJobRuntime({
           transitionTerminal(job, "failed", "Claude: timed out before retry");
           return;
         }
-        if (job.quotaFallback) {
+        if (job.model !== CLAUDE_FABLE_MODEL) {
           transitionTerminal(job, "failed", CLAUDE_QUOTA_DEFAULT_ERROR);
           return;
         }
-        job.quotaFallback = true;
+        job.model = "default";
         setStatus(job, "running", CLAUDE_QUOTA_FALLBACK_MESSAGE);
         spawnAttempt(job);
         return;
@@ -2767,7 +2773,7 @@ function createClaudeJobRuntime({
       settleAttempt(spawnFailed);
     });
   };
-  const createJob = (prompt, cwd) => {
+  const createJob = (prompt, cwd, model = DEFAULT_CLAUDE_MODEL) => {
     const now = Date.now();
     const job = {
       jobId: randomUUID(),
@@ -2786,7 +2792,7 @@ function createClaudeJobRuntime({
       stopRequested: undefined,
       attempt: 0,
       emptyRetries: 0,
-      quotaFallback: false,
+      model,
       attemptResult: undefined,
       stdoutBuffer: Buffer.alloc(0),
       waiters: new Set(),
@@ -2816,7 +2822,7 @@ function createClaudeJobRuntime({
       : {};
     const contracts = {
       "claude-start": {
-        allowed: ["prompt", "cwd"],
+        allowed: ["prompt", "cwd", "model"],
         required: ["prompt", "cwd"],
       },
       "claude-status": {
@@ -3004,7 +3010,7 @@ function createClaudeJobRuntime({
             },
           );
         }
-        const job = createJob(args.prompt, args.cwd);
+        const job = createJob(args.prompt, args.cwd, args.model);
         jobs.set(job.jobId, job);
         logErr(
           `[mcp-agents] Claude job started ` +
@@ -11905,6 +11911,18 @@ async function main() {
       };
     }
 
+    if (providerName === "claude" &&
+        (params.name === backend.toolName || params.name === "claude-start") &&
+        Object.hasOwn(params.arguments ?? {}, "model") &&
+        !CLAUDE_MODEL_PROPERTY.enum.includes(params.arguments.model)) {
+      const problem = `must be one of: ${CLAUDE_MODEL_PROPERTY.enum.join(", ")}`;
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Claude model ${problem}` }],
+        structuredContent: { code: "invalid_arguments", issues: [{ argument: "model", problem }] },
+      };
+    }
+
     if (claudeJobs?.handles(params.name)) {
       activeRequests += 1;
       try {
@@ -12027,7 +12045,6 @@ async function main() {
       const startedAt = Date.now();
       let attempts = 0;
       let emptyRetries = 0;
-      let quotaFallback = false;
       let priorAttemptsWithoutWork = true;
       const checkRequest = () => {
         if (ctx.mcpReq.signal?.aborted) {
@@ -12047,7 +12064,7 @@ async function main() {
         checkRequest();
         const remainingMs = checkDeadline();
         const cliArgs = backend.stdinPrompt
-          ? backend.buildArgs({ ...extraOpts, quotaFallback })
+          ? backend.buildArgs(extraOpts)
           : backend.buildArgs(prompt, extraOpts);
         attempts += 1;
         let result;
@@ -12069,13 +12086,13 @@ async function main() {
         if (normalized.quotaExhausted) {
           reapCliAttempt();
           checkDeadline();
-          if (quotaFallback || !priorAttemptsWithoutWork || !normalized.noModelWork) {
-            const message = quotaFallback
-              ? CLAUDE_QUOTA_DEFAULT_ERROR : CLAUDE_QUOTA_UNSAFE_ERROR;
+          const usingFable = extraOpts.model === CLAUDE_FABLE_MODEL;
+          if (!usingFable || !priorAttemptsWithoutWork || !normalized.noModelWork) {
+            const message = usingFable ? CLAUDE_QUOTA_UNSAFE_ERROR : CLAUDE_QUOTA_DEFAULT_ERROR;
             logErr(`[mcp-agents] ${message}`);
             return { content: [{ type: "text", text: message }], isError: true };
           }
-          quotaFallback = true;
+          extraOpts.model = "default";
           logErr(`[mcp-agents] ${CLAUDE_QUOTA_FALLBACK_MESSAGE}`);
           continue;
         }

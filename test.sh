@@ -939,7 +939,7 @@ test_http_token_parent_safety() {
 # ========== CLI flag tests ==========
 
 test_cli_flag "--help prints usage"         "--help"    "Usage:"
-test_cli_flag "--help shows GPT-6 Astra default" "--help" "gpt-6-astra"
+test_cli_flag "--help shows GPT-6.2 Astra default" "--help" "gpt-6.2-astra"
 test_cli_flag "--help shows xhigh default"  "--help"    "xhigh"
 test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
@@ -1128,7 +1128,9 @@ test_claude_tools_schema "Claude job tools expose closed operational schemas" \
    (($t["claude-start"].inputSchema |
       (.additionalProperties == false) and
       (.required == ["prompt","cwd"]) and
-      ((.properties | keys | sort) == ["cwd","prompt"]) and
+      ((.properties | keys | sort) == ["cwd","model","prompt"]) and
+      (.properties.model.default == "claude-opus-5-5") and
+      (.properties.model.enum == ["claude-opus-5-5","claude-fable-5-2"]) and
       (.properties.cwd.type == "string")) and
     ($t["claude-status"].inputSchema |
       (.additionalProperties == false) and
@@ -1149,7 +1151,9 @@ test_claude_tools_schema "legacy claude_code keeps prompt and caller timeout com
   '(.result.tools | map(select(.name == "claude_code"))[0].inputSchema) as $s |
    ($s.additionalProperties == true) and
    ($s.required == ["prompt"]) and
-   (($s.properties | keys | sort) == ["prompt","timeout_ms"]) and
+   (($s.properties | keys | sort) == ["model","prompt","timeout_ms"]) and
+   ($s.properties.model.default == "claude-opus-5-5") and
+   ($s.properties.model.enum == ["claude-opus-5-5","claude-fable-5-2"]) and
    ($s.properties.timeout_ms.minimum == 1)'
 
 # ---------- Gemini provider ----------
@@ -2166,8 +2170,8 @@ const callTool = (name, args, id, meta) => request(
   id,
 );
 const structured = (frame) => frame?.result?.structuredContent;
-const startJob = async (prompt) => {
-  const frame = await callTool("claude-start", { prompt, cwd: serverDir });
+const startJob = async (prompt, model) => {
+  const frame = await callTool("claude-start", { prompt, cwd: serverDir, model });
   data.starts.push(frame);
   const jobId = structured(frame)?.jobId;
   if (typeof jobId !== "string" || !jobId) {
@@ -2298,6 +2302,7 @@ try {
     const quotaRequestId = "quota-blocking-request";
     const quotaStartedAt = Date.now();
     const quotaRequest = callTool("claude_code", {
+      model: prompt === "QUOTA_OPUS" ? "claude-opus-5-5" : "claude-fable-5-2",
       prompt, timeout_ms: prompt.includes("SUCCESS_DRAIN") ? 400 :
         prompt.includes("DEADLINE") ? 150 : 2_000,
     }, quotaRequestId).then((frame) => {
@@ -2320,7 +2325,7 @@ try {
     }
   } else if (scenario.startsWith("quota-background-")) {
     const prompt = scenario.slice("quota-background-".length);
-    const job = await startJob(prompt);
+    const job = await startJob(prompt, prompt === "QUOTA_OPUS" ? "claude-opus-5-5" : "claude-fable-5-2");
     data.quotaJobId = job.jobId;
     if (prompt.includes("CANCEL") || prompt.includes("SHUTDOWN")) {
       await waitForQuotaResult();
@@ -2355,10 +2360,15 @@ try {
     data.legacy = await callTool("claude_code", {
       prompt: "LEGACY",
       timeout_ms: 2_000,
-      model: "ignored-for-compatibility",
+      effort: "ignored-for-compatibility",
     });
     await ping();
   } else if (scenario === "invalid") {
+    for (const tool of ["claude-start", "claude_code"]) {
+      data.invalid.push(await callTool(tool, {
+        prompt: "NORMAL", cwd: serverDir, model: "unknown-model",
+      }));
+    }
     data.invalid.push(await callTool("claude-start", {
       prompt: "NORMAL",
       cwd: "relative/path",
@@ -3002,7 +3012,7 @@ function completeActive(text = "APP_SERVER_OK", status = "completed") {
       threadId: current.threadId,
       // A reroute of a turn the bridge never started, e.g. a goal continuation.
       turnId: mode === "model-rerouted-foreign" ? "turn-goal-1" : current.turnId,
-      fromModel: "gpt-6-astra",
+      fromModel: "gpt-6.2-astra",
       toModel: "gpt-5.6-terra",
       reason: "highRiskCyberActivity",
     });
@@ -3432,7 +3442,7 @@ function onMessage(message) {
           thread: value,
           model: mode === "model-mismatch"
             ? "gpt-5.6-terra"
-            : message.params.model || "gpt-6-astra",
+            : message.params.model || "gpt-6.2-astra",
           modelProvider: "openai",
           // Real Codex answers with the session's resolved effort.
           ...(mode === "effort-unreported" ? {} : {
@@ -3580,7 +3590,7 @@ function onMessage(message) {
         lateResume = null;
         setTimeout(() => respond(answer.id, {
           thread: thread(answer.threadId),
-          model: "gpt-6-astra",
+          model: "gpt-6.2-astra",
           modelProvider: "openai",
           cwd: workspace,
           approvalPolicy: "never",
@@ -3709,7 +3719,7 @@ function onMessage(message) {
       if (excludeTurnsRejected(message)) break;
       respond(message.id, {
         thread: { ...thread("thread-forked"), forkedFromId: message.params.threadId },
-        model: "gpt-6-astra",
+        model: "gpt-6.2-astra",
         modelProvider: "openai",
         cwd: workspace,
         approvalPolicy: "never",
@@ -4060,7 +4070,7 @@ const initialArgs = (prompt = "hello") => ({
   prompt,
   cwd: `${stubDir}/workspace`,
   sandbox: "read-only",
-  model: "gpt-6-astra",
+  model: "gpt-6.2-astra",
   model_reasoning_effort: "high",
 });
 const unsubscribesNow = (threadId) => {
@@ -5833,7 +5843,7 @@ const initialArgs = (cwd, prompt = "hello") => ({
   prompt,
   cwd,
   sandbox: "read-only",
-  model: "gpt-6-astra",
+  model: "gpt-6.2-astra",
   model_reasoning_effort: "high",
 });
 const assertToolText = (result, expected) => {
@@ -6367,7 +6377,7 @@ const callArguments = {
   prompt: "PRIVATE_MODERN_PROMPT",
   cwd: `${stubDir}/workspace`,
   sandbox: "read-only",
-  model: "gpt-6-astra",
+  model: "gpt-6.2-astra",
   model_reasoning_effort: "high",
 };
 let result;
@@ -7731,42 +7741,46 @@ test_oversized_frame_shutdown "an over-limit frame shuts down instead of orphani
 for quota_path in blocking background; do
   quota_followup=0
   [ "$quota_path" = background ] && quota_followup=1
-  for quota_variant in NORMAL EXIT0 ARRAY DESCENDANT LATE_DESCENDANT SUCCESS_DRAIN_DESCENDANT EMPTY_AFTER EMPTY_AFTER_TWICE REPEAT WORK MISSING SUBAGENT TOOL ASSISTANT MODEL_USAGE API_TIME COST CACHE_USAGE SECOND_TURN SERVER_TOOL EXIT2 SIGNAL OVERSIZE WRONG_CODE AUTH AUTH_EXIT0 MALFORMED TEXT EMPTY_BEFORE SAFE_EMPTY_BEFORE EMPTY_BEFORE_EMPTY_AFTER; do
+  for quota_variant in NORMAL OPUS EXIT0 ARRAY DESCENDANT LATE_DESCENDANT SUCCESS_DRAIN_DESCENDANT EMPTY_AFTER EMPTY_AFTER_TWICE REPEAT WORK MISSING SUBAGENT TOOL ASSISTANT MODEL_USAGE API_TIME COST CACHE_USAGE SECOND_TURN SERVER_TOOL EXIT2 SIGNAL OVERSIZE WRONG_CODE AUTH AUTH_EXIT0 MALFORMED TEXT EMPTY_BEFORE SAFE_EMPTY_BEFORE EMPTY_BEFORE_EMPTY_AFTER; do
     if [ "$quota_path" = background ]; then
       case "$quota_variant" in LATE_DESCENDANT|SUCCESS_DRAIN_DESCENDANT) continue ;; esac
     fi
     quota_attempts=2
     quota_success=true
-    quota_models='["claude-fable-5-1","default"]'
+    quota_models='["claude-fable-5-2","default"]'
     case "$quota_variant" in
+      OPUS)
+        quota_attempts=1
+        quota_success=false
+        quota_models='["claude-opus-5-5"]' ;;
       EMPTY_AFTER|EMPTY_AFTER_TWICE)
         quota_attempts=3
-        quota_models='["claude-fable-5-1","default","default"]'
+        quota_models='["claude-fable-5-2","default","default"]'
         [ "$quota_variant" = EMPTY_AFTER_TWICE ] && quota_success=false ;;
       REPEAT) quota_success=false ;;
       WORK|MISSING|SUBAGENT|TOOL|ASSISTANT|MODEL_USAGE|API_TIME|COST|CACHE_USAGE|SECOND_TURN|SERVER_TOOL|EXIT2|SIGNAL)
         if [ "$quota_path" = blocking ]; then
           quota_attempts=1
           quota_success=false
-          quota_models='["claude-fable-5-1"]'
+          quota_models='["claude-fable-5-2"]'
         fi ;;
       WRONG_CODE|AUTH|AUTH_EXIT0|MALFORMED|OVERSIZE)
         quota_attempts=1
         quota_success=false
-        quota_models='["claude-fable-5-1"]' ;;
+        quota_models='["claude-fable-5-2"]' ;;
       TEXT)
         quota_attempts=1
-        quota_models='["claude-fable-5-1"]' ;;
+        quota_models='["claude-fable-5-2"]' ;;
       SUCCESS_DRAIN_DESCENDANT)
         quota_attempts=1
-        quota_models='["claude-fable-5-1"]' ;;
+        quota_models='["claude-fable-5-2"]' ;;
       EMPTY_BEFORE|SAFE_EMPTY_BEFORE|EMPTY_BEFORE_EMPTY_AFTER)
         quota_attempts=3
-        quota_models='["claude-fable-5-1","claude-fable-5-1","default"]'
+        quota_models='["claude-fable-5-2","claude-fable-5-2","default"]'
         if [ "$quota_path" = blocking ] && [ "$quota_variant" != SAFE_EMPTY_BEFORE ]; then
           quota_attempts=2
           quota_success=false
-          quota_models='["claude-fable-5-1","claude-fable-5-1"]'
+          quota_models='["claude-fable-5-2","claude-fable-5-2"]'
         fi
         [ "$quota_variant" = EMPTY_BEFORE_EMPTY_AFTER ] && quota_success=false ;;
     esac
@@ -7797,9 +7811,9 @@ for quota_path in blocking background; do
          ((.meta.argv | stable_args) == ($attempts[0].meta.argv | stable_args)) and
          (.rawStdin == $attempts[0].rawStdin) and
          (arg_after(.meta.argv; "--effort") == "xhigh") and
-         (if arg_after(.meta.argv; "--model") == "default"
-          then (.meta.argv | index("--fallback-model") == null)
-          else arg_after(.meta.argv; "--fallback-model") == "claude-opus-5" end))) and
+         (if arg_after(.meta.argv; "--model") == "claude-fable-5-2"
+          then arg_after(.meta.argv; "--fallback-model") == "claude-opus-5-5"
+          else (.meta.argv | index("--fallback-model") == null) end))) and
        ((.data.quotaResult.result.isError != true) == '"$quota_success"') and
        (if '"$quota_success"' then
           .data.quotaResult.result.content[0].text ==
@@ -7821,7 +7835,7 @@ for quota_path in blocking background; do
           ([.data.statuses[].result.structuredContent |
              select(.jobId == $summary.data.quotaJobId) | .cursor] as $cursors |
             $cursors == ($cursors | sort)) and
-          (arg_after(.captures[-1].meta.argv; "--model") == "claude-fable-5-1") and
+          (arg_after(.captures[-1].meta.argv; "--model") == "claude-opus-5-5") and
           (.data.followupResult.result.content[0].text == "CLAUDE_REVIEW_OK")
         else true end)'
   done
@@ -7857,8 +7871,8 @@ test_claude_job \
    (.captures[0] as $capture |
      ($capture.meta.cwd == "'"$(pwd)"'") and
      ($capture.meta.streaming == true) and
-     (arg_after($capture.meta.argv; "--model") == "claude-fable-5-1") and
-     (arg_after($capture.meta.argv; "--fallback-model") == "claude-opus-5") and
+     (arg_after($capture.meta.argv; "--model") == "claude-opus-5-5") and
+     ($capture.meta.argv | index("--fallback-model") == null) and
      (arg_after($capture.meta.argv; "--effort") == "xhigh") and
      (arg_after($capture.meta.argv; "--input-format") == "stream-json") and
      (arg_after($capture.meta.argv; "--output-format") == "stream-json") and
@@ -7925,8 +7939,8 @@ test_claude_job \
    (.captures[0] as $capture |
      ($capture.meta.streaming == false) and
      ($capture.rawStdin == "LEGACY") and
-     (arg_after($capture.meta.argv; "--model") == "claude-fable-5-1") and
-     (arg_after($capture.meta.argv; "--fallback-model") == "claude-opus-5") and
+     (arg_after($capture.meta.argv; "--model") == "claude-opus-5-5") and
+     ($capture.meta.argv | index("--fallback-model") == null) and
      (arg_after($capture.meta.argv; "--effort") == "xhigh") and
      (arg_after($capture.meta.argv; "--output-format") == "json") and
      ($capture.meta.argv | index("--no-session-persistence") != null) and
@@ -7937,10 +7951,11 @@ test_claude_job \
    (.data.pings[-1].result.content[0].text == "pong")'
 
 test_claude_job \
-  "Claude jobs reject relative cwd, caller timeout, and malformed polling locally" \
+  "Claude tools reject invalid models and malformed job arguments locally" \
   "invalid" \
   '(.captures | length == 0) and
-   (.data.invalid | length == 4) and
+   (.data.invalid | length == 6) and
+   (.data.invalid[0:2] | all(.result.structuredContent.issues[0].argument == "model")) and
    (.data.invalid | all(
      (.result.isError == true) and
      (.result.structuredContent.code == "invalid_arguments"))) and
@@ -8314,6 +8329,7 @@ test_codex_app_case "Codex tools expose closed curated App Server contracts" \
       contains("private state database"))) and
    (($t.codex.inputSchema.properties | keys | sort) ==
       ["allow_subagents","cwd","goal","model","model_reasoning_effort","prompt","sandbox"]) and
+   ($t.codex.inputSchema.properties.model.enum == ["gpt-6.2-astra","gpt-5.6-terra"]) and
    (($t["codex-reply"].inputSchema.properties | keys | sort) ==
       ["goal","prompt","threadId"]) and
    (($t["codex-goal-set"].inputSchema.properties.status.enum | sort) ==
@@ -8329,9 +8345,9 @@ test_codex_app_case "Codex initial calls map to thread/start and turn/start" \
    (.data.call.result.content[0].text == "APP_SERVER_OK") and
    (.data.call.result.structuredContent == {threadId:"thread-1",content:"APP_SERVER_OK",
       modelSettings:{reportedBy:"thread_start",
-        model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+        model:{requested:"gpt-6.2-astra",reported:"gpt-6.2-astra",status:"confirmed"},
         reasoningEffort:{requested:"high",reported:"high",status:"confirmed"}}}) and
-   (.stderr | contains("[mcp-agents] Codex turn started (tool=codex, thread=thread-1, reported_by=thread_start, requested_model=gpt-6-astra, reported_model=gpt-6-astra, model_status=confirmed, requested_effort=high, reported_effort=high, effort_status=confirmed)")) and
+   (.stderr | contains("[mcp-agents] Codex turn started (tool=codex, thread=thread-1, reported_by=thread_start, requested_model=gpt-6.2-astra, reported_model=gpt-6.2-astra, model_status=confirmed, requested_effort=high, reported_effort=high, effort_status=confirmed)")) and
    (.stderr | contains("WARNING: Codex turn started") | not) and
    ([.frames[] | select(.method == "codex/event")] | length == 0) and
    ([.frames[] | select(
@@ -8346,7 +8362,7 @@ test_codex_app_case "Codex initial calls map to thread/start and turn/start" \
    ([.appRequests[] | select(.method == "initialized" and (has("id") | not))] |
      length == 1) and
    ([.appRequests[] | select(.method == "thread/start")][0].params |
-     (.cwd | endswith("/workspace")) and (.model == "gpt-6-astra") and
+     (.cwd | endswith("/workspace")) and (.model == "gpt-6.2-astra") and
      (.sandbox == "read-only")) and
    ([.appRequests[] | select(.method == "turn/start")][0].params |
      (.threadId == "thread-1") and (.effort == "high") and
@@ -8357,7 +8373,7 @@ test_codex_app_case "An unreported reasoning effort is never called confirmed" \
   '(.data.call.result.isError != true) and
    (.data.call.result.structuredContent.modelSettings ==
       {reportedBy:"thread_start",
-       model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+       model:{requested:"gpt-6.2-astra",reported:"gpt-6.2-astra",status:"confirmed"},
        reasoningEffort:{requested:"high",reported:null,status:"unreported"}}) and
    (.stderr | contains("reported_effort=none, effort_status=unreported)")) and
    (.stderr | contains("WARNING: Codex turn started") | not)'
@@ -8377,16 +8393,16 @@ test_codex_app_case "A mid-turn model reroute withdraws the confirmation" \
   '(.data.call.result.content[0].text == "APP_SERVER_OK") and
    (.data.call.result.structuredContent.modelSettings ==
       {reportedBy:"model_rerouted",
-       model:{requested:"gpt-6-astra",reported:"gpt-5.6-terra",status:"rerouted"},
+       model:{requested:"gpt-6.2-astra",reported:"gpt-5.6-terra",status:"rerouted"},
        reasoningEffort:{requested:"high",reported:null,status:"rerouted"}}) and
-   (.stderr | contains("[mcp-agents] WARNING: Codex rerouted the model (thread=thread-1, from=gpt-6-astra, to=gpt-5.6-terra, reason=highRiskCyberActivity)")) and
+   (.stderr | contains("[mcp-agents] WARNING: Codex rerouted the model (thread=thread-1, from=gpt-6.2-astra, to=gpt-5.6-terra, reason=highRiskCyberActivity)")) and
    ([.frames[] | select((.method // "") == "model/rerouted")] | length == 0)'
 
 test_codex_app_case "A reroute of another turn on the thread leaves the confirmation alone" \
   "model-rerouted-foreign" \
   '(.data.call.result.structuredContent.modelSettings ==
       {reportedBy:"thread_start",
-       model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+       model:{requested:"gpt-6.2-astra",reported:"gpt-6.2-astra",status:"confirmed"},
        reasoningEffort:{requested:"high",reported:"high",status:"confirmed"}}) and
    (.stderr | contains("Codex rerouted the model") | not)'
 
@@ -8395,17 +8411,17 @@ test_codex_app_case "A different reported model is a warned mismatch" \
   '(.data.call.result.isError != true) and
    (.data.call.result.structuredContent.modelSettings ==
       {reportedBy:"thread_start",
-       model:{requested:"gpt-6-astra",reported:"gpt-5.6-terra",status:"mismatch"},
+       model:{requested:"gpt-6.2-astra",reported:"gpt-5.6-terra",status:"mismatch"},
        reasoningEffort:{requested:"high",reported:"high",status:"confirmed"}}) and
-   (.stderr | contains("[mcp-agents] WARNING: Codex turn started (tool=codex, thread=thread-1, reported_by=thread_start, requested_model=gpt-6-astra, reported_model=gpt-5.6-terra, model_status=mismatch,"))'
+   (.stderr | contains("[mcp-agents] WARNING: Codex turn started (tool=codex, thread=thread-1, reported_by=thread_start, requested_model=gpt-6.2-astra, reported_model=gpt-5.6-terra, model_status=mismatch,"))'
 
 test_codex_app_case "Server defaults count as the request when the caller names none" \
   "effort-default" \
   '([.appRequests[] | select(.method == "thread/start")][0].params |
-     (.model == "gpt-6-astra") and (.config.model_reasoning_effort == "max")) and
+     (.model == "gpt-6.2-astra") and (.config.model_reasoning_effort == "max")) and
    (.data.call.result.structuredContent.modelSettings ==
       {reportedBy:"thread_start",
-       model:{requested:"gpt-6-astra",reported:"gpt-6-astra",status:"confirmed"},
+       model:{requested:"gpt-6.2-astra",reported:"gpt-6.2-astra",status:"confirmed"},
        reasoningEffort:{requested:"max",reported:"max",status:"confirmed"}})' \
   "--model_reasoning_effort max"
 

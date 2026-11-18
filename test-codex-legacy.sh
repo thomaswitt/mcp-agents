@@ -277,7 +277,7 @@ test_codex_legacy_bridge_config() {
   ok=1
   [ "$status" -eq 0 ] || ok=0
   for expected in \
-    'model = "gpt-6-astra"' \
+    'model = "gpt-6.2-astra"' \
     'model_reasoning_effort = "xhigh"' \
     'web_search = "cached"' \
     'check_for_update_on_startup = false' \
@@ -2665,10 +2665,10 @@ test_codex_legacy_call_passes_through_unmodified \
 
 # Accepted initial calls preserve a curated model, translate effort into native
 # config, and may inject goal.
-test_codex_legacy_call_transform "codex-legacy forwards per-session Sol model with medium effort" \
+test_codex_legacy_call_transform "codex-legacy forwards Astra 6.2 with medium effort" \
   "" \
-  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only","model":"gpt-6-astra","model_reasoning_effort":"medium"}' \
-  '.params.arguments | ((has("model_reasoning_effort")|not) and (.model == "gpt-6-astra") and (.cwd == "/tmp/work") and (.sandbox == "read-only") and (.config == {"model_reasoning_effort":"medium"}))'
+  '{"prompt":"hi","cwd":"/tmp/work","sandbox":"read-only","model":"gpt-6.2-astra","model_reasoning_effort":"medium"}' \
+  '.params.arguments | ((has("model_reasoning_effort")|not) and (.model == "gpt-6.2-astra") and (.cwd == "/tmp/work") and (.sandbox == "read-only") and (.config == {"model_reasoning_effort":"medium"}))'
 test_codex_legacy_call_transform "codex-legacy forwards per-session Terra model with high effort" \
   "" \
   '{"prompt":"hi","cwd":"/tmp/work","sandbox":"workspace-write","model":"gpt-5.6-terra","model_reasoning_effort":"high"}' \
@@ -2847,9 +2847,9 @@ test_codex_legacy_toolslist_rewrite "Codex legacy job tools use exact closed sch
     ($t["codex-commentary"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])) and
     ($t["codex-result"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])) and
     ($t["codex-cancel"].inputSchema | (.additionalProperties == false) and (.required == ["jobId"])))'
-test_codex_legacy_toolslist_rewrite "tools/list advertises exact Sol|Terra model on codex only" \
+test_codex_legacy_toolslist_rewrite "tools/list advertises Astra 6.2 and Terra on codex only" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model | ((.type == "string") and (.enum == ["gpt-6-astra","gpt-5.6-terra"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model")|not))'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model | ((.type == "string") and (.enum == ["gpt-6.2-astra","gpt-5.6-terra"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model")|not))'
 test_codex_legacy_toolslist_rewrite "tools/list advertises exact medium|high|xhigh|max effort on codex only" \
   "normal" \
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.model_reasoning_effort | ((.type == "string") and (.enum == ["medium","high","xhigh","max"]) and (has("default")|not))) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|has("model_reasoning_effort")|not))'
@@ -2863,7 +2863,7 @@ test_codex_legacy_toolslist_rewrite "tools/list advertises boolean allow_subagen
     (($t.codex.inputSchema.required|sort) == ["cwd","prompt","sandbox"]))'
 test_codex_legacy_toolslist_rewrite "tools/list explains model, effort, and reply inheritance" \
   "normal" \
-  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties) as $p | (($p.model.description|test("gpt-6-astra.*demanding")) and ($p.model.description|test("gpt-5.6-terra.*faster")) and ($p.model.description|test("repl.*inherit")) and ($p.model_reasoning_effort.description|ascii_downcase|test("medium.*balanced.*high.*complex.*xhigh.*hard.*max.*quality-first.*repl.*inherit")))'
+  'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties) as $p | (($p.model.description|test("gpt-6.2-astra.*demanding")) and ($p.model.description|test("gpt-5.6-terra.*faster")) and ($p.model.description|test("repl.*inherit")) and ($p.model_reasoning_effort.description|ascii_downcase|test("medium.*balanced.*high.*complex.*xhigh.*hard.*max.*quality-first.*repl.*inherit")))'
 # If upstream Codex starts declaring this property itself, mcp-agents still
 # owns the policy: constrain codex to the four allowed values and remove the
 # property from codex-reply rather than exposing upstream drift such as ultra.
@@ -2878,7 +2878,7 @@ test_codex_legacy_toolslist_rewrite "tools/list advertises exact sandbox choices
   'select(.id==2) | (.result.tools|map(select(.name=="codex"))[0].inputSchema.properties.sandbox.enum == ["read-only","workspace-write","danger-full-access"])'
 test_codex_legacy_toolslist_rewrite "tools/list curates model and hides native config and future drift" \
   "normal" \
-  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties | (.model.enum == ["gpt-6-astra","gpt-5.6-terra"]) and (has("approval-policy")|not) and (has("base-instructions")|not) and (has("compact-prompt")|not) and (has("config")|not) and (has("developer-instructions")|not) and (has("future_upstream_setting")|not)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties | (has("conversationId")|not) and (has("future_reply_setting")|not)))'
+  'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties | (.model.enum == ["gpt-6.2-astra","gpt-5.6-terra"]) and (has("approval-policy")|not) and (has("base-instructions")|not) and (has("compact-prompt")|not) and (has("config")|not) and (has("developer-instructions")|not) and (has("future_upstream_setting")|not)) and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties | (has("conversationId")|not) and (has("future_reply_setting")|not)))'
 test_codex_legacy_toolslist_rewrite "tools/list keeps workspace network server-owned" \
   "normal" \
   'select(.id==2) | [.result.tools[] | select(.name == "codex" or .name == "codex-start" or .name == "codex-reply" or .name == "codex-reply-start") | .inputSchema.properties | ((has("network_access")|not) and (has("codex_workspace_network_access")|not) and (has("codex-workspace-network")|not))] | all'

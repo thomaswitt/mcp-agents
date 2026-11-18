@@ -330,7 +330,7 @@ A LaunchAgent starts at login and stays running for that user's session.
 | Provider | Best for | Under the hood | State model |
 | --- | --- | --- | --- |
 | `codex` | Implementation, reviews, steering, goals, and resumable sessions | Wrapper-owned MCP adapter over `codex app-server --stdio` | Durable threads and native goals |
-| `claude` | One-shot help and independent read-only reviews | Claude Code CLI, Fable 5.1 at `xhigh` effort with Opus 5 availability fallback and guarded default-model quota retry | Blocking calls and connection-local review jobs |
+| `claude` | One-shot help and independent read-only reviews | Claude Code CLI at `xhigh` effort, with Opus 5.5 by default and optional Fable 5.2 | Blocking calls and connection-local review jobs |
 
 ### Also supported
 
@@ -404,7 +404,7 @@ configuration. To override Codex defaults at server startup:
         "--provider",
         "codex",
         "--model",
-        "gpt-6-astra",
+        "gpt-6.2-astra",
         "--model_reasoning_effort",
         "xhigh",
         "--codex-workspace-network=false"
@@ -415,7 +415,7 @@ configuration. To override Codex defaults at server startup:
 }
 ```
 
-Every initial `codex` call may select `gpt-6-astra` or `gpt-5.6-terra` and
+Every initial `codex` call may select `gpt-6.2-astra` or `gpt-5.6-terra` and
 `medium`, `high`, `xhigh`, or `max`. Omitted selectors use the server defaults;
 replies inherit the thread's model, effort, sandbox, and subagent policy. Other
 models, raw `config`, and per-call approval-policy arguments are rejected before
@@ -536,7 +536,7 @@ safely, or the answer to a dispatched mutation, still restarts the child.
 | `prompt` | string | yes | Initial user prompt |
 | `cwd` | absolute path | yes | Working directory |
 | `sandbox` | string | yes | `read-only`, `workspace-write`, or `danger-full-access` |
-| `model` | string | no | `gpt-6-astra` or `gpt-5.6-terra` |
+| `model` | string | no | `gpt-6.2-astra` or `gpt-5.6-terra` |
 | `model_reasoning_effort` | string | no | `medium`, `high`, `xhigh`, or `max` |
 | `allow_subagents` | boolean | no | Enable native in-process Codex subagents for this thread; default `false` |
 | `goal` | string | no | Set the native durable objective; `""` suppresses the server default |
@@ -553,7 +553,7 @@ Codex reported, in `structuredContent.modelSettings`:
 ```json
 {
   "reportedBy": "thread_start",
-  "model": { "requested": "gpt-6-astra", "reported": "gpt-6-astra", "status": "confirmed" },
+  "model": { "requested": "gpt-6.2-astra", "reported": "gpt-6.2-astra", "status": "confirmed" },
   "reasoningEffort": { "requested": "max", "reported": "max", "status": "confirmed" }
 }
 ```
@@ -662,7 +662,7 @@ session files in that case; restart the bridge to build a fresh private index.
 | `--codex-session-retention-days <days>` | `30` for eligible `appServer` / `subAgentReview` sessions; `0` disables expiry | `MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS` |
 | App Server initialization | `300000` ms; blank uses the default; invalid warns and uses the default; `0` clamps to `1` ms | `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` |
 | Progress detail | `detailed`; `minimal` keeps content-free command and file-change wording; blank uses the default; invalid warns and uses the default | `MCP_AGENTS_CODEX_PROGRESS` |
-| `--model <model>` | `gpt-6-astra` | — |
+| `--model <model>` | `gpt-6.2-astra` | — |
 | `--model_reasoning_effort <effort>` | `xhigh` | — |
 | `--codex-workspace-network=true\|false` | `true` | `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` |
 | `--codex-mcp-servers <names>` | none; comma-separated names of remote MCP servers to copy into isolated sessions ([details](#codex-app-server-backed-mcp)) | `MCP_AGENTS_CODEX_MCP_SERVERS` |
@@ -766,7 +766,7 @@ commands Codex runs do not see them by default; a trusted project's own
 `shell_environment_policy` can replace that exclusion.
 
 The bridge model (`--model`, the per-call `model`, or the default
-`gpt-6-astra` when the call names none) must be one the provider serves.
+`gpt-6.2-astra` when the call names none) must be one the provider serves.
 Profiles (`profile = "x"`) and `openai_base_url` are not mirrored.
 
 The minimal config strips the MCP servers of the user's own Codex config, unless
@@ -1180,7 +1180,7 @@ finish inside one MCP request.
 
 | Tool | Required arguments | Optional arguments |
 | --- | --- | --- |
-| `claude-start` | `prompt`, absolute `cwd` | — |
+| `claude-start` | `prompt`, absolute `cwd` | `model` |
 | `claude-status` | `jobId`, `cursor` | `wait_ms` |
 | `claude-result` | `jobId` | `offset` |
 | `claude-cancel` | `jobId` | — |
@@ -1195,16 +1195,16 @@ one hour, pages results at 32,768 Unicode code points, and rejects a final
 result over 10 MiB. Background reviews have a bridge-owned two-hour deadline;
 operators can replace it with `--timeout <seconds>` at server startup.
 
-Each Claude call starts with `claude-fable-5-1` at effort `xhigh` and keeps the
-CLI's native `claude-opus-5` fallback for overload or unavailability. If Claude
-returns the structured error `model_requires_usage_credits`, the bridge can
-retry once with `--model default`, letting Claude resolve the account's current
-default instead of pinning an Opus version. Other rate limits and errors do not
-trigger this switch. Background reviews restart with the same prompt, working
-directory, job ID, and deadline. Blocking calls use the stricter guard below.
-The quota switch and one empty-result retry allow at most three CLI attempts
-within the original timeout; later attempts stay on default after the switch.
-Each independent call starts with Fable again.
+`claude_code` and `claude-start` default to Opus 5.5 (`claude-opus-5-5`) at
+`xhigh` effort. To use Fable 5.2 for one call, pass `"model": "claude-fable-5-2"`.
+Fable uses Opus 5.5 as its native fallback on overload or unavailability.
+
+If Fable returns `model_requires_usage_credits`, the bridge can retry once with
+`--model default`, which Claude resolves using the account's current default.
+Blocking calls use the replay guard below. Background reviews keep their prompt,
+working directory, job ID, and deadline. The quota switch and one empty-result
+retry allow at most three CLI attempts within the original timeout. After a
+quota switch, any empty-result retry also uses the account default.
 
 Background reviews run as leaf reviewers. They keep project instructions and
 repository context but disable
@@ -1222,9 +1222,10 @@ are exposed.
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `prompt` | `string` | yes | Prompt sent to Claude Code |
+| `model` | `string` | no | `claude-opus-5-5` (default) or `claude-fable-5-2` |
 | `timeout_ms` | `integer` | no | Timeout in milliseconds; default 900,000 / 15 minutes |
 
-Additional `tools/call` arguments such as `model`, `effort`, or `config` are
+Additional `tools/call` arguments such as `effort` or `config` are
 ignored. Calls run with `--output-format json`; the bridge returns the assistant
 `result` text or an MCP error when `is_error=true`.
 
