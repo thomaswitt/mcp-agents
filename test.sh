@@ -2638,6 +2638,9 @@ test_claude_job() {
   tmpdir=$(mktemp -d)
   write_claude_job_stub "$tmpdir"
   write_claude_job_driver "$tmpdir"
+  # A fresh executable can take longer to launch on macOS than the 150 ms
+  # quota deadline. Warm the stub before measuring the bridge's behavior.
+  "$tmpdir/claude" --version >/dev/null
 
   set +e
   summary=$(
