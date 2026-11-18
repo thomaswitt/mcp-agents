@@ -5,12 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.38.0] - 2026-11-18
 
 ### Changed
 
 - New `codex` and `codex-legacy` sessions default to `gpt-6.2-astra`. Callers
-  that explicitly select `gpt-6-astra` per session should use `gpt-6.2-astra`.
+  that pass `gpt-6-astra` as a per-call `model` must switch to `gpt-6.2-astra`.
 - `claude_code` and `claude-start` now start on Opus 5.5 (`claude-opus-5-5`).
   Pass `"model": "claude-fable-5-2"` for Fable 5.2. Fable uses Opus 5.5 on
   overload and retains its guarded retry on the account default for exhausted
